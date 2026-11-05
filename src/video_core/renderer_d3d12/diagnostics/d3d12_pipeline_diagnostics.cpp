@@ -1,0 +1,312 @@
+// SPDX-FileCopyrightText: Copyright 2026 Jadyx Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <fstream>
+#include <string>
+#include <vector>
+
+#include <fmt/format.h>
+
+#include "common/fs/path_util.h"
+#include "common/logging.h"
+#include "video_core/renderer_d3d12/d3d12_device.h"
+#include "video_core/renderer_d3d12/d3d12_driver_guard.h"
+#include "video_core/renderer_d3d12/diagnostics/d3d12_pipeline_diagnostics.h"
+
+namespace D3D12 {
+
+namespace {
+
+/// Failed pipelines diagnosed so far; each one creates several extra PSOs, so only the first few.
+std::atomic_int diagnosed_failures;
+constexpr int MAX_DIAGNOSED_FAILURES = 6;
+/// Pipelines whose DXIL is written out after they fault the driver.
+constexpr int MAX_DUMPED_FAULTS = 8;
+
+/// Logs the stream output of a failed pipeline and narrows down which part of it the driver
+/// rejects: none at all, the rasterized stream, or a single entry.
+template <typename TryVariant>
+void DiagnoseStreamOutput(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
+                          const TryVariant& try_variant) {
+    const D3D12_STREAM_OUTPUT_DESC& so = desc.StreamOutput;
+    if (so.NumEntries == 0) {
+        return;
+    }
+    LOG_ERROR(Render, "D3D12 PSO diag:   stream output {} entries, {} strides, rasterized {}",
+              so.NumEntries, so.NumStrides, so.RasterizedStream);
+    for (UINT i = 0; i < so.NumStrides; ++i) {
+        LOG_ERROR(Render, "D3D12 PSO diag:   SO slot {} stride {}", i, so.pBufferStrides[i]);
+    }
+    for (UINT i = 0; i < so.NumEntries; ++i) {
+        const D3D12_SO_DECLARATION_ENTRY& entry = so.pSODeclaration[i];
+        LOG_ERROR(Render,
+                  "D3D12 PSO diag:   SO entry {} stream {} {}{} components {}+{} slot {}", i,
+                  entry.Stream, entry.SemanticName ? entry.SemanticName : "(gap)",
+                  entry.SemanticIndex, entry.StartComponent, entry.ComponentCount,
+                  entry.OutputSlot);
+    }
+    {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC v = desc;
+        v.StreamOutput = {};
+        try_variant("no stream output", v);
+    }
+    if (so.RasterizedStream == D3D12_SO_NO_RASTERIZED_STREAM) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC v = desc;
+        v.StreamOutput.RasterizedStream = 0;
+        try_variant("stream output rasterized", v);
+    }
+    constexpr UINT MAX_SINGLE_ENTRIES = 8;
+    for (UINT i = 0; i < (std::min)(so.NumEntries, MAX_SINGLE_ENTRIES); ++i) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC v = desc;
+        v.StreamOutput.pSODeclaration = so.pSODeclaration + i;
+        v.StreamOutput.NumEntries = 1;
+        try_variant(fmt::format("only SO entry {}", i).c_str(), v);
+    }
+}
+
+} // Anonymous namespace
+
+u64 ShaderFeatureFlags(const std::vector<u8>& dxil) {
+    const auto read_u32 = [&](size_t offset) {
+        u32 value{};
+        std::memcpy(&value, dxil.data() + offset, sizeof(value));
+        return value;
+    };
+    constexpr size_t HEADER_SIZE = 32; // "DXBC", digest, version, size, part count
+    if (dxil.size() < HEADER_SIZE || std::memcmp(dxil.data(), "DXBC", 4) != 0) {
+        return 0;
+    }
+    const u32 part_count = read_u32(28);
+    for (u32 part = 0; part < part_count; ++part) {
+        const size_t index_offset = HEADER_SIZE + part * sizeof(u32);
+        if (index_offset + sizeof(u32) > dxil.size()) {
+            return 0;
+        }
+        const size_t part_offset = read_u32(index_offset);
+        if (part_offset + 16 > dxil.size()) {
+            return 0;
+        }
+        if (std::memcmp(dxil.data() + part_offset, "SFI0", 4) == 0) {
+            u64 flags{};
+            std::memcpy(&flags, dxil.data() + part_offset + 8, sizeof(flags));
+            return flags;
+        }
+    }
+    return 0;
+}
+
+void DiagnoseFailedPipeline(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
+    if (diagnosed_failures.fetch_add(1, std::memory_order_relaxed) >= MAX_DIAGNOSED_FAILURES) {
+        return;
+    }
+    for (UINT i = 0; i < desc.InputLayout.NumElements; ++i) {
+        const D3D12_INPUT_ELEMENT_DESC& element = desc.InputLayout.pInputElementDescs[i];
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT support{.Format = element.Format};
+        const bool ia_support =
+            SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support,
+                                                  sizeof(support))) &&
+            (support.Support1 & D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER) != 0;
+        LOG_ERROR(Render,
+                  "D3D12 PSO diag:   TEXCOORD{} format {} (IA vertex buffer {}) slot {} offset {} "
+                  "{} step {}",
+                  element.SemanticIndex, static_cast<u32>(element.Format),
+                  ia_support ? "yes" : "NO", element.InputSlot, element.AlignedByteOffset,
+                  element.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA
+                      ? "instance"
+                      : "vertex",
+                  element.InstanceDataStepRate);
+    }
+    const D3D12_RASTERIZER_DESC& raster = desc.RasterizerState;
+    LOG_ERROR(Render,
+              "D3D12 PSO diag:   VS {} B, PS {} B, HS {} B, DS {} B, GS {} B; topology type {}, "
+              "strip cut {}, samples {}",
+              desc.VS.BytecodeLength, desc.PS.BytecodeLength, desc.HS.BytecodeLength,
+              desc.DS.BytecodeLength, desc.GS.BytecodeLength,
+              static_cast<u32>(desc.PrimitiveTopologyType), static_cast<u32>(desc.IBStripCutValue),
+              desc.SampleDesc.Count);
+    LOG_ERROR(Render,
+              "D3D12 PSO diag:   raster fill {} cull {} ccw {} bias {} clamp {} slope {} clip {} "
+              "aa lines {}; depth {} write {} func {} stencil {}; alpha to coverage {}",
+              static_cast<u32>(raster.FillMode), static_cast<u32>(raster.CullMode),
+              raster.FrontCounterClockwise, raster.DepthBias, raster.DepthBiasClamp,
+              raster.SlopeScaledDepthBias, raster.DepthClipEnable, raster.AntialiasedLineEnable,
+              desc.DepthStencilState.DepthEnable,
+              static_cast<u32>(desc.DepthStencilState.DepthWriteMask),
+              static_cast<u32>(desc.DepthStencilState.DepthFunc),
+              desc.DepthStencilState.StencilEnable, desc.BlendState.AlphaToCoverageEnable);
+    for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
+        const D3D12_RENDER_TARGET_BLEND_DESC& blend = desc.BlendState.RenderTarget[i];
+        LOG_ERROR(Render,
+                  "D3D12 PSO diag:   RT{} format {} blend {} rgb {}/{}/{} alpha {}/{}/{} mask {:x}",
+                  i, static_cast<u32>(desc.RTVFormats[i]), blend.BlendEnable,
+                  static_cast<u32>(blend.SrcBlend), static_cast<u32>(blend.DestBlend),
+                  static_cast<u32>(blend.BlendOp), static_cast<u32>(blend.SrcBlendAlpha),
+                  static_cast<u32>(blend.DestBlendAlpha), static_cast<u32>(blend.BlendOpAlpha),
+                  blend.RenderTargetWriteMask);
+    }
+
+    const auto try_once = [&](const char* name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& v) {
+        ComPtr<ID3D12PipelineState> pso;
+        DWORD fault_code = 0;
+        // A pipeline that faulted the driver can fault it again in its variants.
+        const HRESULT hr = CallDriverGuarded(
+            [&] { return device->CreateGraphicsPipelineState(&v, IID_PPV_ARGS(&pso)); },
+            fault_code);
+        if (hr == DRIVER_FAULT_HRESULT) {
+            pso.Detach();
+            return fmt::format("driver fault 0x{:08X}", static_cast<u32>(fault_code));
+        }
+        CheckRemovedAfter(device, [&] { return fmt::format("PSO diag variant '{}'", name); });
+        return SUCCEEDED(hr) ? std::string("BUILDS")
+                             : fmt::format("fails 0x{:08X}", static_cast<u32>(hr));
+    };
+    // Twice: a variant that builds once and faults once points at the driver, not at the state.
+    const auto try_variant = [&](const char* name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& v) {
+        const std::string first = try_once(name, v);
+        const std::string second = try_once(name, v);
+        LOG_ERROR(Render, "D3D12 PSO diag: variant '{}' -> {}, again {}", name, first, second);
+    };
+    {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC v = desc;
+        v.PS = {};
+        try_variant("no pixel shader", v);
+    }
+    {
+        std::vector<D3D12_INPUT_ELEMENT_DESC> elements(
+            desc.InputLayout.pInputElementDescs,
+            desc.InputLayout.pInputElementDescs + desc.InputLayout.NumElements);
+        for (D3D12_INPUT_ELEMENT_DESC& element : elements) {
+            element.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        }
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC v = desc;
+        v.InputLayout.pInputElementDescs = elements.empty() ? nullptr : elements.data();
+        try_variant("all attributes RGBA32F", v);
+    }
+    // Input layout variants: the instancing setup is compiled into the vertex fetch.
+    const std::vector<D3D12_INPUT_ELEMENT_DESC> layout(
+        desc.InputLayout.pInputElementDescs,
+        desc.InputLayout.pInputElementDescs + desc.InputLayout.NumElements);
+    const auto try_layout = [&](const char* name, std::vector<D3D12_INPUT_ELEMENT_DESC> elements) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC v = desc;
+        v.InputLayout = {elements.empty() ? nullptr : elements.data(),
+                         static_cast<UINT>(elements.size())};
+        try_variant(name, v);
+    };
+    if (!layout.empty()) {
+        auto per_vertex = layout;
+        for (D3D12_INPUT_ELEMENT_DESC& element : per_vertex) {
+            element.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+            element.InstanceDataStepRate = 0;
+        }
+        try_layout("attributes per vertex", per_vertex);
+        auto first_per_vertex = layout;
+        first_per_vertex[0].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+        first_per_vertex[0].InstanceDataStepRate = 0;
+        try_layout("first attribute per vertex", first_per_vertex);
+        auto padded = layout;
+        padded.push_back({
+            .SemanticName = "JADYXPAD",
+            .SemanticIndex = 0,
+            .Format = DXGI_FORMAT_R32_FLOAT,
+            .InputSlot = D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT - 1,
+            .AlignedByteOffset = 0,
+            .InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            .InstanceDataStepRate = 0,
+        });
+        try_layout("extra per-vertex element", padded);
+        auto one_slot = layout;
+        for (D3D12_INPUT_ELEMENT_DESC& element : one_slot) {
+            element.InputSlot = 0;
+            element.AlignedByteOffset = D3D12_APPEND_ALIGNED_ELEMENT;
+        }
+        try_layout("attributes in one slot", one_slot);
+        auto step_zero = layout;
+        for (D3D12_INPUT_ELEMENT_DESC& element : step_zero) {
+            if (element.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA) {
+                element.InstanceDataStepRate = 0;
+            }
+        }
+        try_layout("instance step rate 0", step_zero);
+    }
+    {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC v = desc;
+        v.RasterizerState = {
+            .FillMode = D3D12_FILL_MODE_SOLID,
+            .CullMode = D3D12_CULL_MODE_NONE,
+            .FrontCounterClockwise = FALSE,
+            .DepthBias = 0,
+            .DepthBiasClamp = 0.0f,
+            .SlopeScaledDepthBias = 0.0f,
+            .DepthClipEnable = TRUE,
+            .MultisampleEnable = FALSE,
+            .AntialiasedLineEnable = FALSE,
+            .ForcedSampleCount = 0,
+            .ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF,
+        };
+        try_variant("default rasterizer", v);
+    }
+    {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC v = desc;
+        v.BlendState.AlphaToCoverageEnable = FALSE;
+        for (UINT i = 0; i < v.NumRenderTargets; ++i) {
+            D3D12_RENDER_TARGET_BLEND_DESC& blend = v.BlendState.RenderTarget[i];
+            blend.BlendEnable = FALSE;
+            blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        }
+        try_variant("no blending", v);
+    }
+    {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC v = desc;
+        v.DepthStencilState.DepthEnable = FALSE;
+        v.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        v.DepthStencilState.StencilEnable = FALSE;
+        try_variant("no depth-stencil test", v);
+    }
+    {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC v = desc;
+        v.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
+        try_variant("no strip cut", v);
+    }
+    DiagnoseStreamOutput(desc, try_variant);
+    {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC v = desc;
+        v.DepthStencilState.DepthEnable = FALSE;
+        v.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        v.DepthStencilState.StencilEnable = FALSE;
+        v.DSVFormat = DXGI_FORMAT_UNKNOWN;
+        try_variant("no depth target", v);
+    }
+    {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC v = desc;
+        for (UINT i = 0; i < v.NumRenderTargets; ++i) {
+            v.RTVFormats[i] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        }
+        try_variant("render targets RGBA8", v);
+    }
+}
+
+void DumpFaultedPipeline(u64 vertex_shader, u64 fragment_shader,
+                         std::span<const std::vector<u8>> stages) {
+    static std::atomic_int dumped;
+    if (dumped.fetch_add(1, std::memory_order_relaxed) >= MAX_DUMPED_FAULTS) {
+        return;
+    }
+    const auto directory = Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir);
+    for (size_t stage = 0; stage < stages.size(); ++stage) {
+        if (stages[stage].empty()) {
+            continue;
+        }
+        const std::string name = fmt::format("dxil_fault_{:016x}_{:016x}_{}.dxil", vertex_shader,
+                                             fragment_shader, stage);
+        std::ofstream{directory / name, std::ios::binary | std::ios::trunc}.write(
+            reinterpret_cast<const char*>(stages[stage].data()),
+            static_cast<std::streamsize>(stages[stage].size()));
+    }
+    LOG_ERROR(Render, "D3D12 PSO diag: DXIL of VS {:016x} PS {:016x} dumped to the log folder",
+              vertex_shader, fragment_shader);
+}
+
+} // namespace D3D12

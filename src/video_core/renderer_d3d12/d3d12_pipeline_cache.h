@@ -1,0 +1,307 @@
+// SPDX-FileCopyrightText: Copyright 2026 Jadyx Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#pragma once
+
+#include <array>
+#include <filesystem>
+#include <memory>
+#include <span>
+#include <string_view>
+#include <stop_token>
+#include <unordered_set>
+#include <vector>
+
+#include "common/container/unordered_map.h"
+#include "common/memory_ledger.h"
+#include "common/thread_worker.h"
+#include "shader_recompiler/frontend/ir/basic_block.h"
+#include "shader_recompiler/frontend/ir/value.h"
+#include "shader_recompiler/frontend/maxwell/control_flow.h"
+#include "shader_recompiler/host_translate_info.h"
+#include "shader_recompiler/object_pool.h"
+#include "shader_recompiler/profile.h"
+#include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/rasterizer_interface.h"
+#include "video_core/renderer_d3d12/d3d12_compute_pipeline.h"
+#include "video_core/renderer_d3d12/d3d12_graphics_pipeline.h"
+#include "video_core/renderer_d3d12/d3d12_linked_shader_cache.h"
+#include "video_core/renderer_d3d12/d3d12_memory_guard.h"
+#include "video_core/renderer_d3d12/d3d12_prewarm_pacer.h"
+#include "video_core/renderer_d3d12/d3d12_pipeline_key_tracking.h"
+#include "video_core/renderer_d3d12/d3d12_pipeline_residency.h"
+#include "video_core/renderer_d3d12/d3d12_root_signature.h"
+#include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/shader_cache.h"
+
+namespace Shader {
+class Environment;
+}
+
+namespace VideoCore {
+class ShaderNotify;
+}
+
+namespace D3D12 {
+
+/// Diagnostics: shaders with these unique hashes (up to 4, one call each) write their translated
+/// IR and SPIR-V next to the log (shader_<hash>_<stage>.ir.txt / .spv) when a pipeline using them
+/// is built, and pipelines with such a vertex shader also write their linked DXIL
+/// (dxil_<hash>_<stage>.dxil) and log their guest constant buffers on each draw. Set before boot
+/// (boot.cfg "dump_shader=", hashes separated by commas).
+void SetDumpedShader(u64 unique_hash);
+bool IsDumpedShader(u64 unique_hash);
+
+/// Diagnostics: draws whose pipeline uses a shader with one of these unique hashes (up to 4) are
+/// not recorded, to tell whether those draws are what hangs the GPU. Set before boot (boot.cfg
+/// "skip_shader=", one line per hash).
+void SetSkippedShader(u64 unique_hash);
+bool UsesSkippedShader(const std::array<u64, 6>& unique_hashes);
+
+/// Diagnostics: pipelines with one of these vertex shaders (up to 4) are built without their
+/// geometry shader, to tell whether the VS alone or the VS+GS pair hangs the GPU. Draws come out
+/// wrong. Set before boot (boot.cfg "drop_gs=", one line per hash).
+void SetGeometryDroppedShader(u64 unique_hash);
+
+/// Diagnostics: false keeps idle pipelines' PSOs resident unless memory is nearly exhausted, to
+/// tell a problem with rebuilt PSOs from one in what they draw. Set before boot (boot.cfg
+/// "pso_eviction=0").
+void SetPipelineEviction(bool enabled);
+
+/// true writes transform feedback from the vertex shader to storage buffers instead of stream
+/// output: the fallback for a spirv_to_dxil.dll without it, for A/B comparison. Covers the vertex
+/// shader alone. Set before boot (boot.cfg "xfb=storage").
+void SetTransformFeedbackStorage(bool enabled);
+
+/// Diagnostics: false never builds dormant PSOs ahead of their first draw, for A/B timing of the
+/// background prewarm. Set before boot (boot.cfg "pso_prewarm=0").
+void SetPipelinePrewarm(bool enabled);
+
+/// Compute shaders dispatched with few groups, whose work is a stride loop over their local id,
+/// run each guest group as `factor` real groups (Shader::Optimization::WorkgroupSplitPass) to
+/// fill a GPU that a handful of persistent groups leaves mostly idle. 1 disables it; otherwise a
+/// power of two. Defaults to 16, still experimental (see the .cpp). Set before boot (boot.cfg
+/// "cs_split=").
+void SetComputeWorkgroupSplit(u32 factor);
+
+class ShaderCompiler;
+class TextureCacheRuntime;
+
+struct ShaderPools {
+    void ReleaseContents() {
+        flow_block.ReleaseContents();
+        block.ReleaseContents();
+        inst.ReleaseContents();
+    }
+
+    Shader::ObjectPool<Shader::IR::Inst> inst{8192};
+    Shader::ObjectPool<Shader::IR::Block> block{32};
+    Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_block{32};
+};
+
+/// Linked DXIL as the linked shader cache holds it: charged to the memory ledger once, however
+/// many pipelines share it, until the last of them is gone.
+struct ChargedDxilStages {
+    GraphicsPipeline::LinkedDxil linked;
+    Common::MemoryCharge charge;
+};
+
+/// Guest shaders -> D3D12 pipelines, modeled on Vulkan::PipelineCache.
+///
+/// Maxwell code goes through the shared recompiler to SPIR-V (one binding counter across the
+/// stages), then spirv_to_dxil translates and links the stages and dxil.dll signs them. The PSO is
+/// created on a worker; a dependent draw waits until the exact PSO is ready.
+/// The disk cache stores the guest environments, as Vulkan does, and rebuilds from them at boot:
+/// every pipeline's DXIL, but PSOs only for the ones drawn in recent sessions (HotPipelineSet).
+/// PSOs idle for long are released and built again when drawn (PipelineResidencyPolicy).
+class PipelineCache : public VideoCommon::ShaderCache {
+public:
+    PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory, const Device& device,
+                  const ShaderCompiler& compiler, const TextureCacheRuntime& texture_runtime,
+                  VideoCore::ShaderNotify& shader_notify);
+    ~PipelineCache();
+
+    void GuardMemory(const CacheMemorySnapshot& snapshot) {
+        // Optional cache: emptied when headroom is low, given back only after sustained headroom
+        // (OptionalCacheGate). The cache mutex is taken only on those two transitions.
+        switch (linked_shaders_gate.Update(snapshot.app_used, snapshot.app_limit)) {
+        case OptionalCacheGate::Action::Trim:
+            linked_shaders.SetBudget(0);
+            break;
+        case OptionalCacheGate::Action::Restore:
+            linked_shaders.SetBudget(decltype(linked_shaders)::DEFAULT_BUDGET);
+            break;
+        case OptionalCacheGate::Action::None:
+            break;
+        }
+    }
+
+    /// Frame boundary, on the GPU thread: releases the PSOs of pipelines idle for longer than the
+    /// app's headroom allows, a bounded slice of them a frame, and saves the hot set now and then.
+    void TickResidency(const CacheMemorySnapshot& snapshot, Scheduler& scheduler);
+
+    /// GPU thread, once a composite: whether the game is on a loading screen (pso_loading).
+    void SetLoadingScreen(bool loading);
+
+    /// The pipeline of the current Maxwell state, or null if shader preparation failed. Ready,
+    /// unless async_pipelines is on: then it may still be building (IsBuilt false), and the draw
+    /// either skips it or calls WaitPending.
+    [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
+
+    /// Waits for a pipeline still being built; null if its PSO ran out of memory (its draws are
+    /// skipped until it is tried again).
+    [[nodiscard]] GraphicsPipeline* WaitPending(GraphicsPipeline* pipeline);
+    /// Waits for a worker's build up to this long, counted as a pipeline stall. True when the build
+    /// ended; WaitPending then returns at once.
+    [[nodiscard]] bool WaitPendingFor(GraphicsPipeline* pipeline, u64 microseconds);
+
+    /// The compute pipeline of the current launch, or null if shader preparation failed. It may
+    /// still be building (IsBuilt false): its dispatch is not skipped but waits on the recorder.
+    [[nodiscard]] ComputePipeline* CurrentComputePipeline();
+
+    /// A draw sampled with a filtered MIN/MAX sampler the device cannot create through a pipeline
+    /// that does not emulate it (PipelineBindings::unemulated_reduction_stages): from the next
+    /// lookup on, pipelines with those stages' shaders take their emulating variant.
+    void EmulateReduction(const GraphicsPipelineCacheKey& key, u8 stages);
+    /// The same for a compute shader.
+    void EmulateReduction(u64 compute_hash);
+    /// PipelineBindings::unemulated_mirror_border: the same for the key's fragment shader.
+    void EmulateMirrorBorder(const GraphicsPipelineCacheKey& key);
+
+    /// Whether the pipelines that capture transform feedback do it through stream output.
+    [[nodiscard]] bool NativeStreamOutput() const;
+
+    /// Lanes of the fragment local memory pool (Shader::LocalMemoryScratch), or 0 without it.
+    [[nodiscard]] u32 FragmentScratchLanes() const noexcept {
+        return profile.fragment_local_memory_scratch_lanes;
+    }
+
+    void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
+                           const VideoCore::DiskResourceLoadCallback& callback);
+
+private:
+    [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
+    /// Refreshes the key and finds its pipeline, through the transitions or the cache.
+    [[nodiscard]] GraphicsPipeline* LookupGraphicsPipeline();
+    void ReportKeyReuseMismatch(const GraphicsPipeline* reused);
+
+    /// Records the draw (residency, hot set), wakes a dormant pipeline, and returns it once its PSO
+    /// is built, or right away while it builds when async_pipelines is on.
+    [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline);
+
+    void SaveHotPipelines();
+
+    /// GPU thread, once a frame: queues the next dormant PSO on the prewarm thread, one at a time,
+    /// while memory is plentiful (PipelineResidencyPolicy::MayPrewarm).
+    void TickPrewarm(const CacheMemorySnapshot& snapshot);
+
+    /// Logs each preparation stage's distribution and the waits by cause, totals so far.
+    void LogPipelineStats(std::string_view when) const;
+
+    std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
+
+    std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
+        ShaderPools& pools, const GraphicsPipelineCacheKey& key,
+        std::span<Shader::Environment* const> envs, bool build_in_parallel, bool build_pso = true);
+
+    std::unique_ptr<ComputePipeline> CreateComputePipeline(const ComputePipelineCacheKey& key,
+                                                           const VideoCommon::ShaderInfo* shader,
+                                                           bool emulate_reduction = false,
+                                                           u32 workgroup_split = 1);
+
+    std::unique_ptr<ComputePipeline> CreateComputePipeline(ShaderPools& pools,
+                                                           const ComputePipelineCacheKey& key,
+                                                           Shader::Environment& env,
+                                                           bool build_in_parallel,
+                                                           bool emulate_reduction = false,
+                                                           u32 workgroup_split = 1);
+
+    /// Whether a stage of the key uses a shader in reduction_shaders.
+    [[nodiscard]] bool UsesReductionShader(const std::array<u64, 6>& unique_hashes) const;
+
+    const Device& device;
+    const ShaderCompiler& compiler;
+    const TextureCacheRuntime& texture_runtime;
+    VideoCore::ShaderNotify& shader_notify;
+
+    GraphicsPipelineCacheKey graphics_key{};
+    GraphicsPipeline* current_pipeline{};
+    PipelineKeyTracking::Reuse key_reuse;
+    u64 key_reuse_mismatches{};
+
+    RootSignatureCache root_signatures;
+    GraphicsPsoCache graphics_psos; ///< Weak host-identity index; residency stays with pipelines.
+
+    ::Common::unordered_map<ComputePipelineCacheKey, std::unique_ptr<ComputePipeline>>
+        compute_cache;
+    /// Emulating variants of compute_cache's pipelines, built on demand (not on disk).
+    ::Common::unordered_map<ComputePipelineCacheKey, std::unique_ptr<ComputePipeline>>
+        compute_reduction_cache;
+    /// Variants of compute_cache's pipelines for launches SetComputeWorkgroupSplit applies to,
+    /// built on demand (not on disk). A shader the pass rejects has none: see compute_not_split.
+    ::Common::unordered_map<ComputePipelineCacheKey, std::unique_ptr<ComputePipeline>>
+        compute_split_cache;
+    /// Split variants of compute_reduction_cache's pipelines, as compute_split_cache.
+    ::Common::unordered_map<ComputePipelineCacheKey, std::unique_ptr<ComputePipeline>>
+        compute_reduction_split_cache;
+    /// Keys WorkgroupSplitPass rejected: the pass leaves them as written, so their launches use
+    /// the plain pipeline, which the disk cache has already built. GPU thread only.
+    std::unordered_set<u64> compute_not_split;
+    /// Shaders (unique hashes) that sample with an emulated MIN/MAX reduction. GPU thread only.
+    std::unordered_set<u64> reduction_shaders;
+    /// Fragment shaders that sample with a mirror-once-to-border sampler. GPU thread only.
+    std::unordered_set<u64> mirror_border_shaders;
+    ::Common::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>>
+        graphics_cache;
+
+    ShaderPools main_pools;
+
+    Shader::Profile profile;
+    Shader::HostTranslateInfo host_info;
+    /// Every dynamic feature off: D3D12 bakes that state into the PSO.
+    Vulkan::DynamicFeatures dynamic_features{};
+
+    std::filesystem::path pipeline_cache_filename;
+
+    LinkedShaderCache<ChargedDxilStages> linked_shaders;
+    OptionalCacheGate linked_shaders_gate;
+
+    // Residency, GPU thread only once the disk cache is loaded.
+    HotPipelineSet hot_pipelines;
+    std::filesystem::path hot_pipelines_filename;
+    bool hot_pipelines_dirty{};
+    std::vector<GraphicsPipeline*> residency_sweep; ///< Every graphics pipeline; never shrinks.
+    size_t residency_cursor{};
+    u64 residency_frame{};
+    /// Frames a pipeline whose PSO ran out of memory waits before it is built again, and for which
+    /// idle pipelines are released as in an emergency meanwhile.
+    static constexpr u64 OOM_RETRY_FRAMES = 60;
+    /// How often a released memory reserve is committed again, with no shortage of memory.
+    static constexpr u64 OOM_REARM_FRAMES = 10 * 60;
+    u64 seen_oom_events{};
+    u64 oom_frame{};
+    u64 last_hot_save_frame{};
+    u64 last_stats_frame{};
+    u64 pipelines_evicted{};
+    u64 pipelines_woken{};
+    /// Whether releasing PSOs under pressure frees commit, measured on the first releases.
+    PipelineReleaseProbe release_probe;
+    /// Disk-cache pipelines left dormant at boot, most likely to be drawn first.
+    std::vector<GraphicsPipeline*> prewarm_order;
+    size_t prewarm_cursor{};
+    GraphicsPipeline* prewarm_last{}; ///< Queued last; the next waits until it is built.
+    PrewarmPacer prewarm_pacer;
+    /// pso_loading: prewarm_order from here on holds released pipelines to build again.
+    size_t prewarm_rebuild_from{SIZE_MAX};
+    bool loading_screen{};
+    u64 loading_screens{};
+
+    // Last, so they are joined before the pipelines they build are destroyed.
+    Common::ThreadWorker workers;
+    Common::ThreadWorker serialization_thread;
+    /// One thread, low priority: the PSOs it builds are guesses, so it must not compete with the
+    /// workers' or the guest's.
+    Common::ThreadWorker prewarm_thread;
+};
+
+} // namespace D3D12
