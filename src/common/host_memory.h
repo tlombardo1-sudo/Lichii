@@ -9,10 +9,55 @@
 #include <atomic>
 #include <memory>
 #include <optional>
+#include <string>
 #include "common/common_funcs.h"
 #include "common/common_types.h"
+#include "common/guest_zero_census.h"
 
 namespace Common {
+
+struct HostMemoryFastmemRegion {
+    size_t offset{};
+    size_t size{};
+    bool force_full{};
+};
+
+/// Configured by the UWP frontend before Core::System creates DeviceMemory.
+void ConfigureHostMemoryFastmem(size_t hot_mib, bool force_full);
+[[nodiscard]] size_t HostMemoryFastmemHotSize();
+[[nodiscard]] bool HostMemoryFastmemForceFull();
+
+/// Xbox private DRAM backing: cold guest memory written to a swap file (Permafrost, common/permafrost.h).
+/// Configured by the UWP frontend before Core::System creates DeviceMemory; off unless enabled.
+struct GuestSwapSettings {
+    bool enabled{};
+    std::wstring path;
+    u64 reserve_bytes{};
+    u32 probation_ms{1500};
+    u32 min_idle_ms{8000};
+    u64 batch_bytes{64ULL << 20};
+    u32 fill_pages{4};
+    bool prefetch{true};
+    bool pause_fill{true};
+};
+void ConfigureGuestSwap(const GuestSwapSettings& settings);
+/// Whether the backing in use writes cold memory out.
+[[nodiscard]] bool GuestSwapActive();
+/// How short of memory the swapper's caller is.
+enum class GuestSwapPressure : u8 {
+    Watch,     // close: the access sampling runs, nothing goes out
+    Low,       // short: idle granules go out
+    Urgent,    // far short
+    Emergency, // commits about to fail
+};
+/// One pass of the swapper: tries to give back `want` bytes, written out by its own threads.
+/// Returns the bytes those threads gave back since the last pass.
+u64 StepGuestSwap(u64 want, GuestSwapPressure pressure);
+/// Commits again the reserve given up to a failed demand commit. True when it is held.
+bool RefillGuestSwapReserve();
+/// Whether a demand commit failed and took the reserve since it was last refilled.
+[[nodiscard]] bool GuestSwapReserveReleased();
+[[nodiscard]] std::string DescribeGuestSwap();
 
 enum class MemoryPermission : u32 {
     Read = 1 << 0,
@@ -28,7 +73,8 @@ DECLARE_ENUM_FLAG_OPERATORS(MemoryPermission)
  */
 class HostMemory {
 public:
-    explicit HostMemory(size_t backing_size_, size_t virtual_size_);
+    explicit HostMemory(size_t backing_size_, size_t virtual_size_,
+                        HostMemoryFastmemRegion fastmem_region_ = {});
     ~HostMemory();
 
     /**
@@ -62,6 +108,7 @@ public:
     /// it needs RAM. The contents stay; using the pages brings them back.
     void HintCold(size_t physical_offset, size_t length,
                   std::optional<size_t> virtual_offset) const;
+
     /// Pages the kernel hands out (cleared or not).
     void MarkUsed(size_t physical_offset, size_t length);
 
@@ -71,6 +118,14 @@ public:
     /// A new kernel on this memory: everything a previous one used may hold data.
     void ForgetContents();
 
+    size_t ReleaseBackingRegion(size_t physical_offset, size_t length);
+
+    struct TrimResult {
+        size_t visited{};
+        size_t released{};
+    };
+    TrimResult Trim(size_t& cursor, size_t budget);
+
     [[nodiscard]] u8* BackingBasePointer() noexcept {
         return backing_base;
     }
@@ -78,15 +133,19 @@ public:
         return backing_base;
     }
 
+    [[nodiscard]] size_t BackingSize() const noexcept {
+        return backing_size;
+    }
+
+    [[nodiscard]] size_t VirtualSize() const noexcept {
+        return virtual_size;
+    }
+
     [[nodiscard]] u8* VirtualBasePointer() noexcept {
         return virtual_base;
     }
     [[nodiscard]] const u8* VirtualBasePointer() const noexcept {
         return virtual_base;
-    }
-
-    [[nodiscard]] size_t VirtualSize() const noexcept {
-        return virtual_size;
     }
 
     bool IsInVirtualRange(void* address) const noexcept {
@@ -111,8 +170,63 @@ private:
     static constexpr u8 GranuleDirty = 1 << 1;  ///< May hold non-zero data
     std::unique_ptr<std::atomic<u8>[]> granules;
     size_t num_granules{};
+
+    /// Zeroes or fills the range as the platform backing allows (decommit on the Xbox backing).
+    void ClearBackingRegionNow(size_t physical_offset, size_t length, u32 fill_value);
     // Windows requires it for kernels whom lack proper support for some functions!
     bool fallback_buffer{false};
+};
+
+/// Xbox fastmem: MiB committed in the DRAM section and the demand-commit failures so far, for the
+/// diag. Empty elsewhere.
+std::string HostMemoryCommitStats();
+
+/// Xbox: where `address` falls against the DRAM backing, the process commit and the last
+/// demand-commit failure, as one line in `out`. Allocates nothing, for the crash handler.
+void FormatBackingFault(char* out, size_t out_size, uintptr_t address);
+
+/// Bytes of the emulated DRAM committed in the app (Xbox host memory). Empty where it cannot be
+/// told apart, such as a file-backed section.
+std::optional<u64> EmulatedDramCommittedBytes();
+
+/// Xbox private DRAM backing: the run of host pages around `host` that share its commit state,
+/// clamped to the backing. `untouched` pages are reserved but never committed, and the guest reads
+/// them as zero. Empty outside such a backing (fastmem section, file, desktop).
+struct DramRegion {
+    const u8* begin{};
+    const u8* end{};
+    bool untouched{};
+};
+std::optional<DramRegion> QueryDramRegion(const void* host);
+
+/// Diagnostic, Xbox private DRAM backing: the committed bytes that hold only zeros, by guest swap
+/// granule. Reads every committed page, so it costs a pass over the DRAM. Empty elsewhere.
+std::optional<GuestZeroCensus> CensusGuestZeroMemory();
+
+/// Diagnostic: the commit state of the DRAM page at `host`, and the last kernel clear that
+/// decommitted it.
+std::string DescribeDramPage(const void* host);
+
+/// Diagnostic: queue a DRAM page whose first write after ArmDramWriteWatch is logged.
+void WatchDramPage(const void* host);
+
+/// Diagnostic: forget the queued pages.
+void ResetDramWatch();
+
+/// Diagnostic: each queued page as its nonzero word count, or 'r' when never committed.
+std::string DescribeWatchedPages();
+
+/// Diagnostic: write-protect the queued pages; each one logs its first writer and unprotects.
+void ArmDramWriteWatch();
+
+/// Diagnostic: names the kernel path whose DRAM clears follow, on this thread.
+class ScopedClearTag {
+public:
+    explicit ScopedClearTag(const char* tag);
+    ~ScopedClearTag();
+
+private:
+    const char* previous;
 };
 
 } // namespace Common

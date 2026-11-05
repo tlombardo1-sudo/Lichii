@@ -6,11 +6,16 @@
 
 #ifdef _WIN32
 
+#include <cstdio>
 #include <iterator>
+#include <string>
 #include "common/container/unordered_map.h"
 #include <boost/icl/separate_interval_set.hpp>
 #include <windows.h>
+#include <winioctl.h>
+#include <psapi.h>
 #include "common/dynamic_library.h"
+#include "common/guest_zero_census_scan.h"
 
 #else // ^^^ Windows ^^^ vvv POSIX vvv
 
@@ -22,7 +27,6 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include "common/scope_exit.h"
-#include "common/settings.h"
 
 #if defined(__linux__)
 #include <sys/random.h>
@@ -53,10 +57,16 @@
 #endif // ^^^ POSIX ^^^
 
 #include <algorithm>
-#include <cstdio>
 #include <cstdlib>
+#include <atomic>
+#include <bitset>
+#include <array>
+#include <chrono>
 #include <mutex>
 #include <random>
+
+#include "common/permafrost.h"
+#include "common/pulse_diagnostics.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -64,6 +74,8 @@
 #include "common/free_region_manager.h"
 #include "common/host_memory.h"
 #include "common/logging.h"
+#include "common/settings.h"
+#include "common/thread.h"
 
 #if defined(__ANDROID__) && __ANDROID_API__ < 30
 #include <sys/syscall.h>
@@ -80,6 +92,32 @@ namespace Common {
 [[maybe_unused]] constexpr size_t PageAlignment = 0x1000;
 [[maybe_unused]] constexpr size_t HugePageSize = 0x200000;
 
+namespace {
+std::atomic<size_t> g_fastmem_hot_size{size_t{384} << 20};
+std::atomic<bool> g_fastmem_force_full{false};
+std::mutex g_guest_swap_settings_mutex;
+GuestSwapSettings g_guest_swap_settings;
+}
+
+void ConfigureGuestSwap(const GuestSwapSettings& settings) {
+    std::scoped_lock lock{g_guest_swap_settings_mutex};
+    g_guest_swap_settings = settings;
+}
+
+void ConfigureHostMemoryFastmem(size_t hot_mib, bool force_full) {
+    g_fastmem_hot_size.store(std::clamp(hot_mib, size_t{128}, size_t{448}) << 20,
+                             std::memory_order_release);
+    g_fastmem_force_full.store(force_full, std::memory_order_release);
+}
+
+size_t HostMemoryFastmemHotSize() {
+    return g_fastmem_hot_size.load(std::memory_order_acquire);
+}
+
+bool HostMemoryFastmemForceFull() {
+    return g_fastmem_force_full.load(std::memory_order_acquire);
+}
+
 #ifdef _WIN32
 
 // Manually imported for MinGW compatibility
@@ -94,6 +132,28 @@ namespace Common {
 #endif
 #ifndef MEM_PRESERVE_PLACEHOLDER
 #define MEM_PRESERVE_PLACEHOLDER 0x00000002
+#endif
+
+// On the Xbox/UWP AppContainer the placeholder virtual-memory APIs used for the emulated DRAM must go
+// through the sandbox-legal *FromApp variants. The signatures of VirtualAlloc2FromApp and
+// MapViewOfFile3FromApp match their base versions (we just resolve a different export); only the file
+// mapping differs (CreateFileMappingFromApp has no extended-parameter form, so it takes the page
+// protection OR'd with SEC_COMMIT directly). VirtualFree/VirtualFreeEx/UnmapViewOfFile2/CloseHandle
+// are permitted in the AppContainer and are left unchanged.
+//
+// Auto-detected from the Windows SDK app-family partition (a UWP/WindowsStore CMake target defines
+// WINAPI_FAMILY == WINAPI_FAMILY_APP); force it for a desktop compile/run check with
+// -DYUZU_UWP_APPCONTAINER. The *FromApp exports also exist on desktop Win10+, so the forced build is
+// runtime-valid there too.
+// VirtualProtectFromApp is resolved dynamically (like the other kernelbase entry points below)
+// rather than called directly: a direct call would pull in the UWP/onecore import library, whereas
+// GetProcAddress keeps this translation unit free of link-time dependencies on the target's link set.
+// The plain desktop path keeps calling VirtualProtect directly, so it is byte-for-byte unchanged.
+#if defined(YUZU_UWP_APPCONTAINER) || (defined(WINAPI_FAMILY) && WINAPI_FAMILY == WINAPI_FAMILY_APP)
+#define HOST_MEMORY_USE_FROM_APP 1
+#define HOST_MEMORY_VIRTUAL_PROTECT pfn_VirtualProtectFromApp
+#else
+#define HOST_MEMORY_VIRTUAL_PROTECT VirtualProtect
 #endif
 
 using PFN_CreateFileMapping2 = _Ret_maybenull_ HANDLE(WINAPI*)(
@@ -118,6 +178,28 @@ using PFN_MapViewOfFile3 = _Ret_maybenull_ PVOID(WINAPI*)(
 using PFN_UnmapViewOfFile2 = BOOL(WINAPI*)(_In_ HANDLE Process, _In_ PVOID BaseAddress,
                                            _In_ ULONG UnmapFlags);
 
+// AppContainer-legal file mapping. Unlike CreateFileMapping2 it has no extended-parameter form; the
+// page protection carries SEC_COMMIT directly (the same shape as classic CreateFileMapping).
+using PFN_CreateFileMappingFromApp = _Ret_maybenull_ HANDLE(WINAPI*)(
+    _In_ HANDLE File, _In_opt_ PSECURITY_ATTRIBUTES SecurityAttributes, _In_ ULONG PageProtection,
+    _In_ ULONG64 MaximumSize, _In_opt_ PCWSTR Name);
+
+// VirtualProtectFromApp — identical shape to VirtualProtect; resolved by name under the AppContainer.
+using PFN_VirtualProtect = BOOL(WINAPI*)(_In_ LPVOID Address, _In_ SIZE_T Size,
+                                         _In_ DWORD NewProtection, _Out_ PDWORD OldProtection);
+
+// VirtualAllocFromApp — reserves the private DRAM backing and demand-commits its pages (see below).
+using PFN_VirtualAllocFromApp = _Ret_maybenull_ PVOID(WINAPI*)(
+    _In_opt_ PVOID BaseAddress, _In_ SIZE_T Size, _In_ ULONG AllocationType, _In_ ULONG Protection);
+
+// Vectored-exception-handler APIs. Resolved by name (not called directly) so the binary does not hard-
+// import api-ms-win-core-errorhandling-l1-1-1.dll — an api-set the Xbox AppContainer loader does not
+// expose, which would make the app fail to ACTIVATE (no process, no crash dump). Kernelbase exports
+// both by name, so they resolve at runtime even though the api-set is absent.
+using PFN_AddVectoredExceptionHandler =
+    PVOID(WINAPI*)(_In_ ULONG First, _In_ PVECTORED_EXCEPTION_HANDLER Handler);
+using PFN_RemoveVectoredExceptionHandler = ULONG(WINAPI*)(_In_ PVOID Handle);
+
 template <typename T>
 static void GetFuncAddress(Common::DynamicLibrary& dll, const char* name, T& pfn) {
     if (!dll.GetSymbol(name, &pfn)) {
@@ -125,11 +207,296 @@ static void GetFuncAddress(Common::DynamicLibrary& dll, const char* name, T& pfn
     }
 }
 
+// Map/MapView also compile on desktop Windows. Their accounting must share the
+// same platform scope even though hybrid fastmem is initialized only in UWP.
+namespace {
+std::atomic<u64> g_fastmem_canonical_bytes{0};
+std::atomic<u64> g_fastmem_alias_bytes{0};
+std::atomic<u64> g_fastmem_alias_budget{0};
+std::atomic<u64> g_fastmem_guest_bytes{0};
+std::atomic<u64> g_fastmem_skipped_bytes{0};
+std::atomic<u64> g_fastmem_map_failures{0};
+std::atomic<u64> g_fastmem_hot_offset{0};
+std::atomic<u64> g_fastmem_hot_size_actual{0};
+std::atomic<u64> g_fastmem_request_bytes{0};
+std::atomic<u64> g_fastmem_request_min{~u64{0}};
+std::atomic<u64> g_fastmem_request_max{0};
+constexpr size_t FastmemHistogramShift = 26;
+constexpr size_t FastmemHistogramBuckets = 64;
+std::array<std::atomic<u64>, FastmemHistogramBuckets> g_fastmem_request_histogram{};
+} // namespace
+
+#ifdef HOST_MEMORY_USE_FROM_APP
+// Demand-commit for the Xbox/UWP backing. The backing is PRIVATE memory reserved (MEM_RESERVE) but
+// not eagerly committed — an eager 4 GiB commit busts the Series-S dev-app commit budget, and only
+// MEM_PRIVATE pages can be committed on demand (a MEM_MAPPED section view cannot). The first access
+// to a reserved-but-uncommitted page faults; this vectored handler commits the faulting page's chunk
+// on demand, so only what the guest/kernel actually touches is charged — a tiny homebrew NRO needs a
+// few MiB, while the kernel's full 4 GiB memory-pool layout stays valid. (CORE: Series-S memory.)
+//
+// There is exactly one emulated-DRAM backing (Core::DeviceMemory), so a single file-scope range +
+// committer suffices; the handler is allocation-free and re-entrancy-safe (atomic loads + one commit).
+//
+// With fastmem the backing is instead a SEC_RESERVE section: its views (the linear backing view and
+// the ones mapped into the fastmem arena) are MEM_MAPPED, and committing a page through any view
+// commits the section page for all of them. The 4 GiB SEC_COMMIT section the desktop path uses does
+// not fit the console's commit budget (ERROR_COMMITMENT_LIMIT, measured by the 0.2.51 probe).
+namespace {
+std::atomic<u8*> g_backing_base{nullptr};
+std::atomic<size_t> g_backing_size{0};
+std::atomic<u8*> g_arena_base{nullptr};
+std::atomic<size_t> g_arena_size{0};
+std::atomic<bool> g_backing_is_section{false};
+std::atomic<bool> g_backing_is_file{false};
+std::atomic<bool> g_backing_file_sparse{false};
+PFN_VirtualAllocFromApp g_pfn_virtual_alloc_from_app{nullptr};
+PFN_VirtualProtect g_pfn_virtual_protect_from_app{nullptr};
+PFN_AddVectoredExceptionHandler g_pfn_add_veh{nullptr};
+PFN_RemoveVectoredExceptionHandler g_pfn_remove_veh{nullptr};
+void* g_backing_veh{nullptr};
+
+constexpr size_t BACKING_COMMIT_GRANULARITY = 64 * 1024; // commit in 64 KiB chunks to limit faults
+constexpr uintptr_t HOST_PAGE_SIZE = 4096;
+constexpr size_t SPAN_SIZE = 4 * 1024 * 1024;
+constexpr size_t SPAN_PAGES = SPAN_SIZE / HOST_PAGE_SIZE;
+
+// Section commit accounting for the diag (0.2.55 died with commit far below the app limit, so the
+// error the console returns is what is missing). Written from the handler: atomics only.
+std::atomic<u64> g_section_commit_bytes{0};
+std::atomic<u64> g_commit_failures{0};
+std::atomic<u64> g_page_retry_saves{0};
+std::atomic<u32> g_last_commit_error{0};
+std::atomic<uintptr_t> g_last_failed_address{0};
+std::atomic<u64> g_last_failed_length{0};
+std::atomic<u32> g_last_failed_thread{0};
+std::atomic<u64> g_last_failed_process_commit{0};
+
+// Private commit of the whole process, for the failure record and the crash report.
+u64 ProcessCommitBytes() {
+    PROCESS_MEMORY_COUNTERS counters{};
+    return K32GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))
+               ? counters.PagefileUsage
+               : 0;
+}
+
+void RecordCommitFailure(uintptr_t begin, size_t length) {
+    g_last_commit_error.store(GetLastError(), std::memory_order_relaxed);
+    g_last_failed_address.store(begin, std::memory_order_relaxed);
+    g_last_failed_length.store(length, std::memory_order_relaxed);
+    g_last_failed_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    g_last_failed_process_commit.store(ProcessCommitBytes(), std::memory_order_relaxed);
+    g_commit_failures.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::atomic<uintptr_t> g_held_span{0};
+std::atomic<u32> g_commits_in_flight{0};
+std::mutex g_backing_decommit_mutex;
+
+void WaitHeldSpan(uintptr_t span) {
+    for (u32 spin = 0; g_held_span.load(std::memory_order_acquire) == span; ++spin) {
+        if (spin < 4096) {
+            YieldProcessor();
+        } else {
+            Sleep(spin < 4160 ? 0 : 1);
+        }
+    }
+}
+bool CommitSectionRange(uintptr_t begin, uintptr_t end) {
+    if (g_pfn_virtual_alloc_from_app(reinterpret_cast<void*>(begin), end - begin, MEM_COMMIT,
+                                     PAGE_READWRITE)) {
+        g_section_commit_bytes.fetch_add(end - begin, std::memory_order_relaxed);
+        return true;
+    }
+    RecordCommitFailure(begin, end - begin);
+    return false;
+}
+
+// Section mode: commits the reserved pages of the view around the fault. A committed read-write
+// page means another thread committed it first, so the access is retried; anything else (an
+// unmapped arena placeholder, a page the rasterizer protected) is left to dynarmic's handler.
+LONG SectionDemandCommit(u8* fault_addr) {
+    const uintptr_t page = reinterpret_cast<uintptr_t>(fault_addr) & ~(HOST_PAGE_SIZE - 1);
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(reinterpret_cast<void*>(page), &info, sizeof(info)) == 0 ||
+        info.Type != MEM_MAPPED) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (info.State == MEM_COMMIT) {
+        return info.Protect == PAGE_READWRITE ? EXCEPTION_CONTINUE_EXECUTION
+                                              : EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (info.State != MEM_RESERVE) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const uintptr_t region_end = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+    const uintptr_t chunk_end = (page + BACKING_COMMIT_GRANULARITY) & ~(BACKING_COMMIT_GRANULARITY - 1);
+    const uintptr_t end = (std::min)(region_end, chunk_end);
+    if (CommitSectionRange(page, end)) {
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    // The chunk failed: try the faulting page alone before giving up.
+    if (end - page > HOST_PAGE_SIZE && CommitSectionRange(page, page + HOST_PAGE_SIZE)) {
+        g_page_retry_saves.fetch_add(1, std::memory_order_relaxed);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// Diagnostic: DRAM pages write-protected to catch their first writer.
+constexpr size_t WatchSlots = 256;
+std::array<std::atomic<uintptr_t>, WatchSlots> g_watch_pages{};
+std::atomic<size_t> g_watch_count{0};
+std::atomic<size_t> g_watch_armed{0};
+const auto g_watch_epoch = std::chrono::steady_clock::now();
+
+extern "C" IMAGE_DOS_HEADER __ImageBase;
+
+using PFN_GetThreadDescription = HRESULT(WINAPI*)(HANDLE, PWSTR*);
+
+BOOL WatchProtect(uintptr_t page, DWORD protection) {
+    static Common::DynamicLibrary kernelbase("Kernelbase");
+    static PFN_VirtualProtect protect = [] {
+        PFN_VirtualProtect function{};
+        if (kernelbase.IsOpen()) kernelbase.GetSymbol("VirtualProtectFromApp", &function);
+        return function;
+    }();
+    DWORD old{};
+    return protect && protect(reinterpret_cast<void*>(page), 4096, protection, &old);
+}
+
+std::string CurrentThreadName() {
+    static Common::DynamicLibrary kernelbase("Kernelbase");
+    static PFN_GetThreadDescription describe = [] {
+        PFN_GetThreadDescription function{};
+        if (kernelbase.IsOpen()) kernelbase.GetSymbol("GetThreadDescription", &function);
+        return function;
+    }();
+    PWSTR wide{};
+    if (!describe || FAILED(describe(GetCurrentThread(), &wide)) || !wide) return "?";
+    std::string name;
+    for (const wchar_t* c = wide; *c; ++c) name.push_back(*c < 128 ? static_cast<char>(*c) : '?');
+    LocalFree(wide);
+    return name;
+}
+
+LONG CheckWatchedWrite(EXCEPTION_POINTERS* ep) {
+    if (g_watch_armed.load(std::memory_order_acquire) == 0) return EXCEPTION_CONTINUE_SEARCH;
+    if (ep->ExceptionRecord->ExceptionInformation[0] != 1) return EXCEPTION_CONTINUE_SEARCH;
+    const uintptr_t address = ep->ExceptionRecord->ExceptionInformation[1];
+    const uintptr_t page = address & ~uintptr_t{4095};
+    const size_t count = (std::min)(g_watch_count.load(std::memory_order_acquire), WatchSlots);
+    for (size_t i = 0; i < count; ++i) {
+        uintptr_t expected = page;
+        if (!g_watch_pages[i].compare_exchange_strong(expected, 0)) continue;
+        WatchProtect(page, PAGE_READWRITE);
+        g_watch_armed.fetch_sub(1, std::memory_order_acq_rel);
+        const auto image = reinterpret_cast<uintptr_t>(&__ImageBase);
+        const auto rip = static_cast<uintptr_t>(ep->ContextRecord->Rip);
+        const auto* words = reinterpret_cast<const u64*>(page);
+        size_t nonzero{};
+        for (size_t w = 0; w < 512; ++w) nonzero += words[w] != 0;
+        const auto at = std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                      g_watch_epoch).count();
+        LOG_WARNING(Common_Memory,
+                    "Watched DRAM page {:#x} (offset {:#x}) first written at {:.3f} s by thread '{}' "
+                    "({}), rip {:#x} {}{:#x}, before: {} of 512 words nonzero, {:016x} {:016x} "
+                    "{:016x} {:016x}",
+                    page, address - page, at, CurrentThreadName(), GetCurrentThreadId(), rip,
+                    rip - image < 0x10000000 ? "image+" : "outside image, delta ", rip - image,
+                    nonzero, words[0], words[1], words[2], words[3]);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// The private backing's demand commit of the page at `fault_addr`: its 64 KiB chunk, or the page
+// alone in a partly committed chunk. True when the access can be retried. A failure gives up the
+// Permafrost's commit reserve, when it holds one, and tries again.
+bool CommitBackingPage(u8* fault_addr) {
+    u8* const base = g_backing_base.load(std::memory_order_acquire);
+    const size_t size = g_backing_size.load(std::memory_order_acquire);
+    const size_t offset = static_cast<size_t>(fault_addr - base);
+    const size_t chunk_offset = offset & ~(BACKING_COMMIT_GRANULARITY - 1);
+    const size_t chunk_len = (std::min)(BACKING_COMMIT_GRANULARITY, size - chunk_offset);
+    const auto span = reinterpret_cast<uintptr_t>(base + (offset & ~(SPAN_SIZE - 1)));
+    g_commits_in_flight.fetch_add(1);
+    if (g_held_span.load() == span) {
+        g_commits_in_flight.fetch_sub(1);
+        WaitHeldSpan(span);
+        return true;
+    }
+    // A partly committed chunk takes back only the faulting page.
+    size_t commit_offset = chunk_offset;
+    size_t commit_len = chunk_len;
+    if (MEMORY_BASIC_INFORMATION info{};
+        VirtualQuery(base + chunk_offset, &info, sizeof(info)) != 0 &&
+        !(info.State == MEM_RESERVE &&
+          static_cast<u8*>(info.BaseAddress) + info.RegionSize >= base + chunk_offset + chunk_len)) {
+        commit_offset = offset & ~(HOST_PAGE_SIZE - 1);
+        commit_len = HOST_PAGE_SIZE;
+    }
+    const auto commit = [&] {
+        return g_pfn_virtual_alloc_from_app(base + commit_offset, commit_len, MEM_COMMIT,
+                                            PAGE_READWRITE) != nullptr;
+    };
+    bool committed = commit();
+    if (!committed && Common::Permafrost::ReleaseReserve()) {
+        committed = commit();
+    }
+    if (!committed) {
+        RecordCommitFailure(reinterpret_cast<uintptr_t>(base + commit_offset), commit_len);
+    }
+    g_commits_in_flight.fetch_sub(1);
+    return committed;
+}
+
+LONG NTAPI BackingDemandCommitHandler(EXCEPTION_POINTERS* ep) {
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (CheckWatchedWrite(ep) == EXCEPTION_CONTINUE_EXECUTION) {
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    u8* const base = g_backing_base.load(std::memory_order_acquire);
+    const size_t size = g_backing_size.load(std::memory_order_acquire);
+    if (base == nullptr || g_pfn_virtual_alloc_from_app == nullptr) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const auto fault_addr =
+        reinterpret_cast<u8*>(ep->ExceptionRecord->ExceptionInformation[1]); // [1] = faulting address
+    if (g_backing_is_section.load(std::memory_order_acquire)) {
+        u8* const arena = g_arena_base.load(std::memory_order_acquire);
+        const size_t arena_size = g_arena_size.load(std::memory_order_acquire);
+        const bool in_backing = fault_addr >= base && fault_addr < base + size;
+        const bool in_arena = arena != nullptr && fault_addr >= arena && fault_addr < arena + arena_size;
+        if (in_backing || in_arena) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(fault_addr, &info, sizeof(info)) != 0 && info.Type == MEM_MAPPED) {
+                return SectionDemandCommit(fault_addr);
+            }
+        }
+        // Hybrid backing: its prefix and suffix are private reservations. Arena holes must keep
+        // faulting so Dynarmic patches those accesses to the page-table path.
+        if (!in_backing) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+    }
+    if (fault_addr < base || fault_addr >= base + size) {
+        return EXCEPTION_CONTINUE_SEARCH; // not our backing — let other handlers run
+    }
+    // With Permafrost on, a granule on probation or on disk is brought back first; a resident
+    // one takes the plain demand commit.
+    return Common::Permafrost::OnFault(fault_addr, CommitBackingPage) ? EXCEPTION_CONTINUE_EXECUTION
+                                                                     : EXCEPTION_CONTINUE_SEARCH;
+}
+} // namespace
+#endif
 class HostMemory::Impl {
 public:
-    explicit Impl(size_t backing_size_, size_t virtual_size_)
+    explicit Impl(size_t backing_size_, size_t virtual_size_, HostMemoryFastmemRegion fastmem_region_)
         : backing_size{backing_size_}
         , virtual_size{virtual_size_}
+        , fastmem_region{fastmem_region_}
         , process{GetCurrentProcess()}
         , kernelbase_dll("Kernelbase")
     {}
@@ -139,11 +506,71 @@ public:
             LOG_CRITICAL(HW_Memory, "Failed to load Kernelbase.dll");
             return false;
         }
+#ifdef HOST_MEMORY_USE_FROM_APP
+        GetFuncAddress(kernelbase_dll, "CreateFileMappingFromApp", pfn_CreateFileMappingFromApp);
+        GetFuncAddress(kernelbase_dll, "VirtualAlloc2FromApp", pfn_VirtualAlloc2);
+        GetFuncAddress(kernelbase_dll, "MapViewOfFile3FromApp", pfn_MapViewOfFile3);
+        GetFuncAddress(kernelbase_dll, "VirtualProtectFromApp", pfn_VirtualProtectFromApp);
+#else
         GetFuncAddress(kernelbase_dll, "CreateFileMapping2", pfn_CreateFileMapping2);
         GetFuncAddress(kernelbase_dll, "VirtualAlloc2", pfn_VirtualAlloc2);
         GetFuncAddress(kernelbase_dll, "MapViewOfFile3", pfn_MapViewOfFile3);
+#endif
         GetFuncAddress(kernelbase_dll, "UnmapViewOfFile2", pfn_UnmapViewOfFile2);
 
+        // Allocate the linear DRAM backing.
+#ifdef HOST_MEMORY_USE_FROM_APP
+        // Xbox/UWP: back the emulated DRAM with demand-committable PRIVATE memory, not a file-mapping
+        // section. The section design exists only to alias the backing into virtual_base for fastmem
+        // — which is OFF on UWP (fastmem_arena is always null), so Map()/virtual_base are never used
+        // here (every Map/Unmap/VirtualBasePointer caller is fastmem- or NCE-gated, both off on UWP).
+        // Critically, ONLY MEM_PRIVATE pages can be committed on demand: VirtualAllocFromApp(MEM_COMMIT)
+        // cannot commit pages of a MEM_MAPPED section view in the AppContainer — that is why an earlier
+        // SEC_RESERVE section + demand-commit handler access-violated on-console. So reserve private
+        // address space now (no eager commit — a 4 GiB SEC_COMMIT busts the Series-S dev-app budget);
+        // the handler below commits 64 KiB chunks on first touch, charging only the touched working
+        // set while the full 4 GiB stays reserved (kernel memory-pool layout unchanged).
+        GetFuncAddress(kernelbase_dll, "VirtualAllocFromApp", g_pfn_virtual_alloc_from_app);
+        g_pfn_virtual_protect_from_app = pfn_VirtualProtectFromApp;
+        // Resolve the VEH APIs by name (see typedef note) so we do not hard-import the errorhandling
+        // api-set the Xbox loader lacks — a direct call there makes the app fail to activate on-console.
+        GetFuncAddress(kernelbase_dll, "AddVectoredExceptionHandler", g_pfn_add_veh);
+        GetFuncAddress(kernelbase_dll, "RemoveVectoredExceptionHandler", g_pfn_remove_veh);
+        if (Settings::values.cpuopt_fastmem.GetValue()) {
+            if (fastmem_region.force_full && InitSection()) {
+                return true;
+            }
+            if (fastmem_region.force_full) {
+                LOG_WARNING(HW_Memory, "Full fastmem unavailable, trying the hybrid arena");
+                Release();
+            }
+            if (InitHybridSection()) {
+                return true;
+            }
+            LOG_WARNING(HW_Memory, "Hybrid fastmem unavailable, using the private backing");
+            Release();
+        }
+        backing_base = static_cast<u8*>(
+            g_pfn_virtual_alloc_from_app(nullptr, backing_size, MEM_RESERVE, PAGE_READWRITE));
+        if (backing_base == nullptr) {
+            LOG_CRITICAL(HW_Memory, "Failed to reserve {} MiB of backing memory", backing_size >> 20);
+            return false;
+        }
+        g_backing_base.store(backing_base, std::memory_order_release);
+        g_backing_size.store(backing_size, std::memory_order_release);
+        g_backing_veh = g_pfn_add_veh(/*first=*/1, BackingDemandCommitHandler);
+        if (g_backing_veh == nullptr) {
+            Release();
+            LOG_CRITICAL(HW_Memory, "Failed to install backing demand-commit handler");
+            return false;
+        }
+        StartGuestSwap();
+        // No file-mapping section and no fastmem arena on UWP. VirtualBasePointer() returns null;
+        // that is tolerated by all callers (fastmem disabled).
+        backing_handle = nullptr;
+        virtual_base = nullptr;
+        return true;
+#else
         if (!pfn_CreateFileMapping2 || !pfn_VirtualAlloc2 || !pfn_MapViewOfFile3 || !pfn_UnmapViewOfFile2) {
             LOG_CRITICAL(HW_Memory, "Failed to find functions for virtual allocs");
             return false;
@@ -177,11 +604,453 @@ public:
             return false;
         }
         return true;
+#endif
     }
 
     ~Impl() {
         Release();
     }
+
+#ifdef HOST_MEMORY_USE_FROM_APP
+    /// Cold guest memory to disk, over the private backing only: a section page cannot be
+    /// decommitted on its own.
+    void StartGuestSwap() {
+        GuestSwapSettings settings;
+        {
+            std::scoped_lock lock{g_guest_swap_settings_mutex};
+            settings = g_guest_swap_settings;
+        }
+        if (!settings.enabled) {
+            return;
+        }
+        if (g_pfn_virtual_protect_from_app == nullptr) {
+            LOG_WARNING(HW_Memory, "Permafrost off: VirtualProtectFromApp is missing");
+            return;
+        }
+        const Permafrost::Platform platform{
+            [](void* address, size_t size) {
+                return g_pfn_virtual_alloc_from_app(address, size, MEM_COMMIT, PAGE_READWRITE) !=
+                       nullptr;
+            },
+            [](void* address, size_t size, u32 protection) {
+                DWORD old{};
+                return g_pfn_virtual_protect_from_app(address, size, protection, &old) != FALSE;
+            },
+            [](size_t size) {
+                return g_pfn_virtual_alloc_from_app(nullptr, size, MEM_COMMIT | MEM_RESERVE,
+                                                    PAGE_READWRITE);
+            },
+            [](const char* name) { Common::SetCurrentThreadName(name); },
+        };
+        const Permafrost::Config config{
+            .path = settings.path,
+            .reserve_bytes = settings.reserve_bytes,
+            .probation_ms = settings.probation_ms,
+            .min_idle_ms = settings.min_idle_ms,
+            .batch_bytes = settings.batch_bytes,
+            .fill_pages = settings.fill_pages,
+            .prefetch = settings.prefetch,
+            .pause_fill = settings.pause_fill,
+        };
+        if (Permafrost::Init(backing_base, backing_size, platform, config)) {
+            LOG_INFO(HW_Memory,
+                     "Permafrost on: {} MiB reserve, {} ms probation, {} ms idle, {} MiB batches, "
+                     "fill {} pages, prefetch {}, pause fill {}",
+                     settings.reserve_bytes >> 20, settings.probation_ms, settings.min_idle_ms,
+                     settings.batch_bytes >> 20, settings.fill_pages,
+                     settings.prefetch ? "on" : "off", settings.pause_fill ? "on" : "off");
+        } else {
+            LOG_WARNING(HW_Memory, "Permafrost off: the swap file could not be opened (error {})",
+                        GetLastError());
+        }
+    }
+
+    /// Xbox fastmem: only a bounded hot slice of the application pool is section-backed. The private
+    /// reservations and the mapped section remain adjacent, so every existing BackingBasePointer
+    /// user still sees one linear DRAM allocation. Only the section-backed range can be aliased.
+    bool InitHybridSection() {
+        if (!pfn_CreateFileMappingFromApp || !pfn_VirtualAlloc2 || !pfn_MapViewOfFile3 ||
+            !pfn_UnmapViewOfFile2 || !g_pfn_virtual_alloc_from_app || !g_pfn_add_veh) {
+            return false;
+        }
+        hybrid_hot_offset = AlignDown(fastmem_region.offset, size_t{64} << 10);
+        hybrid_hot_size = AlignDown(fastmem_region.size, size_t{64} << 10);
+        if (hybrid_hot_size == 0 || hybrid_hot_offset >= backing_size ||
+            hybrid_hot_size > backing_size - hybrid_hot_offset) {
+            LOG_WARNING(HW_Memory, "Invalid hybrid fastmem range at {:#x}, size {:#x}",
+                        hybrid_hot_offset, hybrid_hot_size);
+            return false;
+        }
+        hybrid_alias_budget =
+            (std::min)(MaxHybridAliasBudget, HybridTotalViewBudget - hybrid_hot_size);
+
+        backing_file = OpenBackingFile();
+        if (backing_file == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+        backing_handle = pfn_CreateFileMappingFromApp(backing_file, nullptr, PAGE_READWRITE,
+                                                      hybrid_hot_size, nullptr);
+        if (!backing_handle) {
+            LOG_WARNING(HW_Memory, "Failed to create the hybrid fastmem section, error {}",
+                        GetLastError());
+            return false;
+        }
+        backing_base = static_cast<u8*>(pfn_VirtualAlloc2(
+            process, nullptr, backing_size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS,
+            nullptr, 0));
+        if (!backing_base) {
+            LOG_WARNING(HW_Memory, "Failed to reserve the hybrid backing, error {}", GetLastError());
+            return false;
+        }
+        hybrid = true;
+
+        // Split [private prefix | mapped hot section | private suffix].
+        if (hybrid_hot_offset != 0 &&
+            !VirtualFree(backing_base, hybrid_hot_offset,
+                         MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+            LOG_WARNING(HW_Memory, "Failed to split the hybrid backing prefix, error {}",
+                        GetLastError());
+            return false;
+        }
+        hybrid_split_prefix = hybrid_hot_offset != 0;
+        if (hybrid_hot_offset + hybrid_hot_size != backing_size &&
+            !VirtualFree(backing_base + hybrid_hot_offset, hybrid_hot_size,
+                         MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+            LOG_WARNING(HW_Memory, "Failed to split the hybrid backing suffix, error {}",
+                        GetLastError());
+            return false;
+        }
+        hybrid_split_suffix = hybrid_hot_offset + hybrid_hot_size != backing_size;
+        if (hybrid_hot_offset != 0 &&
+            pfn_VirtualAlloc2(process, backing_base, hybrid_hot_offset,
+                              MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr,
+                              0) != backing_base) {
+            LOG_WARNING(HW_Memory, "Failed to reserve the hybrid private prefix, error {}",
+                        GetLastError());
+            return false;
+        }
+        hybrid_prefix_private = hybrid_hot_offset != 0;
+        const size_t suffix_offset = hybrid_hot_offset + hybrid_hot_size;
+        if (suffix_offset != backing_size &&
+            pfn_VirtualAlloc2(process, backing_base + suffix_offset, backing_size - suffix_offset,
+                              MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr,
+                              0) != backing_base + suffix_offset) {
+            LOG_WARNING(HW_Memory, "Failed to reserve the hybrid private suffix, error {}",
+                        GetLastError());
+            return false;
+        }
+        hybrid_suffix_private = suffix_offset != backing_size;
+        if (pfn_MapViewOfFile3(backing_handle, process, backing_base + hybrid_hot_offset, 0,
+                               hybrid_hot_size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr,
+                               0) != backing_base + hybrid_hot_offset) {
+            LOG_WARNING(HW_Memory, "Failed to map the hybrid canonical view, error {}",
+                        GetLastError());
+            return false;
+        }
+        hybrid_canonical_mapped = true;
+
+        virtual_base = static_cast<u8*>(pfn_VirtualAlloc2(
+            process, nullptr, virtual_size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS,
+            nullptr, 0));
+        if (!virtual_base) {
+            LOG_WARNING(HW_Memory, "Failed to reserve the hybrid fastmem arena, error {}",
+                        GetLastError());
+            return false;
+        }
+
+        // Exercise coherence before exposing the arena to Dynarmic. This catches a section/view
+        // incompatibility here and preserves the all-private fallback instead of failing in-game.
+        constexpr size_t VerifySize = size_t{64} << 10;
+        bool verify_ok = VirtualFree(virtual_base, VerifySize,
+                                     MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != FALSE;
+        if (verify_ok) {
+            verify_ok = pfn_MapViewOfFile3(backing_handle, process, virtual_base, 0, VerifySize,
+                                           MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr,
+                                           0) == virtual_base;
+        }
+        if (verify_ok) {
+            volatile u8* const canonical = backing_base + hybrid_hot_offset;
+            volatile u8* const alias = virtual_base;
+            const u8 original = canonical[0];
+            canonical[0] = 0xA5;
+            verify_ok = alias[0] == 0xA5;
+            alias[0] = 0x5A;
+            verify_ok = verify_ok && canonical[0] == 0x5A;
+            canonical[0] = original;
+            pfn_UnmapViewOfFile2(process, virtual_base, MEM_PRESERVE_PLACEHOLDER);
+        }
+        const bool coalesced =
+            VirtualFree(virtual_base, virtual_size,
+                        MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != FALSE;
+        verify_ok = verify_ok && coalesced;
+        if (!verify_ok) {
+            LOG_WARNING(HW_Memory, "Hybrid fastmem coherence check failed, error {}",
+                        GetLastError());
+            return false;
+        }
+
+        g_backing_base.store(backing_base, std::memory_order_release);
+        g_backing_size.store(backing_size, std::memory_order_release);
+        g_arena_base.store(virtual_base, std::memory_order_release);
+        g_arena_size.store(virtual_size, std::memory_order_release);
+        g_backing_is_section.store(true, std::memory_order_release);
+        g_fastmem_canonical_bytes.store(hybrid_hot_size, std::memory_order_release);
+        g_fastmem_alias_bytes.store(0, std::memory_order_release);
+        g_fastmem_alias_budget.store(hybrid_alias_budget, std::memory_order_release);
+        g_fastmem_guest_bytes.store(0, std::memory_order_release);
+        g_fastmem_skipped_bytes.store(0, std::memory_order_release);
+        g_fastmem_map_failures.store(0, std::memory_order_release);
+        g_fastmem_request_bytes.store(0, std::memory_order_release);
+        g_fastmem_request_min.store(~u64{0}, std::memory_order_release);
+        g_fastmem_request_max.store(0, std::memory_order_release);
+        for (auto& bucket : g_fastmem_request_histogram) {
+            bucket.store(0, std::memory_order_release);
+        }
+        g_fastmem_hot_offset.store(hybrid_hot_offset, std::memory_order_release);
+        g_fastmem_hot_size_actual.store(hybrid_hot_size, std::memory_order_release);
+        g_backing_veh = g_pfn_add_veh(/*first=*/1, BackingDemandCommitHandler);
+        if (!g_backing_veh) {
+            LOG_WARNING(HW_Memory, "Failed to install the hybrid demand-commit handler");
+            return false;
+        }
+        LOG_INFO(HW_Memory,
+                 "Hybrid fastmem: {} MiB at DRAM offset {:#x}, {} GiB arena, alias budget {} MiB",
+                 hybrid_hot_size >> 20, hybrid_hot_offset, virtual_size >> 30,
+                 hybrid_alias_budget >> 20);
+        return true;
+    }
+
+    /// Fastmem layout for the AppContainer: the DRAM is a SEC_RESERVE section mapped once as the
+    /// linear backing, plus the address-space placeholder that Map() fills with views of it. Pages
+    /// are committed on first touch by the demand-commit handler.
+    bool InitSection() {
+        if (!pfn_CreateFileMappingFromApp || !pfn_VirtualAlloc2 || !pfn_MapViewOfFile3 ||
+            !pfn_UnmapViewOfFile2 || !g_pfn_virtual_alloc_from_app || !g_pfn_add_veh) {
+            LOG_CRITICAL(HW_Memory, "Failed to find functions for the fastmem arena");
+            return false;
+        }
+        // A pagefile-backed section charges system commit, of which the console leaves the app
+        // about 1.1 GiB in all sections (0.2.56 probe), and the game ran out a minute in. A section
+        // over a real file charges no commit: its pages are backed by the file.
+        backing_file = OpenBackingFile();
+        if (backing_file == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+        backing_handle = pfn_CreateFileMappingFromApp(backing_file, nullptr, PAGE_READWRITE,
+                                                      backing_size, nullptr);
+        if (!backing_handle) {
+            LOG_CRITICAL(HW_Memory, "Failed to create a {} MiB file-backed section, error {}",
+                         backing_size >> 20, GetLastError());
+            return false;
+        }
+        backing_base = static_cast<u8*>(pfn_VirtualAlloc2(process, nullptr, backing_size,
+                                                          MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                                                          PAGE_NOACCESS, nullptr, 0));
+        if (!backing_base) {
+            LOG_CRITICAL(HW_Memory, "Failed to reserve {} MiB of virtual memory, error {}",
+                         backing_size >> 20, GetLastError());
+            return false;
+        }
+        if (!MapBackingViews()) {
+            return false;
+        }
+        virtual_base = static_cast<u8*>(pfn_VirtualAlloc2(process, nullptr, virtual_size,
+                                                          MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                                                          PAGE_NOACCESS, nullptr, 0));
+        if (!virtual_base) {
+            LOG_CRITICAL(HW_Memory, "Failed to reserve {} GiB of virtual memory, error {}",
+                         virtual_size >> 30, GetLastError());
+            return false;
+        }
+        g_backing_base.store(backing_base, std::memory_order_release);
+        g_backing_size.store(backing_size, std::memory_order_release);
+        g_arena_base.store(virtual_base, std::memory_order_release);
+        g_arena_size.store(virtual_size, std::memory_order_release);
+        g_backing_is_section.store(true, std::memory_order_release);
+        g_backing_veh = g_pfn_add_veh(/*first=*/1, BackingDemandCommitHandler);
+        if (g_backing_veh == nullptr) {
+            LOG_CRITICAL(HW_Memory, "Failed to install backing demand-commit handler");
+            return false;
+        }
+        LOG_INFO(HW_Memory, "Fastmem arena: {} GiB reserved over a {} MiB file-backed section",
+                 virtual_size >> 30, backing_size >> 20);
+        return true;
+    }
+
+    /// Maps the section over the backing placeholder: one view, or, when the console refuses a
+    /// view that large (error 8 for 4 GiB of a file, 0.2.56.1), one view per piece of the
+    /// placeholder, split first.
+    bool MapBackingViews() {
+        if (pfn_MapViewOfFile3(backing_handle, process, backing_base, 0, backing_size,
+                               MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr,
+                               0) == backing_base) {
+            backing_mapped = true;
+            return true;
+        }
+        const DWORD whole_error = GetLastError();
+        for (const size_t piece : {size_t{1} << 30, size_t{256} << 20}) {
+            if (backing_size % piece != 0) {
+                continue;
+            }
+            const size_t count = backing_size / piece;
+            size_t mapped = 0;
+            DWORD error = 0;
+            for (; mapped < count; ++mapped) {
+                u8* const address = backing_base + mapped * piece;
+                if (mapped + 1 < count &&
+                    !VirtualFree(address, piece, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+                    error = GetLastError();
+                    break;
+                }
+                if (pfn_MapViewOfFile3(backing_handle, process, address, mapped * piece, piece,
+                                       MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr,
+                                       0) != address) {
+                    error = GetLastError();
+                    break;
+                }
+            }
+            backing_piece = piece;
+            backing_pieces = mapped;
+            if (mapped == count) {
+                LOG_INFO(HW_Memory,
+                         "A {} MiB view of the DRAM failed (error {}), mapped it as {} views of "
+                         "{} MiB",
+                         backing_size >> 20, whole_error, count, piece >> 20);
+                return true;
+            }
+            LOG_WARNING(HW_Memory, "Mapping the DRAM as {} MiB views stopped at {} of {}, error {}",
+                        piece >> 20, mapped, count, error);
+            UnmapBackingViews(); // the placeholder is split now: release it and start over
+            backing_base = static_cast<u8*>(pfn_VirtualAlloc2(
+                process, nullptr, backing_size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS, nullptr, 0));
+            if (!backing_base) {
+                return false;
+            }
+        }
+        LOG_CRITICAL(HW_Memory, "Failed to map {} MiB of backing memory, error {}",
+                     backing_size >> 20, whole_error);
+        return false;
+    }
+
+    /// Unmaps the backing views and releases the backing placeholder, whole or in pieces.
+    void UnmapBackingViews() {
+        if (!backing_base) {
+            return;
+        }
+        if (backing_piece != 0) {
+            const size_t count = backing_size / backing_piece;
+            for (size_t i = 0; i < count; ++i) {
+                u8* const address = backing_base + i * backing_piece;
+                if (i < backing_pieces) {
+                    pfn_UnmapViewOfFile2(process, address, MEM_PRESERVE_PLACEHOLDER);
+                }
+                // Past the last split the rest is one placeholder: only its first piece is an
+                // allocation base, and releasing inside it just fails.
+                VirtualFree(address, 0, MEM_RELEASE);
+            }
+        } else {
+            if (backing_mapped) {
+                pfn_UnmapViewOfFile2(process, backing_base, MEM_PRESERVE_PLACEHOLDER);
+            }
+            VirtualFreeEx(process, backing_base, 0, MEM_RELEASE);
+        }
+        backing_base = nullptr;
+        backing_mapped = false;
+        backing_piece = 0;
+        backing_pieces = 0;
+    }
+
+    /// The file behind the DRAM section: in the app's temp folder, deleted when the handle closes
+    /// (also when the process dies), marked temporary so the OS keeps its pages in memory rather
+    /// than writing them out, and sparse so pages written far into it do not make the file system
+    /// zero everything before them on disk.
+    HANDLE OpenBackingFile() {
+        using PFN_CreateFile2 = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, DWORD,
+                                                LPCREATEFILE2_EXTENDED_PARAMETERS);
+        using PFN_GetTempPathW = DWORD(WINAPI*)(DWORD, LPWSTR);
+        using PFN_DeviceIoControl = BOOL(WINAPI*)(HANDLE, DWORD, LPVOID, DWORD, LPVOID, DWORD,
+                                                  LPDWORD, LPOVERLAPPED);
+        PFN_CreateFile2 create_file2{};
+        PFN_GetTempPathW get_temp_path{};
+        PFN_DeviceIoControl device_io_control{};
+        GetFuncAddress(kernelbase_dll, "CreateFile2", create_file2);
+        GetFuncAddress(kernelbase_dll, "GetTempPathW", get_temp_path);
+        GetFuncAddress(kernelbase_dll, "DeviceIoControl", device_io_control);
+        if (!create_file2 || !get_temp_path) {
+            return INVALID_HANDLE_VALUE;
+        }
+        wchar_t temp[MAX_PATH]{};
+        const DWORD length = get_temp_path(MAX_PATH, temp);
+        if (length == 0 || length >= MAX_PATH) {
+            LOG_CRITICAL(HW_Memory, "Failed to get the temp folder, error {}", GetLastError());
+            return INVALID_HANDLE_VALUE;
+        }
+        const std::wstring path = std::wstring(temp) + L"jadyx_dram.bin";
+        CREATEFILE2_EXTENDED_PARAMETERS params{};
+        params.dwSize = sizeof(params);
+        params.dwFileAttributes = FILE_ATTRIBUTE_TEMPORARY;
+        params.dwFileFlags = FILE_FLAG_DELETE_ON_CLOSE;
+        const HANDLE file = create_file2(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
+                                         CREATE_ALWAYS, &params);
+        if (file == INVALID_HANDLE_VALUE) {
+            LOG_CRITICAL(HW_Memory, "Failed to create the DRAM file in the temp folder, error {}",
+                         GetLastError());
+            return INVALID_HANDLE_VALUE;
+        }
+        DWORD returned{};
+        const bool sparse = device_io_control &&
+                            device_io_control(file, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0,
+                                              &returned, nullptr);
+        if (!sparse) {
+            LOG_WARNING(HW_Memory, "The DRAM file could not be made sparse, error {}",
+                        GetLastError());
+        }
+        g_backing_is_file.store(true, std::memory_order_release);
+        g_backing_file_sparse.store(sparse, std::memory_order_release);
+        return file;
+    }
+
+    bool IsSection() const {
+        return backing_handle != nullptr;
+    }
+
+    /// VirtualProtect over a view of the reserved section fails on pages still only reserved, and
+    /// ProtectRegion hands whole heap regions here. Committing them all to protect them (0.2.53)
+    /// ran the console out of commit a minute in, with the demand-commit handler then failing. So
+    /// only committed runs are protected. Reserved runs asked for read-write are skipped, since
+    /// the handler commits them read-write on first touch; anything stricter (rasterizer-cached
+    /// ranges) is committed so a later fastmem access still traps.
+    void ProtectSectionView(u8* begin, size_t length, DWORD new_flags) {
+        u8* address = begin;
+        u8* const end = begin + length;
+        while (address < end) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(address, &info, sizeof(info)) == 0) {
+                LOG_CRITICAL(HW_Memory, "Failed to query virtual memory, error {}", GetLastError());
+                return;
+            }
+            u8* const region_end =
+                (std::min)(static_cast<u8*>(info.BaseAddress) + info.RegionSize, end);
+            const size_t region_length = static_cast<size_t>(region_end - address);
+            bool apply = info.State == MEM_COMMIT;
+            if (info.State == MEM_RESERVE && new_flags != PAGE_READWRITE) {
+                apply = CommitSectionRange(reinterpret_cast<uintptr_t>(address),
+                                           reinterpret_cast<uintptr_t>(region_end));
+                if (!apply) {
+                    LOG_CRITICAL(HW_Memory, "Failed to commit {} KiB to protect it, error {}",
+                                 region_length >> 10, GetLastError());
+                }
+            }
+            DWORD old_flags{};
+            if (apply && !HOST_MEMORY_VIRTUAL_PROTECT(address, region_length, new_flags, &old_flags)) {
+                LOG_CRITICAL(HW_Memory, "Failed to change virtual memory protect rules, error {}",
+                             GetLastError());
+            }
+            address = region_end;
+        }
+    }
+#endif
 
     void* Allocate(size_t size) {
         auto* ptr = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
@@ -193,13 +1062,45 @@ public:
 
     void Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms) {
         std::unique_lock lock{placeholder_mutex};
+        if (hybrid) {
+            g_fastmem_request_bytes.fetch_add(length, std::memory_order_relaxed);
+            g_fastmem_request_min.store(
+                (std::min)(g_fastmem_request_min.load(std::memory_order_relaxed), u64{host_offset}),
+                std::memory_order_relaxed);
+            g_fastmem_request_max.store(
+                (std::max)(g_fastmem_request_max.load(std::memory_order_relaxed),
+                           u64{host_offset + length}),
+                std::memory_order_relaxed);
+            for (size_t offset = host_offset; offset < host_offset + length;) {
+                const size_t bucket = offset >> FastmemHistogramShift;
+                const size_t bucket_end = (std::min)(host_offset + length,
+                                                     (bucket + 1) << FastmemHistogramShift);
+                if (bucket < g_fastmem_request_histogram.size()) {
+                    g_fastmem_request_histogram[bucket].fetch_add(bucket_end - offset,
+                                                                  std::memory_order_relaxed);
+                }
+                offset = bucket_end;
+            }
+            const size_t host_end = host_offset + length;
+            const size_t hot_end = hybrid_hot_offset + hybrid_hot_size;
+            const size_t mapped_begin = (std::max)(host_offset, hybrid_hot_offset);
+            const size_t mapped_end = (std::min)(host_end, hot_end);
+            if (mapped_begin >= mapped_end) {
+                return;
+            }
+            virtual_offset += mapped_begin - host_offset;
+            host_offset = mapped_begin;
+            length = mapped_end - mapped_begin;
+        }
         if (!IsNiechePlaceholder(virtual_offset, length)) {
             Split(virtual_offset, length);
         }
         ASSERT(placeholders.find({virtual_offset, virtual_offset + length}) == placeholders.end());
-        TrackPlaceholder(virtual_offset, host_offset, length);
-
-        MapView(virtual_offset, host_offset, length);
+        if (MapView(virtual_offset, host_offset, length)) {
+            TrackPlaceholder(virtual_offset, host_offset, length);
+        } else {
+            CoalesceAroundHole(virtual_offset, length);
+        }
     }
 
     void Unmap(size_t virtual_offset, size_t length) {
@@ -229,7 +1130,17 @@ public:
             const size_t offset = (std::max)(it->lower(), virtual_offset);
             const size_t protect_length = (std::min)(it->upper(), virtual_end) - offset;
             DWORD old_flags{};
-            if (!VirtualProtect(virtual_base + offset, protect_length, new_flags, &old_flags)) {
+#ifdef HOST_MEMORY_USE_FROM_APP
+            if (IsSection()) {
+                ProtectSectionView(virtual_base + offset, protect_length, new_flags);
+                ++it;
+                continue;
+            }
+#endif
+            const bool protected_ok = HOST_MEMORY_VIRTUAL_PROTECT(virtual_base + offset,
+                                                                  protect_length, new_flags,
+                                                                  &old_flags);
+            if (!protected_ok) {
                 LOG_CRITICAL(HW_Memory, "Failed to change virtual memory protect rules");
             }
             ++it;
@@ -243,6 +1154,7 @@ public:
 
     const size_t backing_size; ///< Size of the backing memory in bytes
     const size_t virtual_size; ///< Size of the virtual address placeholder in bytes
+    const HostMemoryFastmemRegion fastmem_region;
 
     u8* backing_base{};
     u8* virtual_base{};
@@ -250,6 +1162,86 @@ public:
 private:
     /// Release all resources in the object
     void Release() {
+#ifdef HOST_MEMORY_USE_FROM_APP
+        // UWP: private demand-committed backing, no section handle and no fastmem arena. Tear down the
+        // demand-commit handler first, then release the private reservation (committed pages included).
+        // Permafrost goes before it, with its file: nothing faults into it any more.
+        Permafrost::Shutdown();
+        if (g_backing_veh != nullptr && g_pfn_remove_veh != nullptr) {
+            g_pfn_remove_veh(g_backing_veh);
+            g_backing_veh = nullptr;
+        }
+        g_backing_is_section.store(false, std::memory_order_release);
+        g_arena_base.store(nullptr, std::memory_order_release);
+        g_arena_size.store(0, std::memory_order_release);
+        g_backing_base.store(nullptr, std::memory_order_release);
+        g_backing_size.store(0, std::memory_order_release);
+        if (backing_handle || backing_file != INVALID_HANDLE_VALUE) {
+            ReleaseSection();
+            return;
+        }
+        if (backing_base) {
+            if (!VirtualFree(backing_base, 0, MEM_RELEASE)) {
+                LOG_CRITICAL(HW_Memory, "Failed to free backing memory");
+            }
+            backing_base = nullptr;
+        }
+    }
+
+    void ReleaseSection() {
+        if (!placeholders.empty()) {
+            for (const auto& placeholder : placeholders) {
+                pfn_UnmapViewOfFile2(process, virtual_base + placeholder.lower(),
+                                     MEM_PRESERVE_PLACEHOLDER);
+            }
+            Coalesce(0, virtual_size);
+            placeholders.clear();
+            placeholder_host_pointers.clear();
+        }
+        if (virtual_base) {
+            VirtualFree(virtual_base, 0, MEM_RELEASE);
+            virtual_base = nullptr;
+        }
+        if (hybrid) {
+            if (hybrid_canonical_mapped) {
+                pfn_UnmapViewOfFile2(process, backing_base + hybrid_hot_offset,
+                                     MEM_PRESERVE_PLACEHOLDER);
+                hybrid_canonical_mapped = false;
+            }
+            const size_t suffix_offset = hybrid_hot_offset + hybrid_hot_size;
+            if (hybrid_prefix_private) {
+                VirtualFree(backing_base, 0, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            }
+            if (hybrid_suffix_private) {
+                VirtualFree(backing_base + suffix_offset, 0,
+                            MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            }
+            if (hybrid_split_prefix || hybrid_split_suffix) {
+                VirtualFree(backing_base, backing_size,
+                            MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+            }
+            VirtualFree(backing_base, 0, MEM_RELEASE);
+            backing_base = nullptr;
+            hybrid = false;
+            hybrid_alias_bytes = 0;
+        } else {
+            UnmapBackingViews();
+        }
+        if (backing_handle) {
+            CloseHandle(backing_handle);
+        }
+        backing_handle = nullptr;
+        if (backing_file != INVALID_HANDLE_VALUE) {
+            CloseHandle(backing_file); // deletes it (FILE_FLAG_DELETE_ON_CLOSE)
+            backing_file = INVALID_HANDLE_VALUE;
+        }
+        g_backing_is_file.store(false, std::memory_order_release);
+        g_fastmem_canonical_bytes.store(0, std::memory_order_release);
+        g_fastmem_alias_bytes.store(0, std::memory_order_release);
+        g_fastmem_alias_budget.store(0, std::memory_order_release);
+        g_fastmem_hot_offset.store(0, std::memory_order_release);
+        g_fastmem_hot_size_actual.store(0, std::memory_order_release);
+#else
         if (!placeholders.empty()) {
             for (const auto& placeholder : placeholders) {
                 if (!pfn_UnmapViewOfFile2(process, virtual_base + placeholder.lower(),
@@ -275,6 +1267,7 @@ private:
         if (!CloseHandle(backing_handle)) {
             LOG_CRITICAL(HW_Memory, "Failed to free backing memory file handle");
         }
+#endif
     }
 
     /// Unmap one placeholder in the given range (partial unmaps are supported)
@@ -304,6 +1297,10 @@ private:
                                   MEM_PRESERVE_PLACEHOLDER)) {
             LOG_CRITICAL(HW_Memory, "Failed to unmap placeholder");
         }
+        if (hybrid) {
+            hybrid_alias_bytes -= placeholder_end - placeholder_begin;
+            g_fastmem_alias_bytes.store(hybrid_alias_bytes, std::memory_order_relaxed);
+        }
         // If we have to remap memory regions due to partial unmaps, we are in a data race as
         // Windows doesn't support remapping memory without unmapping first. Avoid adding any extra
         // logic within the panic region described below.
@@ -312,13 +1309,11 @@ private:
         if (split_left || split_right) {
             Split(unmap_begin, unmap_end - unmap_begin);
         }
-        if (split_left) {
-            MapView(placeholder_begin, host_offset, unmap_begin - placeholder_begin);
-        }
-        if (split_right) {
-            MapView(unmap_end, host_offset + unmap_end - placeholder_begin,
-                    placeholder_end - unmap_end);
-        }
+        const bool mapped_left =
+            split_left && MapView(placeholder_begin, host_offset, unmap_begin - placeholder_begin);
+        const bool mapped_right =
+            split_right && MapView(unmap_end, host_offset + unmap_end - placeholder_begin,
+                                   placeholder_end - unmap_end);
         // End panic region
 
         size_t coalesce_begin = unmap_begin;
@@ -340,20 +1335,50 @@ private:
         }
         // Remove and reinsert placeholder trackers
         UntrackPlaceholder(it);
-        if (split_left) {
+        if (mapped_left) {
             TrackPlaceholder(placeholder_begin, host_offset, unmap_begin - placeholder_begin);
         }
-        if (split_right) {
+        if (mapped_right) {
             TrackPlaceholder(unmap_end, host_offset + unmap_end - placeholder_begin,
                              placeholder_end - unmap_end);
         }
         return true;
     }
 
-    void MapView(size_t virtual_offset, size_t host_offset, size_t length) {
-        if (!pfn_MapViewOfFile3(backing_handle, process, virtual_base + virtual_offset, host_offset,
-                                length, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0)) {
-            LOG_CRITICAL(HW_Memory, "Failed to map placeholder");
+    bool MapView(size_t virtual_offset, size_t host_offset, size_t length) {
+        if (hybrid && length > hybrid_alias_budget - hybrid_alias_bytes) {
+            g_fastmem_skipped_bytes.fetch_add(length, std::memory_order_relaxed);
+            LOG_WARNING(HW_Memory, "Hybrid fastmem alias budget exhausted; {} KiB stays on page table",
+                        length >> 10);
+            return false;
+        }
+        const size_t section_offset = hybrid ? host_offset - hybrid_hot_offset : host_offset;
+        if (!pfn_MapViewOfFile3(backing_handle, process, virtual_base + virtual_offset,
+                                section_offset, length, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE,
+                                nullptr, 0)) {
+            g_fastmem_map_failures.fetch_add(1, std::memory_order_relaxed);
+            g_fastmem_skipped_bytes.fetch_add(length, std::memory_order_relaxed);
+            LOG_WARNING(HW_Memory,
+                        "Failed to map fastmem alias at guest {:#x}, {} KiB, error {}; using page table",
+                        virtual_offset, length >> 10, GetLastError());
+            return false;
+        }
+        if (hybrid) {
+            hybrid_alias_bytes += length;
+            g_fastmem_alias_bytes.store(hybrid_alias_bytes, std::memory_order_relaxed);
+            g_fastmem_guest_bytes.fetch_add(length, std::memory_order_relaxed);
+        }
+        return true;
+    }
+
+    void CoalesceAroundHole(size_t virtual_offset, size_t length) {
+        // The failed mapping left exactly this range as a placeholder. Neighboring mapped views
+        // delimit the largest placeholder range that can safely be coalesced.
+        const auto right = placeholders.upper_bound({virtual_offset, virtual_offset + length});
+        const size_t begin = right == placeholders.begin() ? 0 : std::prev(right)->upper();
+        const size_t end = right == placeholders.end() ? virtual_size : right->lower();
+        if (begin < virtual_offset || virtual_offset + length < end) {
+            Coalesce(begin, end - begin);
         }
     }
 
@@ -394,12 +1419,30 @@ private:
 
     HANDLE process{};        ///< Current process handle
     HANDLE backing_handle{}; ///< File based backing memory
+    static constexpr size_t MaxHybridAliasBudget = size_t{512} << 20;
+    static constexpr size_t HybridTotalViewBudget = size_t{896} << 20;
+    bool hybrid{};
+    bool hybrid_canonical_mapped{};
+    bool hybrid_split_prefix{};
+    bool hybrid_split_suffix{};
+    bool hybrid_prefix_private{};
+    bool hybrid_suffix_private{};
+    size_t hybrid_hot_offset{};
+    size_t hybrid_hot_size{};
+    size_t hybrid_alias_bytes{};
+    size_t hybrid_alias_budget{};
+    bool backing_mapped{};   ///< UWP fastmem: the section view replaced the backing placeholder
+    HANDLE backing_file{INVALID_HANDLE_VALUE}; ///< UWP fastmem: the file behind the section
+    size_t backing_piece{};  ///< UWP fastmem: size of each backing view, 0 for a single view
+    size_t backing_pieces{}; ///< UWP fastmem: backing views mapped in pieces
 
     DynamicLibrary kernelbase_dll;
     PFN_CreateFileMapping2 pfn_CreateFileMapping2{};
+    PFN_CreateFileMappingFromApp pfn_CreateFileMappingFromApp{};
     PFN_VirtualAlloc2 pfn_VirtualAlloc2{};
     PFN_MapViewOfFile3 pfn_MapViewOfFile3{};
     PFN_UnmapViewOfFile2 pfn_UnmapViewOfFile2{};
+    PFN_VirtualProtect pfn_VirtualProtectFromApp{};
 
     std::mutex placeholder_mutex;                                 ///< Mutex for placeholders
     boost::icl::separate_interval_set<size_t> placeholders;       ///< Mapped placeholders
@@ -415,7 +1458,7 @@ private:
 #define MAP_NOCORE 0
 #endif
 
-#if defined(ARCHITECTURE_arm64) && !defined(__APPLE__)
+#ifdef ARCHITECTURE_arm64
 
 static void* ChooseVirtualBase(size_t virtual_size) {
     constexpr uintptr_t Map39BitSize = (1ULL << 39);
@@ -531,19 +1574,8 @@ public:
 #endif
 
     bool Init() {
-        const long page_size = sysconf(_SC_PAGESIZE);
-        if (page_size < static_cast<long>(PageAlignment) ||
-            page_size % static_cast<long>(PageAlignment) != 0) {
-            LOG_WARNING(Common_Memory, "Host page size {:#x} does not support fastmem", page_size);
-            return false;
-        }
-#ifdef HAS_NCE
-        if (page_size != static_cast<long>(PageAlignment) && Settings::IsNceEnabled()) {
-            LOG_WARNING(Common_Memory, "Host page size {:#x} does not support fastmem with NCE", page_size);
-            return false;
-        }
-#endif
-        host_page_size = static_cast<size_t>(page_size);
+        long page_size = sysconf(_SC_PAGESIZE);
+        ASSERT_MSG(page_size == 0x1000, "page size {:#x} is incompatible with 4K paging", page_size);
         // Backing memory initialization
 #if defined(__sun__) || defined(__HAIKU__) || defined(__NetBSD__) || defined(__DragonFly__)
         fd = shm_open_anon(O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
@@ -551,20 +1583,7 @@ public:
         fd = shm_open_anon(O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
 #elif defined(__FreeBSD__)
         fd = shm_open(SHM_ANON, O_RDWR, 0600);
-#elif defined(__APPLE__)
-        char shm_name[32];
-        std::snprintf(shm_name, sizeof(shm_name), "/eden_mem_%d", int(getpid()));
-        fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0600);
-        if (fd >= 0) {
-            shm_unlink(shm_name);
-        } else {
-            char template_path[] = "/tmp/eden_mem_XXXXXX";
-            fd = mkstemp(template_path);
-            if (fd >= 0) {
-                unlink(template_path);
-            }
-        }
-#elif defined(__managarm__)
+#elif defined(__APPLE__) || defined(__managarm__)
         // macOS doesn't have memfd_create, use anonymous temporary file
         char template_path[] = "/tmp/eden_mem_XXXXXX";
         fd = mkstemp(template_path);
@@ -612,24 +1631,6 @@ public:
         madvise(virtual_base, virtual_size, MADV_HUGEPAGE);
 #endif
         free_manager.SetAddressSpace(virtual_base, virtual_size);
-
-        if (host_page_size != PageAlignment) {
-            if (fd < 0 || virtual_size % host_page_size != 0) {
-                LOG_WARNING(Common_Memory, "Can't emulate {:#x} byte pages with host page size {:#x}",
-                            PageAlignment, host_page_size);
-                return false;
-            }
-            page_states_size = (virtual_size / PageAlignment) * sizeof(u32);
-            void* const states = mmap(nullptr, page_states_size, PROT_READ | PROT_WRITE,
-                                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-            if (states == MAP_FAILED) {
-                LOG_CRITICAL(HW_Memory, "mmap failed: {}", strerror(errno));
-                return false;
-            }
-            page_states = static_cast<u32*>(states);
-            LOG_INFO(Common_Memory, "Fastmem maps {:#x} byte host pages whose guest pages are contiguous",
-                     host_page_size);
-        }
         return true;
     }
 
@@ -647,26 +1648,7 @@ public:
 
     void Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms) {
         // Intersect the range with our address space.
-        const size_t intended_offset = virtual_offset;
         AdjustMap(&virtual_offset, &length);
-        if (length != 0) {
-            host_offset += virtual_offset - intended_offset;
-        }
-
-        if (page_states) {
-            if (length == 0) {
-                return;
-            }
-            std::scoped_lock lk{page_states_mutex};
-            const size_t first = StateIndex(virtual_offset);
-            const u32 state = PageMapped | PermissionBits(perms);
-            for (size_t i = 0; i < length / PageAlignment; ++i) {
-                const u32 host_page = static_cast<u32>(host_offset / PageAlignment + i);
-                page_states[first + i] = state | (host_page << PageOffsetShift);
-            }
-            UpdateHostPages(virtual_offset, length, true);
-            return;
-        }
 
         // We are removing a placeholder.
         free_manager.AllocateBlock(virtual_base + virtual_offset, length);
@@ -693,16 +1675,6 @@ public:
         // Intersect the range with our address space.
         AdjustMap(&virtual_offset, &length);
 
-        if (page_states) {
-            if (length == 0) {
-                return;
-            }
-            std::scoped_lock lk{page_states_mutex};
-            std::fill_n(page_states + StateIndex(virtual_offset), length / PageAlignment, 0u);
-            UpdateHostPages(virtual_offset, length, true);
-            return;
-        }
-
         // Merge with any adjacent placeholder mappings.
         auto [merged_pointer, merged_size] =
             free_manager.FreeBlock(virtual_base + virtual_offset, length);
@@ -714,21 +1686,6 @@ public:
     void Protect(size_t virtual_offset, size_t length, bool read, bool write, bool execute) {
         // Intersect the range with our address space.
         AdjustMap(&virtual_offset, &length);
-
-        if (page_states) {
-            if (length == 0) {
-                return;
-            }
-            const u32 bits = (read ? PageRead : 0u) | (write ? PageWrite : 0u) |
-                             (execute ? PageExecute : 0u);
-            std::scoped_lock lk{page_states_mutex};
-            u32* const states = page_states + StateIndex(virtual_offset);
-            for (size_t i = 0; i < length / PageAlignment; ++i) {
-                states[i] = (states[i] & ~PagePermissionMask) | bits;
-            }
-            UpdateHostPages(virtual_offset, length, false);
-            return;
-        }
 
         int flags = PROT_NONE;
         if (read) {
@@ -760,10 +1717,6 @@ public:
 private:
     /// Release all resources in the object
     void Release() {
-        if (page_states != nullptr) {
-            munmap(page_states, page_states_size);
-        }
-
         if (virtual_map_base != MAP_FAILED) {
             int ret = munmap(virtual_map_base, virtual_size);
             ASSERT_MSG(ret == 0, "munmap failed: {}", strerror(errno));
@@ -801,110 +1754,14 @@ private:
         }
     }
 
-    static constexpr u32 PageRead = 1u << 0;
-    static constexpr u32 PageWrite = 1u << 1;
-    static constexpr u32 PageExecute = 1u << 2;
-    static constexpr u32 PagePermissionMask = PageRead | PageWrite | PageExecute;
-    static constexpr u32 PageMapped = 1u << 3;
-    static constexpr u32 PageOffsetShift = 4;
-
-    static u32 PermissionBits(MemoryPermission perms) {
-        return (True(perms & MemoryPermission::Read) ? PageRead : 0u) |
-               (True(perms & MemoryPermission::Write) ? PageWrite : 0u) |
-               (True(perms & MemoryPermission::Execute) ? PageExecute : 0u);
-    }
-
-    static int ProtectionFlags(u32 bits) {
-        int prot = PROT_NONE;
-        if ((bits & PageRead) != 0) {
-            prot |= PROT_READ;
-        }
-        if ((bits & PageWrite) != 0) {
-            prot |= PROT_WRITE;
-        }
-#ifdef HAS_NCE
-        if ((bits & PageExecute) != 0) {
-            prot |= PROT_EXEC;
-        }
-#endif
-        return prot;
-    }
-
-    struct HostPage {
-        bool mapped;
-        size_t host_offset;
-        int prot;
-    };
-
-    size_t StateIndex(size_t virtual_offset) const {
-        const size_t base = virtual_base != nullptr ? 0 : reinterpret_cast<size_t>(virtual_map_base);
-        return (virtual_offset - base) / PageAlignment;
-    }
-
-    HostPage ResolveHostPage(size_t virtual_offset) const {
-        const u32* const states = page_states + StateIndex(virtual_offset);
-        const u32 first = states[0];
-        const size_t host_offset = size_t(first >> PageOffsetShift) * PageAlignment;
-        if ((first & PageMapped) == 0 || host_offset % host_page_size != 0) {
-            return {};
-        }
-        u32 permissions = first & PagePermissionMask;
-        for (size_t i = 1; i < host_page_size / PageAlignment; ++i) {
-            const u32 state = states[i];
-            if ((state & PageMapped) == 0 || (state >> PageOffsetShift) != (first >> PageOffsetShift) + i) {
-                return {};
-            }
-            permissions &= state;
-        }
-        return {true, host_offset, ProtectionFlags(permissions)};
-    }
-
-    void UpdateHostPages(size_t virtual_offset, size_t length, bool remap) {
-        const size_t begin = AlignDown(virtual_offset, host_page_size);
-        const size_t end = AlignUp(virtual_offset + length, host_page_size);
-        const auto apply = [&](size_t run_begin, size_t run_end, const HostPage& page) {
-            u8* const address = virtual_base + run_begin;
-            const size_t size = run_end - run_begin;
-            if (!page.mapped) {
-                if (remap) {
-                    void* ret = mmap(address, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-                    ASSERT_MSG(ret != MAP_FAILED, "mmap: {}", strerror(errno));
-                }
-            } else if (remap) {
-                void* ret = mmap(address, size, page.prot, MAP_SHARED | MAP_FIXED, fd, off_t(page.host_offset));
-                ASSERT_MSG(ret != MAP_FAILED, "mmap: {}", strerror(errno));
-            } else {
-                int ret = mprotect(address, size, page.prot);
-                ASSERT_MSG(ret == 0, "mprotect failed: {}", strerror(errno));
-            }
-        };
-        size_t run_begin = begin;
-        HostPage run = ResolveHostPage(begin);
-        for (size_t offset = begin + host_page_size; offset < end; offset += host_page_size) {
-            const HostPage page = ResolveHostPage(offset);
-            const bool continues = page.mapped == run.mapped &&
-                                   (!page.mapped || (page.prot == run.prot &&
-                                                     page.host_offset == run.host_offset + (offset - run_begin)));
-            if (!continues) {
-                apply(run_begin, offset, run);
-                run_begin = offset;
-                run = page;
-            }
-        }
-        apply(run_begin, end, run);
-    }
-
     int fd{-1}; // memfd file descriptor, -1 is the error value of memfd_create
     FreeRegionManager free_manager{};
-    size_t host_page_size{PageAlignment};
-    u32* page_states{};
-    size_t page_states_size{};
-    std::mutex page_states_mutex;
 };
 
 #endif // ^^^ POSIX ^^^
 
-HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
+HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_,
+                       HostMemoryFastmemRegion fastmem_region_)
     : backing_size(backing_size_)
     , virtual_size(virtual_size_)
     , num_granules(Common::DivCeil(backing_size_, size_t{1} << GranuleShift))
@@ -916,7 +1773,15 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
     virtual_base = nullptr;
 #else
     // Try to allocate a fastmem arena.
-    impl = std::make_unique<HostMemory::Impl>(AlignUp(backing_size, PageAlignment), AlignUp(virtual_size, PageAlignment) + HugePageSize);
+#ifdef _WIN32
+    impl = std::make_unique<HostMemory::Impl>(AlignUp(backing_size, PageAlignment),
+                                              AlignUp(virtual_size, PageAlignment) + HugePageSize,
+                                              fastmem_region_);
+#else
+    (void)fastmem_region_;
+    impl = std::make_unique<HostMemory::Impl>(AlignUp(backing_size, PageAlignment),
+                                              AlignUp(virtual_size, PageAlignment) + HugePageSize);
+#endif
     if (impl->Init()) {
         backing_base = impl->backing_base;
         virtual_base = impl->virtual_base;
@@ -992,25 +1857,444 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission 
 #endif
 }
 
+namespace {
+// Diagnostic: the latest clears that decommitted DRAM, as host ranges.
+struct Decommit {
+    uintptr_t begin{};
+    uintptr_t end{};
+    u64 serial{};
+    std::chrono::steady_clock::time_point when{};
+};
+std::mutex decommit_mutex;
+std::array<Decommit, 8192> decommits{};
+u64 decommit_serial{};
+const auto decommit_epoch = std::chrono::steady_clock::now();
+thread_local const char* clear_tag = nullptr;
+
+void NoteDecommit(uintptr_t begin, uintptr_t end) {
+    std::scoped_lock lock{decommit_mutex};
+    decommits[decommit_serial % decommits.size()] =
+        Decommit{begin, end, decommit_serial, std::chrono::steady_clock::now()};
+    ++decommit_serial;
+}
+} // namespace
+
+void WatchDramPage(const void* host) {
+#ifdef HOST_MEMORY_USE_FROM_APP
+    const auto page = reinterpret_cast<uintptr_t>(host) & ~uintptr_t{4095};
+    const size_t count = g_watch_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < (std::min)(count, WatchSlots); ++i) {
+        if (g_watch_pages[i].load(std::memory_order_relaxed) == page) return;
+    }
+    const size_t slot = g_watch_count.fetch_add(1, std::memory_order_acq_rel);
+    if (slot < WatchSlots) g_watch_pages[slot].store(page, std::memory_order_release);
+#endif
+}
+
+void ResetDramWatch() {
+#ifdef HOST_MEMORY_USE_FROM_APP
+    for (auto& page : g_watch_pages) page.store(0, std::memory_order_release);
+    g_watch_count.store(0, std::memory_order_release);
+#endif
+}
+
+std::string DescribeWatchedPages() {
+    std::string out;
+#ifdef HOST_MEMORY_USE_FROM_APP
+    const size_t count = (std::min)(g_watch_count.load(std::memory_order_acquire), WatchSlots);
+    size_t committed{}, with_data{};
+    for (size_t i = 0; i < count; ++i) {
+        const uintptr_t page = g_watch_pages[i].load(std::memory_order_acquire);
+        MEMORY_BASIC_INFORMATION info{};
+        if (!page || VirtualQuery(reinterpret_cast<void*>(page), &info, sizeof(info)) == 0 ||
+            info.State != MEM_COMMIT) {
+            out += " r";
+            continue;
+        }
+        ++committed;
+        const auto* words = reinterpret_cast<const u64*>(page);
+        size_t nonzero{};
+        for (size_t w = 0; w < 512; ++w) nonzero += words[w] != 0;
+        with_data += nonzero != 0;
+        out += fmt::format(" {}", nonzero);
+    }
+    out = fmt::format("{} pages, {} committed, {} with data:", count, committed, with_data) + out;
+#endif
+    return out;
+}
+
+void ArmDramWriteWatch() {
+#ifdef HOST_MEMORY_USE_FROM_APP
+    const size_t count = (std::min)(g_watch_count.load(std::memory_order_acquire), WatchSlots);
+    size_t armed{}, uncommitted{};
+    for (size_t i = 0; i < count; ++i) {
+        const uintptr_t page = g_watch_pages[i].load(std::memory_order_acquire);
+        if (!page) continue;
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<void*>(page), &info, sizeof(info)) == 0 ||
+            info.State != MEM_COMMIT) {
+            // A reserved page commits read-write on its first touch, so it cannot be watched.
+            g_watch_pages[i].store(0, std::memory_order_release);
+            ++uncommitted;
+            continue;
+        }
+        g_watch_armed.fetch_add(1, std::memory_order_acq_rel);
+        if (WatchProtect(page, PAGE_READONLY)) {
+            ++armed;
+        } else {
+            g_watch_armed.fetch_sub(1, std::memory_order_acq_rel);
+            g_watch_pages[i].store(0, std::memory_order_release);
+        }
+    }
+    LOG_INFO(Common_Memory, "DRAM write watch armed on {} of {} pages ({} never committed)", armed,
+             count, uncommitted);
+#endif
+}
+
+ScopedClearTag::ScopedClearTag(const char* tag) : previous{clear_tag} {
+    clear_tag = tag;
+}
+
+ScopedClearTag::~ScopedClearTag() {
+    clear_tag = previous;
+}
+
+std::string DescribeDramPage(const void* host) {
+    const auto region = QueryDramRegion(host);
+    if (!region) return "not in the private DRAM backing";
+    std::string state = region->untouched ? "never committed" : "committed";
+    const auto address = reinterpret_cast<uintptr_t>(host);
+    std::scoped_lock lock{decommit_mutex};
+    const u64 count = (std::min<u64>)(decommit_serial, decommits.size());
+    for (u64 i = 0; i < count; ++i) {
+        const auto& entry = decommits[(decommit_serial - 1 - i) % decommits.size()];
+        if (address < entry.begin || address >= entry.end) continue;
+        const auto at = std::chrono::duration<double>(entry.when - decommit_epoch).count();
+        return fmt::format("{}, decommitted by clear #{} of {:#x} bytes at {:.3f} s ({} clears ago)",
+                           state, entry.serial, entry.end - entry.begin, at,
+                           decommit_serial - 1 - entry.serial);
+    }
+    return fmt::format("{}, no decommit in the last {} clears", state, count);
+}
+
+void HostMemory::ClearBackingRegionNow(size_t physical_offset, size_t length, u32 fill_value) {
+#ifdef HOST_MEMORY_USE_FROM_APP
+    if (Common::Pulse::Diagnostics() && length >= (1ULL << 20)) {
+        u64 serial;
+        {
+            std::scoped_lock lock{decommit_mutex};
+            serial = decommit_serial;
+        }
+        LOG_INFO(Common_Memory, "DRAM clear (next #{}) of {:#x} bytes at physical {:#x}, fill {:#x}, by {} on thread {}",
+                 serial, length, physical_offset, fill_value, clear_tag ? clear_tag : "untagged",
+                 GetCurrentThreadId());
+    }
+    // Xbox/UWP: the backing is demand-committed, so a memset of zero COMMITS every page it touches.
+    // The kernel clears every newly allocated heap page, and libnx's default heap is all available
+    // memory (~3.x GiB): that memset alone busts the Game-mode title budget, the handler's commit
+    // fails, and the memset access-violates (observed on-console at +3.6 GiB into the backing).
+    //
+    // Zeroing whole pages is a decommit instead: the next touch faults into the demand-commit
+    // handler, which hands back a freshly committed page, and committed pages always read as zero.
+    // Same contents for the guest, but it returns budget rather than spending it. The partial pages
+    // at either end are memset as before. VirtualFree(MEM_DECOMMIT) accepts pages that were never
+    // committed.
+    // With fastmem the backing is a section view, which cannot be decommitted. Only the pages
+    // already committed are cleared; the reserved ones read as zero whenever they get committed,
+    // so the heap clear does not commit memory the guest never touched.
+    // Over a file every page reads as committed. A page never written is a hole of the file and
+    // reads as zero, and memset would dirty it and give it a disk block, so pages already zero are
+    // only read.
+    if (fill_value == 0 && g_backing_is_file.load(std::memory_order_acquire)) {
+        constexpr uintptr_t HostPageSize = 4096;
+        const auto begin = reinterpret_cast<uintptr_t>(backing_base + physical_offset);
+        const auto end = begin + length;
+        const uintptr_t pages_begin = (std::min)(Common::AlignUp(begin, HostPageSize), end);
+        const uintptr_t pages_end = (std::max)(Common::AlignDown(end, HostPageSize), pages_begin);
+        std::memset(reinterpret_cast<void*>(begin), 0, pages_begin - begin);
+        for (uintptr_t page = pages_begin; page < pages_end; page += HostPageSize) {
+            const auto* const words = reinterpret_cast<const u64*>(page);
+            for (size_t i = 0; i < HostPageSize / sizeof(u64); ++i) {
+                if (words[i] != 0) {
+                    std::memset(reinterpret_cast<void*>(page), 0, HostPageSize);
+                    break;
+                }
+            }
+        }
+        std::memset(reinterpret_cast<void*>(pages_end), 0, end - pages_end);
+        return;
+    }
+    if (fill_value == 0 && impl && impl->IsSection()) {
+        u8* address = backing_base + physical_offset;
+        u8* const end = address + length;
+        while (address < end) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(address, &info, sizeof(info)) == 0) {
+                std::memset(address, 0, end - address);
+                return;
+            }
+            u8* const region_end = (std::min)(
+                static_cast<u8*>(info.BaseAddress) + info.RegionSize, end);
+            if (info.State == MEM_COMMIT) {
+                std::memset(address, 0, region_end - address);
+            }
+            address = region_end;
+        }
+        return;
+    }
+    if (fill_value == 0) {
+        constexpr uintptr_t HostPageSize = 4096;
+        const auto begin = reinterpret_cast<uintptr_t>(backing_base + physical_offset);
+        const auto end = begin + length;
+        const uintptr_t pages_begin = Common::AlignUp(begin, HostPageSize);
+        const uintptr_t pages_end = Common::AlignDown(end, HostPageSize);
+        if (pages_begin < pages_end &&
+            [&] {
+                std::scoped_lock decommit{g_backing_decommit_mutex};
+                Permafrost::ForgetPages(reinterpret_cast<u8*>(pages_begin),
+                                       reinterpret_cast<u8*>(pages_end));
+                return VirtualFree(reinterpret_cast<void*>(pages_begin), pages_end - pages_begin,
+                                   MEM_DECOMMIT);
+            }()) {
+            if (Common::Pulse::Diagnostics()) NoteDecommit(pages_begin, pages_end);
+            std::memset(reinterpret_cast<void*>(begin), 0, pages_begin - begin);
+            std::memset(reinterpret_cast<void*>(pages_end), 0, end - pages_end);
+            return;
+        }
+    }
+#endif
+    std::memset(backing_base + physical_offset, fill_value, length);
+}
+
+#ifdef HOST_MEMORY_USE_FROM_APP
+namespace {
+bool IsPrivateBacking(const u8* backing_base) {
+    return backing_base != nullptr && !g_backing_is_file.load(std::memory_order_acquire) &&
+           !g_backing_is_section.load(std::memory_order_acquire) &&
+           g_backing_base.load(std::memory_order_acquire) == backing_base;
+}
+
+template <typename F>
+void ForEachCommittedRun(u8* begin, u8* end, F&& committed) {
+    for (u8* address = begin; address < end;) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(address, &info, sizeof(info)) == 0) {
+            return;
+        }
+        u8* const region_end = (std::min)(static_cast<u8*>(info.BaseAddress) + info.RegionSize, end);
+        if (info.State == MEM_COMMIT) {
+            committed(address, region_end);
+        }
+        address = region_end;
+    }
+}
+} // namespace
+#endif
+
+size_t HostMemory::ReleaseBackingRegion(size_t physical_offset, size_t length) {
+#ifdef HOST_MEMORY_USE_FROM_APP
+    if (!IsPrivateBacking(backing_base)) {
+        return 0;
+    }
+    constexpr uintptr_t HostPageSize = 4096;
+    const auto begin = reinterpret_cast<uintptr_t>(backing_base + physical_offset);
+    const uintptr_t pages_begin = Common::AlignUp(begin, HostPageSize);
+    const uintptr_t pages_end = Common::AlignDown(begin + length, HostPageSize);
+    if (pages_begin >= pages_end) {
+        return 0;
+    }
+    size_t released = 0;
+    std::scoped_lock decommit{g_backing_decommit_mutex};
+    Permafrost::ForgetPages(reinterpret_cast<u8*>(pages_begin), reinterpret_cast<u8*>(pages_end));
+    ForEachCommittedRun(reinterpret_cast<u8*>(pages_begin), reinterpret_cast<u8*>(pages_end),
+                        [&](u8* run_begin, u8* run_end) {
+                            if (VirtualFree(run_begin, run_end - run_begin, MEM_DECOMMIT)) {
+                                released += run_end - run_begin;
+                                if (Common::Pulse::Diagnostics()) {
+                                    NoteDecommit(reinterpret_cast<uintptr_t>(run_begin),
+                                                 reinterpret_cast<uintptr_t>(run_end));
+                                }
+                            }
+                        });
+    return released;
+#else
+    return 0;
+#endif
+}
+
+#ifdef HOST_MEMORY_USE_FROM_APP
+namespace {
+bool IsClear(const u8* page) {
+    const auto* const words = reinterpret_cast<const volatile u64*>(page);
+    for (size_t i = 0; i < HOST_PAGE_SIZE / sizeof(u64); i += 4) {
+        if ((words[i] | words[i + 1] | words[i + 2] | words[i + 3]) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+BOOL ProtectBacking(u8* begin, size_t size, DWORD protection) {
+    static Common::DynamicLibrary kernelbase("Kernelbase");
+    static PFN_VirtualProtect protect = [] {
+        PFN_VirtualProtect function{};
+        if (kernelbase.IsOpen()) kernelbase.GetSymbol("VirtualProtectFromApp", &function);
+        return function;
+    }();
+    DWORD old{};
+    return protect && protect(begin, size, protection, &old);
+}
+
+template <size_t N, typename F>
+void ForEachPageRun(const std::bitset<N>& mask, F&& f) {
+    for (size_t first = 0; first < N;) {
+        if (!mask[first]) {
+            ++first;
+            continue;
+        }
+        size_t last = first + 1;
+        while (last < N && mask[last]) ++last;
+        f(first, last - first);
+        first = last;
+    }
+}
+
+size_t ReleaseRuns(u8* span, const std::bitset<SPAN_PAGES>& candidates) {
+    using Mask = std::bitset<SPAN_PAGES>;
+    std::scoped_lock hold{g_backing_decommit_mutex};
+    // A granule Permafrost moved is its own: on probation its pages are no-access, and a read
+    // back fills them outside this mutex. A resident one stays so while the mutex is held.
+    for (size_t granule = 0; granule < SPAN_SIZE; granule += Permafrost::GRANULE_SIZE) {
+        if (!Permafrost::IsResident(span + granule)) {
+            return 0;
+        }
+    }
+    g_held_span.store(reinterpret_cast<uintptr_t>(span));
+    while (g_commits_in_flight.load() != 0) {
+        YieldProcessor();
+    }
+    Mask held;
+    ForEachPageRun(candidates, [&](size_t first, size_t count) {
+        if (ProtectBacking(span + first * HOST_PAGE_SIZE, count * HOST_PAGE_SIZE, PAGE_READONLY)) {
+            for (size_t i = first; i < first + count; ++i) held.set(i);
+        }
+    });
+    Mask release;
+    ForEachPageRun(held, [&](size_t first, size_t count) {
+        for (size_t i = first; i < first + count; ++i) {
+            if (IsClear(span + i * HOST_PAGE_SIZE)) release.set(i);
+        }
+    });
+    size_t released = 0;
+    ForEachPageRun(release, [&](size_t first, size_t count) {
+        u8* const begin = span + first * HOST_PAGE_SIZE;
+        if (VirtualFree(begin, count * HOST_PAGE_SIZE, MEM_DECOMMIT)) {
+            released += count * HOST_PAGE_SIZE;
+            if (Common::Pulse::Diagnostics()) {
+                NoteDecommit(reinterpret_cast<uintptr_t>(begin),
+                             reinterpret_cast<uintptr_t>(begin + count * HOST_PAGE_SIZE));
+            }
+        } else {
+            for (size_t i = first; i < first + count; ++i) release.reset(i);
+        }
+    });
+    ForEachPageRun(held & ~release, [&](size_t first, size_t count) {
+        const BOOL restored =
+            ProtectBacking(span + first * HOST_PAGE_SIZE, count * HOST_PAGE_SIZE, PAGE_READWRITE);
+        ASSERT_MSG(restored, "backing protection could not be restored");
+    });
+    g_held_span.store(0);
+    return released;
+}
+
+size_t TrimSpan(u8* span, size_t& released) {
+    using Mask = std::bitset<SPAN_PAGES>;
+    Mask committed;
+    for (size_t page = 0; page < SPAN_PAGES;) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(span + page * HOST_PAGE_SIZE, &info, sizeof(info)) == 0) {
+            return 0;
+        }
+        const size_t end = (std::min)(
+            SPAN_PAGES,
+            static_cast<size_t>(static_cast<u8*>(info.BaseAddress) + info.RegionSize - span) /
+                HOST_PAGE_SIZE);
+        if (info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE) {
+            for (size_t i = page; i < end; ++i) committed.set(i);
+        }
+        page = (std::max)(end, page + 1);
+    }
+    Mask candidates;
+    ForEachPageRun(committed, [&](size_t first, size_t count) {
+        for (size_t i = first; i < first + count; ++i) {
+            if (IsClear(span + i * HOST_PAGE_SIZE)) candidates.set(i);
+        }
+    });
+    if (candidates.any()) {
+        released += ReleaseRuns(span, candidates);
+    }
+    return committed.count() * HOST_PAGE_SIZE;
+}
+
+} // namespace
+#endif
+
+HostMemory::TrimResult HostMemory::Trim(size_t& cursor, size_t budget) {
+    TrimResult result;
+#ifdef HOST_MEMORY_USE_FROM_APP
+    if (!IsPrivateBacking(backing_base) || backing_size < SPAN_SIZE) {
+        return result;
+    }
+    static std::mutex trim_mutex;
+    std::scoped_lock lock{trim_mutex};
+    const size_t spans_end = Common::AlignDown(backing_size, SPAN_SIZE);
+    size_t span = cursor < spans_end ? Common::AlignDown(cursor, SPAN_SIZE) : 0;
+    for (size_t visited = 0; visited < spans_end && result.visited < budget;) {
+        u8* const begin = backing_base + span;
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(begin, &info, sizeof(info)) == 0) {
+            break;
+        }
+        size_t next = span + SPAN_SIZE;
+        const size_t region_end =
+            static_cast<size_t>(static_cast<u8*>(info.BaseAddress) + info.RegionSize - backing_base);
+        if (info.State != MEM_COMMIT && region_end >= next) {
+            next = (std::max)(next, Common::AlignDown((std::min)(region_end, spans_end), SPAN_SIZE));
+        } else {
+            result.visited += TrimSpan(begin, result.released);
+        }
+        visited += next - span;
+        span = next < spans_end ? next : 0;
+    }
+    cursor = span;
+#else
+    (void)cursor;
+    (void)budget;
+#endif
+    return result;
+}
+
 void HostMemory::HintCold(size_t physical_offset, size_t length,
                           std::optional<size_t> virtual_offset) const {
     if (length == 0 || backing_base == nullptr) {
         return;
     }
-    const auto hint = [length](u8* address) {
-#ifdef _WIN32
-        // Unlocking pages that are not locked takes them out of the working set.
-        VirtualUnlock(address, length);
-#elif defined(__linux__) && defined(MADV_PAGEOUT)
-        madvise(address, length, MADV_PAGEOUT);
-#else
-        static_cast<void>(address);
-#endif
-    };
-    hint(backing_base + physical_offset);
+#if defined(_WIN32) && !defined(HOST_MEMORY_USE_FROM_APP)
+    // Unlocking pages that are not locked takes them out of the working set.
+    VirtualUnlock(backing_base + physical_offset, length);
     if (virtual_offset && virtual_base != nullptr && *virtual_offset + length <= virtual_size) {
-        hint(virtual_base + *virtual_offset);
+        VirtualUnlock(virtual_base + *virtual_offset, length);
     }
+#elif defined(__linux__) && defined(MADV_PAGEOUT)
+    madvise(backing_base + physical_offset, length, MADV_PAGEOUT);
+    if (virtual_offset && virtual_base != nullptr && *virtual_offset + length <= virtual_size) {
+        madvise(virtual_base + *virtual_offset, length, MADV_PAGEOUT);
+    }
+#else
+    // The Xbox backing has no working-set hint; Trim/ReleaseBackingRegion give memory back there.
+    static_cast<void>(physical_offset);
+    static_cast<void>(virtual_offset);
+#endif
 }
 
 void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
@@ -1019,13 +2303,12 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
     }
     MarkUsed(physical_offset, length);
     if (fill_value != 0) {
-        std::memset(backing_base + physical_offset, fill_value, length);
+        ClearBackingRegionNow(physical_offset, length, fill_value);
         MarkDirty(physical_offset, length);
         return;
     }
     // Fresh backing memory is zero and the host gives it no RAM until it's touched: clear only
-    // the granules that may hold data (title 1's heap made the host commit every page of it).
-    // A granule cleared in full is zero again.
+    // the granules that may hold data. A granule cleared in full is zero again.
 #ifdef __linux__
     // Handing a whole granule back to the kernel frees its RAM; a memset would commit it.
     static const bool punch = [] {
@@ -1043,13 +2326,15 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
             const bool whole = offset == granule_begin && clear_end == granule_end;
             bool cleared = false;
 #ifdef __linux__
-            cleared = whole && punch && impl && impl->PunchHole(granule_begin, granule_end - granule_begin);
+            cleared = whole && punch && impl &&
+                      impl->PunchHole(granule_begin, granule_end - granule_begin);
 #endif
             if (!cleared) {
-                std::memset(backing_base + offset, 0, clear_end - offset);
+                ClearBackingRegionNow(offset, clear_end - offset, 0);
             }
             if (whole) {
-                granules[index].fetch_and(static_cast<u8>(~GranuleDirty), std::memory_order_release);
+                granules[index].fetch_and(static_cast<u8>(~GranuleDirty),
+                                          std::memory_order_release);
             }
         }
         offset = clear_end;
@@ -1092,6 +2377,255 @@ void HostMemory::EnableDirectMappedAddress() {
         impl->EnableDirectMappedAddress();
         virtual_size += reinterpret_cast<uintptr_t>(virtual_base);
     }
+#endif
+}
+
+std::optional<u64> EmulatedDramCommittedBytes() {
+#ifdef HOST_MEMORY_USE_FROM_APP
+    if (g_backing_is_file.load(std::memory_order_acquire)) {
+        return std::nullopt;
+    }
+    if (g_backing_is_section.load(std::memory_order_acquire)) {
+        return g_section_commit_bytes.load(std::memory_order_relaxed);
+    }
+    // Private backing: what is committed of it, page ranges at a time.
+    u8* const base = g_backing_base.load(std::memory_order_acquire);
+    const size_t size = g_backing_size.load(std::memory_order_acquire);
+    if (base == nullptr) {
+        return std::nullopt;
+    }
+    u64 committed = 0;
+    for (u8* address = base; address < base + size;) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(address, &info, sizeof(info)) == 0) {
+            break;
+        }
+        u8* const region_end =
+            (std::min)(static_cast<u8*>(info.BaseAddress) + info.RegionSize, base + size);
+        if (info.State == MEM_COMMIT) {
+            committed += static_cast<u64>(region_end - address);
+        }
+        address = region_end;
+    }
+    return committed;
+#else
+    return std::nullopt;
+#endif
+}
+
+std::optional<DramRegion> QueryDramRegion(const void* host) {
+#ifdef HOST_MEMORY_USE_FROM_APP
+    if (g_backing_is_file.load(std::memory_order_acquire) ||
+        g_backing_is_section.load(std::memory_order_acquire)) {
+        return std::nullopt;
+    }
+    const u8* const base = g_backing_base.load(std::memory_order_acquire);
+    const size_t size = g_backing_size.load(std::memory_order_acquire);
+    const auto* const address = static_cast<const u8*>(host);
+    if (base == nullptr || address < base || address >= base + size) {
+        return std::nullopt;
+    }
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(address, &info, sizeof(info)) == 0) {
+        return std::nullopt;
+    }
+    const auto* const region = static_cast<const u8*>(info.BaseAddress);
+    DramRegion result{
+        .begin = (std::max)(region, base),
+        .end = (std::min)(region + info.RegionSize, base + size),
+        .untouched = info.State == MEM_RESERVE,
+    };
+    if (result.untouched && Permafrost::Active()) {
+        // Reserved pages of a granule on disk hold data: the run stops at the first such granule,
+        // and one that starts in it is not untouched.
+        const u8* const granule =
+            base + Common::AlignDown(static_cast<size_t>(address - base), Permafrost::GRANULE_SIZE);
+        result.begin = (std::max)(result.begin, granule);
+        result.end = Permafrost::ClipUntouched(result.begin, result.end);
+        if (result.end == result.begin) {
+            result.end = (std::min)(granule + Permafrost::GRANULE_SIZE, base + size);
+            result.untouched = false;
+        }
+    }
+    return result;
+#else
+    return std::nullopt;
+#endif
+}
+
+std::optional<GuestZeroCensus> CensusGuestZeroMemory() {
+#ifdef HOST_MEMORY_USE_FROM_APP
+    if (g_backing_is_file.load(std::memory_order_acquire) ||
+        g_backing_is_section.load(std::memory_order_acquire)) {
+        return std::nullopt;
+    }
+    const u8* const base = g_backing_base.load(std::memory_order_acquire);
+    const size_t size = g_backing_size.load(std::memory_order_acquire);
+    if (base == nullptr) {
+        return std::nullopt;
+    }
+    // One granule at a time under the decommit mutex: no clear decommits a page and no swap step
+    // moves the granule while it is read. A granule the swap holds is left out.
+    return CensusZeroPages(base, size, Permafrost::GRANULE_SIZE, [](const u8* granule, auto&& count) {
+        std::scoped_lock hold{g_backing_decommit_mutex};
+        if (!Permafrost::IsResident(granule)) {
+            return false;
+        }
+        count();
+        return true;
+    });
+#else
+    return std::nullopt;
+#endif
+}
+
+std::string HostMemoryCommitStats() {
+#ifdef HOST_MEMORY_USE_FROM_APP
+    if (!g_backing_is_section.load(std::memory_order_acquire)) {
+        // Private backing: sum what is committed, to split the app's memory into emulated DRAM
+        // and the rest (JIT, GPU, caches).
+        if (g_backing_base.load(std::memory_order_acquire) == nullptr) {
+            return {};
+        }
+        std::string stats =
+            "emulated DRAM " + std::to_string(*EmulatedDramCommittedBytes() >> 20) + " MiB";
+        if (const u64 failures = g_commit_failures.load(std::memory_order_relaxed); failures != 0) {
+            stats += ", " + std::to_string(failures) + " DRAM commit failures (last error " +
+                     std::to_string(g_last_commit_error.load(std::memory_order_relaxed)) + ")";
+        }
+        if (Permafrost::Active()) {
+            stats += "; " + Permafrost::Describe();
+        }
+        return stats;
+    }
+    if (g_backing_is_file.load(std::memory_order_acquire)) {
+        if (const u64 hot_size = g_fastmem_hot_size_actual.load(std::memory_order_acquire);
+            hot_size != 0) {
+            const u64 aliases = g_fastmem_alias_bytes.load(std::memory_order_relaxed);
+            const u64 alias_budget = g_fastmem_alias_budget.load(std::memory_order_relaxed);
+            const u64 skipped = g_fastmem_skipped_bytes.load(std::memory_order_relaxed);
+            const u64 failures = g_fastmem_map_failures.load(std::memory_order_relaxed);
+            const u64 request_min = g_fastmem_request_min.load(std::memory_order_relaxed);
+            const u64 request_max = g_fastmem_request_max.load(std::memory_order_relaxed);
+            char hot_offset[32];
+            std::snprintf(hot_offset, sizeof(hot_offset), "%llx",
+                          static_cast<unsigned long long>(
+                              g_fastmem_hot_offset.load(std::memory_order_relaxed)));
+            std::string histogram;
+            for (size_t i = 0; i < g_fastmem_request_histogram.size(); ++i) {
+                const u64 bytes = g_fastmem_request_histogram[i].load(std::memory_order_relaxed);
+                if (bytes != 0) {
+                    histogram += (histogram.empty() ? "" : ",") + std::to_string(i * 64) + ":" +
+                                 std::to_string(bytes >> 20);
+                }
+            }
+            return "hybrid fastmem hot [0x" + std::string{hot_offset} +
+                   ", " + std::to_string(hot_size >> 20) + " MiB], aliases " +
+                   std::to_string(aliases >> 20) + "/" + std::to_string(alias_budget >> 20) +
+                   " MiB, guest mapped " +
+                   std::to_string(g_fastmem_guest_bytes.load(std::memory_order_relaxed) >> 20) +
+                   " MiB, skipped " + std::to_string(skipped >> 20) + " MiB, failures " +
+                   std::to_string(failures) + ", requested " +
+                   std::to_string(g_fastmem_request_bytes.load(std::memory_order_relaxed) >> 20) +
+                   " MiB in [" + (request_min == ~u64{0} ? "none" : std::to_string(request_min >> 20)) +
+                   ", " + std::to_string(request_max >> 20) + ") MiB; 64-MiB buckets " + histogram;
+        }
+        return g_backing_file_sparse.load(std::memory_order_acquire)
+                   ? "DRAM in a sparse file-backed section"
+                   : "DRAM in a file-backed section (not sparse)";
+    }
+    std::string stats = "section commit " +
+                        std::to_string(g_section_commit_bytes.load(std::memory_order_relaxed) >> 20) +
+                        " MiB";
+    if (const u64 failures = g_commit_failures.load(std::memory_order_relaxed); failures != 0) {
+        char failure[160];
+        std::snprintf(failure, sizeof(failure),
+                      ", %llu commit failures (last: error %u, %llu KiB at 0x%llx), %llu saved by "
+                      "a single-page retry",
+                      static_cast<unsigned long long>(failures),
+                      g_last_commit_error.load(std::memory_order_relaxed),
+                      static_cast<unsigned long long>(
+                          g_last_failed_length.load(std::memory_order_relaxed) >> 10),
+                      static_cast<unsigned long long>(
+                          g_last_failed_address.load(std::memory_order_relaxed)),
+                      static_cast<unsigned long long>(
+                          g_page_retry_saves.load(std::memory_order_relaxed)));
+        stats += failure;
+    }
+    return stats;
+#else
+    return {};
+#endif
+}
+
+bool GuestSwapActive() {
+    return Permafrost::Active();
+}
+
+u64 StepGuestSwap(u64 want, GuestSwapPressure pressure) {
+#ifdef HOST_MEMORY_USE_FROM_APP
+    constexpr Permafrost::Urgency URGENCY[]{Permafrost::Urgency::Watch, Permafrost::Urgency::Normal,
+                                           Permafrost::Urgency::Urgent,
+                                           Permafrost::Urgency::Emergency};
+    return Permafrost::Step(want, URGENCY[static_cast<size_t>(pressure)], g_backing_decommit_mutex)
+        .released;
+#else
+    (void)want;
+    (void)pressure;
+    return 0;
+#endif
+}
+
+bool RefillGuestSwapReserve() {
+    return Permafrost::RefillReserve();
+}
+
+bool GuestSwapReserveReleased() {
+    return Permafrost::ReserveReleased();
+}
+
+std::string DescribeGuestSwap() {
+    return Permafrost::Describe(true);
+}
+
+void FormatBackingFault(char* out, size_t out_size, uintptr_t address) {
+    if (out_size == 0) {
+        return;
+    }
+    out[0] = '\0';
+#ifdef HOST_MEMORY_USE_FROM_APP
+    const auto base = reinterpret_cast<uintptr_t>(g_backing_base.load(std::memory_order_acquire));
+    const size_t size = g_backing_size.load(std::memory_order_acquire);
+    char where[64];
+    if (base == 0) {
+        std::snprintf(where, sizeof(where), "no DRAM backing");
+    } else if (address >= base && address < base + size) {
+        std::snprintf(where, sizeof(where), "DRAM offset 0x%llx",
+                      static_cast<unsigned long long>(address - base));
+    } else {
+        std::snprintf(where, sizeof(where), "outside the DRAM backing");
+    }
+    std::snprintf(out, out_size,
+                  "fault at 0x%llx: %s (backing 0x%llx + %llu MiB, %s); process commit %llu MiB; "
+                  "%llu commit failures, last error %u for %llu KiB at 0x%llx on thread %u with "
+                  "process commit %llu MiB; %u commits in flight",
+                  static_cast<unsigned long long>(address), where,
+                  static_cast<unsigned long long>(base),
+                  static_cast<unsigned long long>(size >> 20),
+                  g_backing_is_section.load(std::memory_order_acquire) ? "section" : "private",
+                  static_cast<unsigned long long>(ProcessCommitBytes() >> 20),
+                  static_cast<unsigned long long>(g_commit_failures.load(std::memory_order_relaxed)),
+                  g_last_commit_error.load(std::memory_order_relaxed),
+                  static_cast<unsigned long long>(
+                      g_last_failed_length.load(std::memory_order_relaxed) >> 10),
+                  static_cast<unsigned long long>(
+                      g_last_failed_address.load(std::memory_order_relaxed)),
+                  g_last_failed_thread.load(std::memory_order_relaxed),
+                  static_cast<unsigned long long>(
+                      g_last_failed_process_commit.load(std::memory_order_relaxed) >> 20),
+                  g_commits_in_flight.load(std::memory_order_relaxed));
+#else
+    (void)address;
 #endif
 }
 
