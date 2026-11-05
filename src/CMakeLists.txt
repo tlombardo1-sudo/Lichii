@@ -293,6 +293,15 @@ if (ENABLE_QT)
     add_subdirectory(yuzu)
 endif()
 
+# Xbox/UWP boot frontend. Only for the WindowsStore target.
+if (CMAKE_SYSTEM_NAME STREQUAL "WindowsStore")
+    add_subdirectory(jadyx)
+
+    include(JadyxHostLto)
+    jadyx_enable_host_lto(common core video_core shader_recompiler dynarmic audio_core hid_core
+                          input_common network frontend_common jadyx)
+endif()
+
 if (ENABLE_WEB_SERVICE)
     add_subdirectory(web_service)
 endif()

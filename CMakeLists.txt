@@ -104,10 +104,14 @@ if(ENABLE_WERROR)
 endif()
 
 
-# Lossless Scaling frame generation. Only Android.
-option(ENABLE_LSFG "Enable frame generation (LSFG and FSR 3 Fluid Motion)" ON)
+# Vulkan renderer. A UWP app on Xbox has only Direct3D 12, so the Store build leaves it out.
+cmake_dependent_option(ENABLE_VULKAN "Enable the Vulkan renderer" ON "NOT CMAKE_SYSTEM_NAME STREQUAL WindowsStore" OFF)
 
-option(ENABLE_RESHADE "Enable ReShade FX post-processing effects" ON)
+# Frame generation (LSFG and FSR 3 Fluid Motion) runs in the Vulkan presenter only.
+cmake_dependent_option(ENABLE_LSFG "Enable frame generation (LSFG and FSR 3 Fluid Motion)" ON "ENABLE_VULKAN" OFF)
+
+# ReShade FX runs in the Vulkan presenter only.
+cmake_dependent_option(ENABLE_RESHADE "Enable ReShade FX post-processing effects" ON "ENABLE_VULKAN" OFF)
 
 # non-linux bundled qt are static
 if (YUZU_USE_BUNDLED_QT AND (APPLE OR NOT UNIX))
@@ -257,6 +261,11 @@ set(BUNDLED_SIRIT_DEFAULT OFF)
 if (MSVC AND NOT (CMAKE_BUILD_TYPE MATCHES "Deb") OR ANDROID)
     set(BUNDLED_SIRIT_DEFAULT ON)
 endif()
+# Xbox UWP/WindowsStore: the bundled sirit prebuilt is /MT and injects LIBCMT, which collides with the
+# /MD Store-CRT app at exe link. Build sirit from source there so it inherits /MD.
+if (CMAKE_SYSTEM_NAME STREQUAL "WindowsStore")
+    set(BUNDLED_SIRIT_DEFAULT OFF)
+endif()
 
 option(YUZU_USE_BUNDLED_SIRIT "Download bundled sirit" ${BUNDLED_SIRIT_DEFAULT})
 
@@ -265,6 +274,9 @@ cmake_dependent_option(ENABLE_LIBUSB "Enable the use of LibUSB" ON "WIN32 OR LIN
 
 cmake_dependent_option(ENABLE_OPENGL "Enable OpenGL" ON "NOT (WIN32 AND ARCHITECTURE_arm64) AND NOT APPLE AND NOT ANDROID" OFF)
 mark_as_advanced(FORCE ENABLE_OPENGL)
+
+# Direct3D 12 renderer: the only graphics API a UWP app has on Xbox.
+cmake_dependent_option(ENABLE_D3D12 "Enable the Direct3D 12 renderer" ON "CMAKE_SYSTEM_NAME STREQUAL WindowsStore" OFF)
 
 option(ENABLE_WEB_SERVICE "Enable web services (telemetry, etc.)" ON)
 option(ENABLE_WIFI_SCAN "Enable WiFi scanning" OFF)
@@ -300,6 +312,12 @@ option(YUZU_DISABLE_LLVM "Disable LLVM (useful for CI)" OFF)
 set(DEFAULT_YUZU_USE_BUNDLED_OPENSSL OFF)
 if (EXT_DEFAULT OR SOLARIS OR OPENBSD)
     set(DEFAULT_YUZU_USE_BUNDLED_OPENSSL ON)
+endif()
+
+# The bundled OpenSSL prebuilt is /MT and collides with the /MD Store CRT app on the Xbox UWP target.
+# Build it from source there (needs perl and nasm, see docs/xbox/uwp_build.md).
+if (CMAKE_SYSTEM_NAME STREQUAL "WindowsStore")
+    set(DEFAULT_YUZU_USE_BUNDLED_OPENSSL OFF)
 endif()
 
 option(YUZU_USE_BUNDLED_OPENSSL "Download bundled OpenSSL build" ${DEFAULT_YUZU_USE_BUNDLED_OPENSSL})
@@ -384,6 +402,14 @@ if (CXX_GCC OR CXX_CLANG)
     if (DEFINED march AND DEFINED mtune)
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=${march} -mtune=${mtune}")
         set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=${march} -mtune=${mtune}")
+    endif()
+endif()
+
+# The Xbox build only runs on the Series' Zen 2, which always has AVX2. C and C++ only: ml64 does not take /arch.
+if (MSVC AND ARCHITECTURE_x86_64 AND CMAKE_SYSTEM_NAME STREQUAL "WindowsStore")
+    option(JADYX_HOST_AVX2 "Compile for AVX2 hosts (the Series' Zen 2)" ON)
+    if (JADYX_HOST_AVX2)
+        add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/arch:AVX2>)
     endif()
 endif()
 

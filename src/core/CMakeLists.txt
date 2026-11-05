@@ -52,10 +52,15 @@ add_library(core STATIC
     debugger/nx2_debug_tools.h
     device_memory.cpp
     device_memory.h
+    pulse_checkpoint.cpp
+    pulse_checkpoint.h
+    pulse_machine_state.h
+    pulse_process_state.h
     device_memory_manager.h
     device_memory_manager.inc
     file_sys/bis_factory.cpp
     file_sys/bis_factory.h
+    file_sys/content_provider_union.cpp
     file_sys/card_image.cpp
     file_sys/card_image.h
     file_sys/common_funcs.h
@@ -126,6 +131,7 @@ add_library(core STATIC
     file_sys/ips_layer.h
     file_sys/kernel_executable.cpp
     file_sys/kernel_executable.h
+    file_sys/mod_priority.h
     file_sys/nca_metadata.cpp
     file_sys/nca_metadata.h
     file_sys/partition_filesystem.cpp
@@ -261,6 +267,8 @@ add_library(core STATIC
     hle/kernel/k_event_info.h
     hle/kernel/k_handle_table.cpp
     hle/kernel/k_handle_table.h
+    hle/kernel/pulse_handle_state.h
+    hle/kernel/pulse_process_layout.h
     hle/kernel/k_hardware_timer.cpp
     hle/kernel/k_hardware_timer.h
     hle/kernel/k_hardware_timer_base.h
@@ -340,6 +348,9 @@ add_library(core STATIC
     hle/kernel/k_thread_local_page.h
     hle/kernel/k_thread_queue.cpp
     hle/kernel/k_thread_queue.h
+    hle/kernel/pulse_wait_state.h
+    hle/kernel/pulse_wait_graph.h
+    hle/kernel/pulse_wait_graph.cpp
     hle/kernel/k_timer_task.h
     hle/kernel/k_trace.h
     hle/kernel/k_transfer_memory.cpp
@@ -365,6 +376,7 @@ add_library(core STATIC
     hle/kernel/svc/svc_condition_variable.cpp
     hle/kernel/svc/svc_debug.cpp
     hle/kernel/svc/svc_debug_string.cpp
+    hle/kernel/svc/svc_debug_string.h
     hle/kernel/svc/svc_device_address_space.cpp
     hle/kernel/svc/svc_event.cpp
     hle/kernel/svc/svc_exception.cpp
@@ -407,6 +419,7 @@ add_library(core STATIC
     hle/service/acc/profile_manager.h
     hle/service/am/am.cpp
     hle/service/am/am.h
+    hle/service/am/am_pulse.h
     hle/service/am/am_results.h
     hle/service/am/am_types.h
     hle/service/am/applet.cpp
@@ -725,6 +738,7 @@ add_library(core STATIC
     hle/service/hid/xcd.cpp
     hle/service/hid/xcd.h
     hle/service/hle_ipc.cpp
+    hle/service/pulse_session_graph.h
     hle/service/hle_ipc.h
     hle/service/ipc_helpers.h
     hle/service/kernel_helpers.cpp
@@ -1182,6 +1196,8 @@ add_library(core STATIC
     memory.h
     memory/cheat_engine.cpp
     memory/cheat_engine.h
+    memory/cheat_text.cpp
+    memory/cheat_text.h
     memory/dmnt_cheat_types.h
     memory/dmnt_cheat_vm.cpp
     memory/dmnt_cheat_vm.h
@@ -1288,6 +1304,9 @@ if (ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64 OR ARCHITECTURE_riscv64 OR ARCHITE
         arm/dynarmic/dynarmic_cp15.h
         arm/dynarmic/dynarmic_exclusive_monitor.cpp
         arm/dynarmic/dynarmic_exclusive_monitor.h
+        arm/dynarmic/jit_prewarm_owner.cpp
+        arm/dynarmic/jit_prewarm_owner.h
+        arm/dynarmic/jit_prewarm_profile.h
         hle/service/jit/jit_code_memory.cpp
         hle/service/jit/jit_code_memory.h
         hle/service/jit/jit_context.cpp

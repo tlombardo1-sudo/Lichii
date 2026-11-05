@@ -137,7 +137,79 @@ add_library(video_core STATIC
     renderer_null/renderer_null.cpp
     renderer_null/renderer_null.h
 
-    # Vulkan
+    # Pipeline state and dirty tracking shared by the Vulkan and D3D12 renderers
+    renderer_vulkan/fixed_pipeline_state.cpp
+    renderer_vulkan/fixed_pipeline_state.h
+    renderer_vulkan/vk_state_tracker.cpp
+    renderer_vulkan/vk_state_tracker.h
+
+    shader_cache.cpp
+    shader_cache.h
+    shader_environment.cpp
+    shader_environment.h
+    shader_handle_program.h
+    shader_notify.cpp
+    shader_notify.h
+    smaa_area_tex.h
+    smaa_search_tex.h
+    surface.cpp
+    surface.h
+    texture_cache/accelerated_swizzle.cpp
+    texture_cache/accelerated_swizzle.h
+    texture_cache/decode_bc.cpp
+    texture_cache/decode_bc.h
+    texture_cache/descriptor_table.h
+    texture_cache/formatter.cpp
+    texture_cache/formatter.h
+    texture_cache/format_lookup_table.cpp
+    texture_cache/format_lookup_table.h
+    texture_cache/image_base.cpp
+    texture_cache/image_base.h
+    texture_cache/image_info.cpp
+    texture_cache/image_info.h
+    texture_cache/image_view_base.cpp
+    texture_cache/image_view_base.h
+    texture_cache/image_view_info.cpp
+    texture_cache/image_view_info.h
+    texture_cache/render_targets.h
+    texture_cache/samples_helper.h
+    texture_cache/texture_cache.cpp
+    texture_cache/texture_cache.h
+    texture_cache/texture_cache_base.h
+    texture_cache/types.h
+    texture_cache/util.cpp
+    texture_cache/util.h
+    textures/astc.h
+    textures/astc.cpp
+    textures/bcn.cpp
+    textures/bcn.h
+    textures/decoders.cpp
+    textures/decoders.h
+    textures/texture.cpp
+    textures/texture.h
+    textures/workers.cpp
+    textures/workers.h
+    transform_feedback.cpp
+    transform_feedback.h
+    video_core.cpp
+    video_core.h
+
+    # Xbox/UWP additions
+    cpu_write_queue.h
+    diagnostics/full_capture.cpp
+    diagnostics/full_capture.h
+    diagnostics/full_capture_archive.h
+    frame_pipeline.h
+    frame_trace.cpp
+    frame_trace.h
+    gpu_written_pages.h
+    textures/etc2.cpp
+    textures/etc2.h
+
+)
+
+if (ENABLE_VULKAN)
+    target_sources(video_core PRIVATE
     renderer_vulkan/present/anti_alias_pass.h
     renderer_vulkan/present/filters.cpp
     renderer_vulkan/present/filters.h
@@ -160,8 +232,6 @@ add_library(video_core STATIC
     renderer_vulkan/present/window_adapt_pass.h
     renderer_vulkan/blit_image.cpp
     renderer_vulkan/blit_image.h
-    renderer_vulkan/fixed_pipeline_state.cpp
-    renderer_vulkan/fixed_pipeline_state.h
     renderer_vulkan/framebuffer_clear_layers.h
     renderer_vulkan/maxwell_to_vk.cpp
     renderer_vulkan/maxwell_to_vk.h
@@ -218,8 +288,6 @@ add_library(video_core STATIC
     renderer_vulkan/vk_shader_util.h
     renderer_vulkan/vk_staging_buffer_pool.cpp
     renderer_vulkan/vk_staging_buffer_pool.h
-    renderer_vulkan/vk_state_tracker.cpp
-    renderer_vulkan/vk_state_tracker.h
     renderer_vulkan/vk_swapchain.cpp
     renderer_vulkan/vk_swapchain.h
     renderer_vulkan/vk_texture_cache.cpp
@@ -248,58 +316,9 @@ add_library(video_core STATIC
     vulkan_common/nsight_aftermath_tracker.h
     vulkan_common/vma.h
     vulkan_common/vulkan.h
-
-    shader_cache.cpp
-    shader_cache.h
-    shader_environment.cpp
-    shader_environment.h
-    shader_handle_program.h
-    shader_notify.cpp
-    shader_notify.h
-    smaa_area_tex.h
-    smaa_search_tex.h
-    surface.cpp
-    surface.h
-    texture_cache/accelerated_swizzle.cpp
-    texture_cache/accelerated_swizzle.h
-    texture_cache/decode_bc.cpp
-    texture_cache/decode_bc.h
-    texture_cache/descriptor_table.h
-    texture_cache/formatter.cpp
-    texture_cache/formatter.h
-    texture_cache/format_lookup_table.cpp
-    texture_cache/format_lookup_table.h
-    texture_cache/image_base.cpp
-    texture_cache/image_base.h
-    texture_cache/image_info.cpp
-    texture_cache/image_info.h
-    texture_cache/image_view_base.cpp
-    texture_cache/image_view_base.h
-    texture_cache/image_view_info.cpp
-    texture_cache/image_view_info.h
-    texture_cache/render_targets.h
-    texture_cache/samples_helper.h
-    texture_cache/texture_cache.cpp
-    texture_cache/texture_cache.h
-    texture_cache/texture_cache_base.h
-    texture_cache/types.h
-    texture_cache/util.cpp
-    texture_cache/util.h
-    textures/astc.h
-    textures/astc.cpp
-    textures/bcn.cpp
-    textures/bcn.h
-    textures/decoders.cpp
-    textures/decoders.h
-    textures/texture.cpp
-    textures/texture.h
-    textures/workers.cpp
-    textures/workers.h
-    transform_feedback.cpp
-    transform_feedback.h
-    video_core.cpp
-    video_core.h
-)
+    )
+    target_compile_definitions(video_core PUBLIC HAS_VULKAN)
+endif()
 
 if (ENABLE_LSFG)
     target_sources(video_core PRIVATE
@@ -503,6 +522,152 @@ if (ENABLE_OPENGL)
     target_compile_definitions(video_core PUBLIC HAS_OPENGL)
 endif()
 
+if (ENABLE_D3D12)
+    target_sources(video_core PRIVATE
+        renderer_d3d12/d3d12_accelerate_dma.cpp
+        renderer_d3d12/d3d12_barrier_batch.h
+        renderer_d3d12/d3d12_blit_compute.cpp
+        renderer_d3d12/d3d12_blit_image.cpp
+        renderer_d3d12/d3d12_blit_image.h
+        renderer_d3d12/d3d12_buffer_cache.cpp
+        renderer_d3d12/d3d12_buffer_cache.h
+        renderer_d3d12/d3d12_index_rewrite_cache.h
+        renderer_d3d12/d3d12_command_recorder.h
+        renderer_d3d12/d3d12_command_stream.h
+        renderer_d3d12/d3d12_command_validation.cpp
+        renderer_d3d12/d3d12_command_validation.h
+        renderer_d3d12/d3d12_compute_pipeline.cpp
+        renderer_d3d12/d3d12_compute_pipeline.h
+        renderer_d3d12/d3d12_conditional_rendering.cpp
+        renderer_d3d12/d3d12_conditional_rendering.h
+        renderer_d3d12/d3d12_descriptor_heap.cpp
+        renderer_d3d12/d3d12_descriptor_heap.h
+        renderer_d3d12/diagnostics/d3d12_astc_verify.cpp
+        renderer_d3d12/diagnostics/d3d12_stencil_blit_verify.cpp
+        renderer_d3d12/diagnostics/d3d12_compute_inputs.cpp
+        renderer_d3d12/diagnostics/d3d12_compute_inputs.h
+        renderer_d3d12/diagnostics/d3d12_draw_hunt.cpp
+        renderer_d3d12/diagnostics/d3d12_draw_hunt.h
+        renderer_d3d12/diagnostics/d3d12_draw_trace.cpp
+        renderer_d3d12/diagnostics/d3d12_local_memory_matrix.cpp
+        renderer_d3d12/diagnostics/d3d12_local_memory_matrix.h
+        renderer_d3d12/diagnostics/d3d12_full_capture.cpp
+        renderer_d3d12/diagnostics/d3d12_frame_dump.cpp
+        renderer_d3d12/diagnostics/d3d12_pipeline_diagnostics.cpp
+        renderer_d3d12/diagnostics/d3d12_pipeline_diagnostics.h
+        renderer_d3d12/diagnostics/d3d12_perf_report.cpp
+        renderer_d3d12/diagnostics/hunt_capture.h
+        renderer_d3d12/d3d12_async_pipelines.cpp
+        renderer_d3d12/d3d12_async_pipelines.h
+        renderer_d3d12/d3d12_fence_manager.cpp
+        renderer_d3d12/d3d12_fence_manager.h
+        renderer_d3d12/d3d12_graphics_pipeline.cpp
+        renderer_d3d12/d3d12_graphics_pipeline.h
+        renderer_d3d12/d3d12_stage_bindings.cpp
+        renderer_d3d12/d3d12_stage_bindings.h
+        renderer_d3d12/d3d12_linked_shader_cache.h
+        renderer_d3d12/d3d12_live_pipeline_cache.h
+        renderer_d3d12/d3d12_pso_blob_cache.cpp
+        renderer_d3d12/d3d12_pso_blob_cache.h
+        renderer_d3d12/d3d12_pso_cache.h
+        renderer_d3d12/d3d12_pso_key.h
+        renderer_d3d12/d3d12_log.h
+        renderer_d3d12/d3d12_indirect_buffer.cpp
+        renderer_d3d12/d3d12_indirect_buffer.h
+        renderer_d3d12/d3d12_maxwell_to_d3d12.cpp
+        renderer_d3d12/d3d12_maxwell_to_d3d12.h
+        renderer_d3d12/d3d12_memory_import_probe.cpp
+        renderer_d3d12/d3d12_memory_import_probe.h
+        renderer_d3d12/d3d12_memory_reserve.cpp
+        renderer_d3d12/d3d12_memory_reserve.h
+        renderer_d3d12/d3d12_render_corrections.cpp
+        renderer_d3d12/d3d12_render_corrections.h
+        renderer_d3d12/d3d12_menu_image.h
+        renderer_d3d12/d3d12_overlay.cpp
+        renderer_d3d12/d3d12_pipeline_cache.cpp
+        renderer_d3d12/d3d12_pipeline_cache.h
+        renderer_d3d12/d3d12_pipeline_key_mode.h
+        renderer_d3d12/d3d12_pipeline_key_tracking.cpp
+        renderer_d3d12/d3d12_pipeline_key_tracking.h
+        renderer_d3d12/d3d12_dxil_disk_cache.cpp
+        renderer_d3d12/d3d12_dxil_disk_cache.h
+        renderer_d3d12/d3d12_pipeline_residency.h
+        renderer_d3d12/d3d12_pipeline_helper.h
+        renderer_d3d12/d3d12_prewarm_pacer.h
+        renderer_d3d12/d3d12_texture_replay.h
+        renderer_d3d12/d3d12_frame_gen.cpp
+        renderer_d3d12/d3d12_frame_gen.h
+        renderer_d3d12/d3d12_frame_gen_pacer.cpp
+        renderer_d3d12/d3d12_frame_gen_pacer.h
+        renderer_d3d12/d3d12_present_manager.cpp
+        renderer_d3d12/d3d12_present_manager.h
+        renderer_d3d12/d3d12_present_blit.cpp
+        renderer_d3d12/d3d12_present_cpu.cpp
+        renderer_d3d12/d3d12_fsr_plan.h
+        renderer_d3d12/d3d12_present_fsr.cpp
+        renderer_d3d12/d3d12_present_fsr.h
+        renderer_d3d12/d3d12_device.cpp
+        renderer_d3d12/d3d12_device.h
+        renderer_d3d12/d3d12_driver_guard.cpp
+        renderer_d3d12/d3d12_driver_guard.h
+        renderer_d3d12/d3d12_scheduler.cpp
+        renderer_d3d12/d3d12_scheduler.h
+        renderer_d3d12/d3d12_query_cache.cpp
+        renderer_d3d12/d3d12_query_cache.h
+        renderer_d3d12/d3d12_resource_allocator.cpp
+        renderer_d3d12/d3d12_resource_allocator.h
+        renderer_d3d12/d3d12_local_memory_scratch.cpp
+        renderer_d3d12/d3d12_local_memory_scratch.h
+        renderer_d3d12/d3d12_resource_utils.cpp
+        renderer_d3d12/d3d12_resource_utils.h
+        renderer_d3d12/d3d12_rasterizer.cpp
+        renderer_d3d12/d3d12_rasterizer.h
+        renderer_d3d12/d3d12_rasterizer_clear.cpp
+        renderer_d3d12/d3d12_rasterizer_indirect.cpp
+        renderer_d3d12/d3d12_rasterizer_state.cpp
+        renderer_d3d12/d3d12_root_signature.cpp
+        renderer_d3d12/d3d12_root_signature.h
+        renderer_d3d12/d3d12_shader_compiler.cpp
+        renderer_d3d12/d3d12_shader_compiler.h
+        renderer_d3d12/d3d12_staging_buffer_pool.cpp
+        renderer_d3d12/d3d12_staging_buffer_pool.h
+        renderer_d3d12/d3d12_stream_output.cpp
+        renderer_d3d12/d3d12_stream_output.h
+        renderer_d3d12/d3d12_tess_emulation.cpp
+        renderer_d3d12/d3d12_tess_emulation.h
+        renderer_d3d12/d3d12_memory_guard.h
+        renderer_d3d12/d3d12_swapchain.cpp
+        renderer_d3d12/d3d12_swapchain.h
+        renderer_d3d12/d3d12_texture_cache.cpp
+        renderer_d3d12/d3d12_texture_cache.h
+        renderer_d3d12/d3d12_astc_gpu_decoder.cpp
+        renderer_d3d12/d3d12_bcn_gpu_decoder.cpp
+        renderer_d3d12/d3d12_gpu_unswizzle.cpp
+        renderer_d3d12/d3d12_depth_stencil_transfer.cpp
+        renderer_d3d12/d3d12_framebuffer.cpp
+        renderer_d3d12/d3d12_image_copy_blit.cpp
+        renderer_d3d12/d3d12_image_transfer.cpp
+        renderer_d3d12/d3d12_image_view.cpp
+        renderer_d3d12/d3d12_srv_compatibility.h
+        renderer_d3d12/d3d12_draw_targets.h
+        renderer_d3d12/d3d12_debug_messages.h
+        renderer_d3d12/d3d12_sampler.cpp
+        renderer_d3d12/d3d12_border_color.h
+        renderer_d3d12/d3d12_texture_cache_internal.h
+        renderer_d3d12/d3d12_texture_formats.cpp
+        renderer_d3d12/d3d12_transfer_buffer_pool.cpp
+        renderer_d3d12/d3d12_transfer_buffer_pool.h
+        renderer_d3d12/d3d12_gc_readback.h
+        renderer_d3d12/renderer_d3d12.cpp
+        renderer_d3d12/renderer_d3d12.h
+        renderer_d3d12/renderer_d3d12_internal.h
+    )
+    target_compile_definitions(video_core PUBLIC HAS_D3D12)
+    # spirv_to_dxil.dll (Mesa) is loaded at runtime; only its C headers are needed to build.
+    target_include_directories(video_core PRIVATE ${PROJECT_SOURCE_DIR}/externals/spirv-to-dxil/include)
+    target_link_libraries(video_core PRIVATE d3d12 dxgi)
+endif()
+
 if (ARCHITECTURE_x86_64)
     target_link_libraries(video_core PUBLIC xbyak::xbyak)
 endif()
@@ -519,7 +684,7 @@ endif()
 # setting is on. Only Streamline's MIT-licensed headers are compiled in and nothing of NVIDIA's is
 # linked or copied: sl.interposer.dll and the DLSS plugins are loaded at run time from the user's PC.
 cmake_dependent_option(ENABLE_NVIDIA_DLSS "Enable NVIDIA DLSS through NVIDIA Streamline" ON
-                       "MSVC AND ARCHITECTURE_x86_64" OFF)
+                       "MSVC AND ARCHITECTURE_x86_64 AND ENABLE_VULKAN" OFF)
 set(EGLANTINE_STREAMLINE_SDK "" CACHE PATH
     "NVIDIA Streamline SDK directory for its headers (empty: download them)")
 if (ENABLE_NVIDIA_DLSS)

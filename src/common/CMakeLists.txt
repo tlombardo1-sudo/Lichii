@@ -32,10 +32,24 @@ add_library(
     bit_field.h
     bit_util.h
     bounded_threadsafe_queue.h
+    bug_tracker.cpp
+    bug_tracker.h
     cityhash.cpp
     cityhash.h
     common_funcs.h
     common_types.h
+    commit_census.cpp
+    commit_census.h
+    guest_zero_census.h
+    guest_zero_census_scan.h
+    memory_ceiling.cpp
+    memory_ceiling.h
+    pulse_archive.cpp
+    pulse_archive.h
+    pulse_store.cpp
+    pulse_diagnostics.h
+    pulse_store.h
+    pulse_version.h
     concepts.h
     container_hash.h
     demangle.cpp
@@ -64,6 +78,8 @@ add_library(
     fs/fs_util.h
     fs/path_util.cpp
     fs/path_util.h
+    permafrost.cpp
+    permafrost.h
     hash.h
     heap_tracker.cpp
     heap_tracker.h
@@ -71,6 +87,7 @@ add_library(
     hex_util.h
     host_memory.cpp
     host_memory.h
+    host_stalls.h
     input.h
     intrusive_red_black_tree.h
     literals.h
@@ -78,6 +95,8 @@ add_library(
     logging.h
     lz4_compression.cpp
     lz4_compression.h
+    memory_ledger.cpp
+    memory_ledger.h
     math_util.h
     memory_detect.cpp
     memory_detect.h
@@ -150,6 +169,11 @@ add_library(
     fs/symlink.h fs/symlink.cpp
     cpu_features.cpp
     cpu_features.h
+    cpu_wait.cpp
+    cpu_wait.h
+    wake_flag.cpp
+    wake_flag.h
+    spsc_wake_queue.h
     httplib.h
     net/net.h net/net.cpp
     container/unordered_map.h container/unordered_set.h)
@@ -159,9 +183,20 @@ set_source_files_properties(zbic_compression.cpp PROPERTIES
     COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wno-unused-function;-Wno-missing-declarations;-Wno-shadow>;$<$<CXX_COMPILER_ID:MSVC>:/wd4505;/wd5245>")
 
 if(WIN32)
-    target_sources(common PRIVATE windows/timer_resolution.cpp
+    target_sources(common PRIVATE windows/cpu_pin.cpp
+        windows/cpu_pin.h
+        windows/precise_timer.cpp
+        windows/precise_timer.h
+        windows/timer_resolution.cpp
         windows/timer_resolution.h)
-    target_link_libraries(common PRIVATE ntdll)
+    # ntdll: the timer resolution; synchronization: WaitOnAddress (Common::Event::WaitFor).
+    target_link_libraries(common PRIVATE ntdll synchronization)
+endif()
+
+# Structured exception handling (__try) guards its stack unwinds: MSVC and clang-cl only.
+if(MSVC)
+    target_sources(common PRIVATE windows/sampling_profiler.cpp
+        windows/sampling_profiler.h)
 endif()
 
 if(NOT WIN32)
@@ -256,6 +291,27 @@ target_link_libraries(common PRIVATE lz4::lz4 zstd::zstd)
 # Please refer to src/common/demangle.cpp
 if (WIN32)
     target_link_libraries(common PRIVATE LLVM::Demangle)
+endif()
+
+# Xbox/UWP AppContainer: HostMemory (host_memory.cpp) must use the sandbox-legal *FromApp
+# placeholder-memory APIs. CMAKE_SYSTEM_NAME=WindowsStore (set by the uwp-x64 preset) is the reliable
+# build signal: the Store-CRT vcvars environment still compiles under the DESKTOP_APP partition, so
+# the source's WINAPI_FAMILY_APP check alone does not fire. Define the project flag so the *FromApp
+# path is active for the console target. Desktop builds are unaffected.
+if (CMAKE_SYSTEM_NAME STREQUAL "WindowsStore")
+    target_compile_definitions(common PRIVATE YUZU_UWP_APPCONTAINER=1)
+    # path_util.cpp resolves the user dir to the app's ApplicationData LocalFolder via
+    # C++/WinRT (Windows.Storage); WindowsApp.lib provides the WinRT activation runtime.
+    target_link_libraries(common PRIVATE WindowsApp.lib)
+endif()
+
+# Xbox/UWP AppContainer: HostMemory (host_memory.cpp) must use the sandbox-legal *FromApp
+# placeholder-memory APIs. CMAKE_SYSTEM_NAME=WindowsStore (set by the uwp-x64 preset) is the reliable
+# build signal: the Store-CRT vcvars environment still compiles under the DESKTOP_APP partition.
+if (CMAKE_SYSTEM_NAME STREQUAL "WindowsStore")
+    target_compile_definitions(common PRIVATE YUZU_UWP_APPCONTAINER=1)
+    # path_util.cpp resolves the user dir to the app's ApplicationData LocalFolder via C++/WinRT.
+    target_link_libraries(common PRIVATE WindowsApp.lib)
 endif()
 
 if(ANDROID)

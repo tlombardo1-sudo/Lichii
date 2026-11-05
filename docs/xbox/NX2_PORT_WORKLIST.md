@@ -11,12 +11,15 @@ build yet, and nothing has been compiled (no MSVC or UWP toolchain in the author
 keeping Lichii's NX2 changes. No merge-base was available (shallow clones), so there is no automatic 3-way merge.
 Lists come from a marker search (UWP/D3D12/ledger/bug-tracker/Pulse names), so expect misses.
 
-## 1. Build wiring (do first)
+## 1. Build wiring (done, not yet configured or compiled)
 
-- `CMakeLists.txt`, `src/CMakeLists.txt`, `src/common/CMakeLists.txt`, `src/core/CMakeLists.txt`
-- `src/video_core/CMakeLists.txt`, `src/video_core/host_shaders/CMakeLists.txt`
-- `src/dynarmic/CMakeLists.txt`, `src/dynarmic/src/dynarmic/CMakeLists.txt`
-- add `CMakePresets.json` entries (`uwp-x64`) and `CMakeModules/JadyxHostLto.cmake` (already copied)
+Merged by hand: root `CMakeLists.txt` (ENABLE_VULKAN/ENABLE_D3D12, sirit and OpenSSL built from source on
+WindowsStore, AVX2), `src/CMakeLists.txt` (`src/jadyx`, host LTO), `src/common`, `src/core`, `src/video_core`
+(Vulkan sources behind `ENABLE_VULKAN`, D3D12 block, DLSS Vulkan-only), `host_shaders`, both dynarmic lists
+(`DYNARMIC_UWP_APPCONTAINER`). `CMakePresets.json` and `CMakeModules/JadyxHostLto.cmake` came with the overlay.
+Checked only for balanced blocks and that every listed file exists. Expect configure errors on the first run
+with the Store toolchain: the C++ sources that these lists now compile still contain the Lichii-side API that the
+D3D12 backend and `src/jadyx` have not been adapted to (sections 2 to 6).
 
 ## 2. Host memory and the 5120 MiB wall (blocks Switch 2 titles)
 

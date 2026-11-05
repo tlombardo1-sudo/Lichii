@@ -72,6 +72,7 @@ add_library(dynarmic STATIC
     frontend/imm.cpp
     frontend/imm.h
     interface/halt_reason.h
+    interface/code_memory.h
     interface/exclusive_monitor.h
     interface/optimization_flags.h
     ir/acc_type.h
@@ -405,6 +406,9 @@ if (DYNARMIC_ENABLE_CPU_FEATURE_DETECTION)
 endif()
 if (DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT)
     target_compile_definitions(dynarmic PRIVATE DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT=1)
+endif()
+if (DYNARMIC_UWP_APPCONTAINER)
+    target_compile_definitions(dynarmic PRIVATE DYNARMIC_UWP_APPCONTAINER=1)
 endif()
 if (DYNARMIC_IGNORE_ASSERTS)
     target_compile_definitions(dynarmic PRIVATE MCL_IGNORE_ASSERTS=1)
