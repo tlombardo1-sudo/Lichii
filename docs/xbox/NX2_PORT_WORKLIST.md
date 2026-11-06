@@ -67,10 +67,26 @@ interfaces, `exclusive_monitor.h`, `emit_x64_vector.cpp`, the A64 frontend and t
 `Patch` rewrites emitted code through `SetCodePtr`, so the other emitters need no W^X change. This is a reading of
 the code, not a test; a JIT run under the AppContainer is the real check.
 
+Also done, to match what `src/jadyx` calls:
+- `core_timing.cpp`: `TimedWaitProfile::ActivateThread()` on the host timing thread (Windows only).
+- `arm_dynarmic.h`: `Core::SetJitCodeCacheSize` / `JitCodeCacheSize` (used by `arm_dynarmic_32/64.cpp` for the 512 MiB
+  default, so the Xbox build can shrink the per-core code cache) and `Core::SetPageTableExclusives`.
+- `physical_core.{h,cpp}`: `PhysicalCore::SetIdleSpinPolicy`.
+- **Stored only, no effect yet:** `SetPageTableExclusives` (nx2's dynarmic has no `page_table_exclusive_access`, so
+  inline exclusives through the page table are not emitted; that matters on Xbox where fastmem is off) and
+  `SetIdleSpinPolicy` (nx2's cores still block on a condition variable; Jadyx's `WakeFlag` based `Idle` is not ported).
+
+Checked: every quoted include in `src/jadyx` and `renderer_d3d12` resolves, except the 45 generated `*_spv.h`
+shader headers. Each of those has a source in `host_shaders` and a CMake entry or variant row.
+
+Left as nx2, deliberately: `arm_dynarmic_64.cpp` (Jadyx's differences are CPU profiling, JIT prewarm, Pulse and the
+JIT read table `jit_entries`, none needed to boot; nx2's CNTPCT pause and sign-extension handling stay),
+`exclusive_monitor.h` (Pulse checkpoint only), `cpu_manager.cpp` (Pulse restore hooks only), the rest of
+`core_timing` (Pulse checkpoint plus guest clock scaling; nx2 has its own guest CNTFRQ and the timer-thread stop fix).
+
 Still open:
-- `src/core/arm/dynarmic/arm_dynarmic_64.cpp`, `src/core/arm/exclusive_monitor.h`
-- `src/core/core_timing.{h,cpp}`, `cpu_manager.cpp`, `src/tests/core/core_timing.cpp`
-- The JIT read table from section 2 (`common/page_table.{h,cpp}` and the dynarmic read path).
+- Inline page-table exclusives in dynarmic (`a64_emit_x64_memory.cpp`, `emit_x64_memory.cpp.inc`) and the JIT read table.
+- Jadyx's `WakeFlag` based `PhysicalCore::Idle`.
 - Jadyx's `writable_code_ranges.h` / profile changes may collide with nx2's LSE atomics, pointer authentication and
   memory tagging work.
 

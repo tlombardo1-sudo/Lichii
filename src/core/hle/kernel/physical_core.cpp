@@ -19,6 +19,14 @@
 
 namespace Kernel {
 
+namespace {
+Common::SpinPolicy idle_spin_policy{};
+} // namespace
+
+void PhysicalCore::SetIdleSpinPolicy(Common::SpinPolicy policy) {
+    idle_spin_policy = policy;
+}
+
 PhysicalCore::PhysicalCore(KernelCore& kernel, std::size_t core_index)
     : m_core_index{core_index}
 {

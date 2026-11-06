@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 
+#include "common/wake_flag.h"
 #include "core/arm/arm_interface.h"
 
 namespace Kernel {
@@ -52,6 +53,11 @@ public:
 
     // Wait for an interrupt.
     void Idle();
+
+    /// How idle cores wait for an interrupt (src/jadyx boot settings). Stored only: nx2's cores
+    /// still block on a condition variable, so the policy has no effect until Jadyx's WakeFlag
+    /// based Idle is ported (worklist section 3).
+    static void SetIdleSpinPolicy(Common::SpinPolicy policy);
 
     // Interrupt this core.
     void Interrupt();

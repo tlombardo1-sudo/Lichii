@@ -12,6 +12,7 @@
 #include "common/cpu_features.h"
 
 #ifdef _WIN32
+#include "common/windows/timed_wait_profile.h"
 #include "common/windows/timer_resolution.h"
 #endif
 
@@ -75,6 +76,9 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
             Common::SetCurrentThreadName("HostTiming");
             Common::SetCurrentThreadPriority(Common::ThreadPriority::VeryHigh);
             Common::SetCurrentThreadToPerformanceCores();
+#ifdef _WIN32
+            Common::Windows::TimedWaitProfile::ActivateThread();
+#endif
             on_thread_init();
             has_started = true;
 
