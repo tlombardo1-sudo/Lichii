@@ -51,14 +51,28 @@ Open questions that only a run on a console can answer:
   `Nx2GraphicsServerMemorySize` to the 12 GB layout, so the hot region may sit in the wrong place. It is a speed hint only.
 - The remaining shared files in this section (`core/core_timing`, `cpu_manager`) are not done.
 
-## 3. CPU / JIT (both forks edit the x64 backend)
+## 3. CPU / JIT (x64 W^X merged, not compiled)
 
-- `src/dynarmic/src/dynarmic/backend/x64/block_of_code.cpp` (W^X in the AppContainer)
-- `src/dynarmic/src/dynarmic/common/spin_lock_x64.cpp`, `interface/exclusive_monitor.h`
+Done (dynarmic x64 backend, paged W^X for the AppContainer, where RWX is never allowed):
+- Jadyx's `block_of_code.{h,cpp}` (write window: `EnableWriting`/`DisableWriting`/`MakeWritable`/`WriteAlias`),
+  `constant_pool.cpp`, `exception_handler_windows.cpp` (unwind info written through `WriteAlias`),
+  `block_range_information.{h,cpp}` and `common/spin_lock_x64.cpp`.
+- `emit_x64.cpp` (by hand): the compact-patch `Patch` loop calls `MakeWritable` before `SetCodePtr`, since patch sites
+  sit in blocks that are already emitted; PerfMap registration limited to Linux; `ClearCache` resets
+  `block_descriptors` and `patch_information`.
+- `DYNARMIC_UWP_APPCONTAINER` forces `REQUIRE_WX` (section 1).
+
+Deliberately left as nx2: `a64_emit_x64.cpp`, `emit_x64_memory.cpp.inc`, `a64_emit_x64_memory.cpp`, the A32/A64
+interfaces, `exclusive_monitor.h`, `emit_x64_vector.cpp`, the A64 frontend and the arm64/riscv64 backends. Only
+`Patch` rewrites emitted code through `SetCodePtr`, so the other emitters need no W^X change. This is a reading of
+the code, not a test; a JIT run under the AppContainer is the real check.
+
+Still open:
 - `src/core/arm/dynarmic/arm_dynarmic_64.cpp`, `src/core/arm/exclusive_monitor.h`
 - `src/core/core_timing.{h,cpp}`, `cpu_manager.cpp`, `src/tests/core/core_timing.cpp`
-- Expect Jadyx's block-range / profile changes (`block_range_information`, `writable_code_ranges.h`) to collide with
-  Lichii's LSE atomics, pointer authentication and memory tagging work.
+- The JIT read table from section 2 (`common/page_table.{h,cpp}` and the dynarmic read path).
+- Jadyx's `writable_code_ranges.h` / profile changes may collide with nx2's LSE atomics, pointer authentication and
+  memory tagging work.
 
 ## 4. GPU front end (Lichii split GPU thread vs Jadyx hooks)
 

@@ -9,9 +9,11 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <type_traits>
+#include <vector>
 
 #include "common/common_types.h"
 #include "common/x64/xbyak.h"
@@ -41,6 +43,7 @@ class BlockOfCode final : public Xbyak::CodeGenerator {
 public:
     BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp);
     BlockOfCode(const BlockOfCode&) = delete;
+    ~BlockOfCode();
 
     /// Call when external emitters have finished emitting their preludes.
     void PreludeComplete();
@@ -49,6 +52,9 @@ public:
     void EnableWriting();
     /// Change permissions to RX. This is required to support systems with W^X enforced.
     void DisableWriting();
+    /// Between EnableWriting and DisableWriting: makes [where, where + size) writable too, for writes
+    /// behind the current code pointer (block linking patches). No-op without paged W^X.
+    void MakeWritable(CodePtr where, size_t size);
 
     /// Clears this block of code and resets code pointer to beginning.
     void ClearCache();
@@ -139,6 +145,12 @@ public:
     /// This is useful for objects that need to be placed close to or within code.
     /// The lifetime of this memory is the same as the code around it.
     void* AllocateFromCodeSpace(size_t size);
+    /// Where to write `p`, a pointer into this block of code: itself, or its alias in the writable
+    /// view when the code memory is dual-mapped (its executable view is read-only).
+    template<typename T>
+    T* WriteAlias(T* p) const noexcept {
+        return reinterpret_cast<T*>(reinterpret_cast<u8*>(p) + writeOffset_);
+    }
 
     void SetCodePtr(CodePtr code_ptr);
     void EnsurePatchLocationSize(CodePtr begin, size_t size);
@@ -173,6 +185,35 @@ private:
     static constexpr size_t MXCSR_ALREADY_EXITED = 1 << 0;
     static constexpr size_t FORCE_RETURN = 1 << 1;
 
+    // The code region's memory state comes before constant_pool: its constructor already commits
+    // and writes code memory (EnsureMemoryCommitted), so this state must be initialized by then.
+    // Declared after it, committed_size was read uninitialized there; with a large garbage value
+    // nothing was committed and the pool's first write faulted.
+#ifdef _WIN32
+    size_t committed_size = 0;
+#endif
+#if defined(_WIN32) && defined(DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT)
+    // Paged W^X (see EnableWriting). Pages in [wx_exec_begin, wx_exec_end) hold emitted code and
+    // are RX unless being written; committed pages past wx_exec_end are always RW. The constant
+    // pool sits below wx_exec_begin and stays RW: it is only ever read as data.
+    const u8* wx_exec_begin = nullptr;
+    const u8* wx_exec_end = nullptr;
+    const u8* wx_write_begin = nullptr;
+    std::vector<const u8*> wx_extra_pages;
+    bool wx_writing = false;
+    // Dual-mapped code memory (see the allocator): writes go through writeOffset_ and no page
+    // ever changes protection. Set before constant_pool, which writes code memory first.
+    bool AdoptWriteView();
+    const bool dual_mapped = AdoptWriteView();
+    void ReleaseMemoryPastCap();
+    bool release_failed = false;
+#endif
+    bool prelude_complete = false;
+    // SetCodeCacheCap as this cache applies it: the cap it last saw, and where its code ends.
+    size_t CapEnd(size_t cap) const;
+    mutable size_t cap_epoch = 0;
+    mutable size_t cap_end = SIZE_MAX;
+
     ConstantPool constant_pool;
     JitStateInfo jsi;
     std::array<const void*, 4> return_from_run_code;
@@ -180,10 +221,6 @@ private:
     RunCodeFuncType step_code = nullptr;
     RunCodeCallbacks cb;
     CodePtr code_begin = nullptr;
-#ifdef _WIN32
-    size_t committed_size = 0;
-#endif
-    bool prelude_complete = false;
 
     void GenRunCode(std::function<void(BlockOfCode&)> rcp);
 };

@@ -349,7 +349,11 @@ Xbyak::Label EmitX64::EmitCond(IR::Cond cond) {
 }
 
 EmitX64::BlockDescriptor EmitX64::RegisterBlock(const IR::LocationDescriptor& descriptor, CodePtr entrypoint, size_t size) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    // The non-Linux registration is a no-op, but evaluating the name formatter would still
+    // allocate and format a string for every block on Windows/UWP.
     PerfMapRegister(entrypoint, code.getCurr(), LocationDescriptorToFriendlyName(descriptor));
+#endif
     Patch(descriptor, entrypoint);
 
     BlockDescriptor block_desc{entrypoint, size};
@@ -380,8 +384,12 @@ void EmitX64::Patch(const IR::LocationDescriptor& target_desc, CodePtr target_co
         return;
     }
     const CodePtr save_code_ptr = code.getCurr();
+    // Patch sites are in blocks already emitted, so behind the write window (paged W^X).
+    constexpr size_t MAX_PATCH_SIZE = 32;
     const auto patch = [&](u32 entry) {
-        code.SetCodePtr(static_cast<const u8*>(code.getCode()) + (entry >> 2));
+        const u8* const site = static_cast<const u8*>(code.getCode()) + (entry >> 2);
+        code.MakeWritable(site, MAX_PATCH_SIZE);
+        code.SetCodePtr(site);
         switch (PatchKind(entry & 3)) {
         case PatchKind::Jg:
             EmitPatchJg(target_desc, target_code_ptr);
@@ -415,8 +423,10 @@ void EmitX64::Unpatch(const IR::LocationDescriptor& target_desc) {
 }
 
 void EmitX64::ClearCache() {
-    block_descriptors.clear();
-    patch_information.clear();
+    // Replaced rather than cleared: clear() keeps every bucket, tens of MiB for a cache that has
+    // compiled a large game, which a clear to give memory back would not return.
+    block_descriptors = decltype(block_descriptors){};
+    patch_information = decltype(patch_information){};
 
     PerfMapClear();
 }
