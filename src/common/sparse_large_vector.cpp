@@ -17,7 +17,43 @@
 #include "common/assert.h"
 #include "common/sparse_large_vector.h"
 
+#if defined(_WIN32) && defined(YUZU_UWP_APPCONTAINER)
+#include "common/dynamic_library.h"
+#endif
+
 namespace Common {
+
+#ifdef _WIN32
+#ifdef YUZU_UWP_APPCONTAINER
+// Xbox/UWP AppContainer: plain VirtualAlloc/VirtualProtect are not available to the app, and the
+// errorhandling api-set that exports AddVectoredExceptionHandler is missing from the Xbox loader, so
+// importing it makes the package fail to activate. Use the *FromApp variants and resolve the handler
+// API by name (same approach as host_memory.cpp).
+namespace {
+using PFN_AddVectoredExceptionHandler = PVOID(WINAPI*)(ULONG First,
+                                                       PVECTORED_EXCEPTION_HANDLER Handler);
+PVOID AddExceptionHandler(ULONG first, PVECTORED_EXCEPTION_HANDLER handler) {
+    static DynamicLibrary kernelbase("Kernelbase");
+    PFN_AddVectoredExceptionHandler add_veh{};
+    if (!kernelbase.IsOpen() || !kernelbase.GetSymbol("AddVectoredExceptionHandler", &add_veh)) {
+        return nullptr;
+    }
+    return add_veh(first, handler);
+}
+} // namespace
+#define LARGE_VECTOR_VIRTUAL_ALLOC(address, size, type, protection)                                \
+    VirtualAllocFromApp(address, size, type, protection)
+#define LARGE_VECTOR_VIRTUAL_PROTECT(address, size, protection, old)                               \
+    VirtualProtectFromApp(address, size, protection, old)
+#define LARGE_VECTOR_ADD_EXCEPTION_HANDLER(first, handler) AddExceptionHandler(first, handler)
+#else
+#define LARGE_VECTOR_VIRTUAL_ALLOC(address, size, type, protection)                                \
+    VirtualAlloc(address, size, type, protection)
+#define LARGE_VECTOR_VIRTUAL_PROTECT(address, size, protection, old)                               \
+    VirtualProtect(address, size, protection, old)
+#define LARGE_VECTOR_ADD_EXCEPTION_HANDLER(first, handler) AddVectoredExceptionHandler(first, handler)
+#endif
+#endif
 
 #ifdef _WIN32
 static std::vector<std::pair<u64, u64>> vector_regions {};
@@ -83,9 +119,9 @@ bool CommitVectorPage(uintptr_t addr, bool write) noexcept {
     if (res == 0) {
         LOG_CRITICAL(HW_Memory, "Failed to query large buffer region at {:#x} with error {}, will try committing anyway", addr, GetLastError());
     } else if (info.State == MEM_COMMIT) {
-        DWORD old_protect {};
+        ULONG old_protect {};
         auto perm = write ? PAGE_READWRITE : PAGE_READONLY;
-        if (!VirtualProtect(reinterpret_cast<void*>(addr), HostPageSize, perm, &old_protect)) {
+        if (!LARGE_VECTOR_VIRTUAL_PROTECT(reinterpret_cast<void*>(addr), HostPageSize, perm, &old_protect)) {
             LOG_ERROR(HW_Memory, "Failed to change permissions of large buffer region at {:#x}, error {}", addr, GetLastError());
             return false;
         }
@@ -96,7 +132,7 @@ bool CommitVectorPage(uintptr_t addr, bool write) noexcept {
     }
 
     auto perm = write ? PAGE_READWRITE : PAGE_READONLY;
-    void* res2 = VirtualAlloc(reinterpret_cast<LPVOID>(addr), HostPageSize, MEM_COMMIT, perm);
+    void* res2 = LARGE_VECTOR_VIRTUAL_ALLOC(reinterpret_cast<LPVOID>(addr), HostPageSize, MEM_COMMIT, perm);
     if (res2 == nullptr) {
         LOG_ERROR(HW_Memory, "Failed to commit large buffer region at {:#x}, error {}", addr, GetLastError());
         return false;
@@ -133,18 +169,18 @@ void* AllocateMemoryPages(std::size_t size) noexcept {
 
 #ifdef _WIN32
     // We will never use this memory entirely so instead of committing it up front let's just reserve it and commit each page individually
-    void* base = VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_READWRITE);
+    void* base = LARGE_VECTOR_VIRTUAL_ALLOC(nullptr, size, MEM_RESERVE, PAGE_READWRITE);
 
     if (base != nullptr) {
         std::lock_guard lock(vector_regions_mutex);
         vector_regions.emplace_back(reinterpret_cast<u64>(base) >> HostPageBits, (reinterpret_cast<u64>(base) + size) >> HostPageBits);
 
         static std::once_flag flag;
-        std::call_once(flag, []() { AddVectoredExceptionHandler(1, FakePageFaultHandler); });
+        std::call_once(flag, []() { LARGE_VECTOR_ADD_EXCEPTION_HANDLER(1, FakePageFaultHandler); });
     } else {
         // Try committing everything instead??
         LOG_WARNING(HW_Memory, "Failed to reserve large vector region with error {}, trying to commit instead..", GetLastError());
-        base = VirtualAlloc(nullptr, size, MEM_COMMIT, PAGE_READWRITE);
+        base = LARGE_VECTOR_VIRTUAL_ALLOC(nullptr, size, MEM_COMMIT, PAGE_READWRITE);
     }
     ASSERT_MSG(base, "Failed to reserve {:#x} sized region with error {}", size, GetLastError());
 #else

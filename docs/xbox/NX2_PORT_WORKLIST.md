@@ -21,12 +21,35 @@ Checked only for balanced blocks and that every listed file exists. Expect confi
 with the Store toolchain: the C++ sources that these lists now compile still contain the Lichii-side API that the
 D3D12 backend and `src/jadyx` have not been adapted to (sections 2 to 6).
 
-## 2. Host memory and the 5120 MiB wall (blocks Switch 2 titles)
+## 2. Host memory and the 5120 MiB wall (merged, not compiled)
 
-- `src/common/host_memory.{h,cpp}` (Lichii: 12 GB layout, 20 GiB backing; Jadyx: `*FromApp` placeholder memory,
-  commit on demand). This is the key conflict.
-- `src/core/device_memory.{h,cpp}`, `src/core/device_memory_manager.{h,inc}`, `src/core/memory.cpp`
-- `src/common/fiber.cpp`, `sparse_large_vector.cpp`, `thread.cpp`, `settings.cpp`, `fs/fs_paths.h`, `fs/path_util.cpp`
+Done:
+- `src/common/host_memory.{h,cpp}`: Jadyx's file (FromApp placeholder memory, demand commit, decommit on clear,
+  guest swap, fastmem hot region) with nx2's granule API on top (`MarkUsed`, `MarkDirty`, `ForgetContents`,
+  `HintCold`, `VirtualSize`) and nx2's skip-clean `ClearBackingRegion`. nx2's POSIX-only macOS work is not carried over.
+- `src/core/device_memory.{h,cpp}`: Jadyx's (fastmem region, Pulse checkpoint access).
+- `src/core/hle/kernel/k_memory_manager.{h,cpp}`: nx2's with Jadyx's `TrimFree` (gives freed guest pages back to the
+  host) and run-coalesced `ProcessOptimizedAllocation`.
+- `src/common/settings.cpp`, `fs/fs_paths.h`, `fs/path_util.cpp`: Jadyx's UWP guards only (LocalFolder user dir,
+  no shell32, fastmem follows `cpuopt_fastmem`). nx2's settings and `STREAMLINE_DIR` kept.
+- `src/common/fiber.{h,cpp}`: Jadyx's growable fiber stacks (reserve all, commit 64 KiB). nx2's unused canaries and
+  `rewind_context` are gone.
+- `src/common/sparse_large_vector.cpp`: nx2's with Jadyx's `*FromApp` wrappers. nx2's region-end and `erase_if` fixes kept.
+- `src/common/thread.{h,cpp}`: Jadyx's (precise-timer `Event::WaitFor`). **Dropped:** nx2's x64 MWAITX/WAITPKG
+  busy-wait `Event::WaitFor`. Reinstate it behind `#if !defined(_WIN32)` if desktop builds from this branch matter.
+
+Deliberately left as nx2 (not Jadyx): `src/core/device_memory_manager.{h,inc}` and `src/core/memory.cpp`. They keep
+the 35-bit physical space the 12 GB layout needs and nx2's translation-cache and continuity fixes. Jadyx's JIT read
+table (`Common::PageTable::jit_entries`, `MarkGpuWritten`, `ReadBlockUnsafeToWriteCombined`) is **not** ported; it is a
+no-fastmem speed-up. It needs `common/page_table.{h,cpp}` and the dynarmic read path, so do it with section 3.
+
+Open questions that only a run on a console can answer:
+- Jadyx reserves the guest DRAM and commits pages on first touch, so reserving the 12 GiB layout costs nothing;
+  only the pages a title touches count against the 5120 MiB app limit. Whether a Switch 2 title stays under that is
+  unmeasured. (Earlier notes called this impossible; that overstated it.)
+- `GetFastmemRegion()` assumes the application pool ends at `dram_size - KTraceBufferSize`. nx2 appends
+  `Nx2GraphicsServerMemorySize` to the 12 GB layout, so the hot region may sit in the wrong place. It is a speed hint only.
+- The remaining shared files in this section (`core/core_timing`, `cpu_manager`) are not done.
 
 ## 3. CPU / JIT (both forks edit the x64 backend)
 

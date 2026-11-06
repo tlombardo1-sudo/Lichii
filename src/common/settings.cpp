@@ -180,6 +180,13 @@ bool IsGPUFenceBehaviorAccurate() {
 }
 
 bool IsFastmemEnabled() {
+#ifdef YUZU_UWP_APPCONTAINER
+    // Xbox/UWP AppContainer: the 0.2.51 probe showed the Series reserves the 512 GiB arena and
+    // maps aliased views of a SEC_RESERVE section into it, so fastmem follows cpuopt_fastmem
+    // (boot.cfg "fastmem=0" turns it off). HostMemory builds the arena only when it is on, and a
+    // failed arena leaves VirtualBasePointer() null, which memory.cpp treats as fastmem off.
+    return values.cpuopt_fastmem.GetValue();
+#else
     if (values.cpu_accuracy.GetValue() == Settings::CpuAccuracy::Debugging)
         return bool(values.cpuopt_fastmem);
     else if (values.cpu_accuracy.GetValue() == CpuAccuracy::Unsafe)
@@ -192,6 +199,7 @@ bool IsFastmemEnabled() {
     return false;
 #else
     return true;
+#endif
 #endif
 }
 
