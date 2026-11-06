@@ -157,6 +157,8 @@ public:
         return total;
     }
 
+    size_t TrimFree(Pool pool, size_t budget);
+
     void DumpFreeList(Pool pool) {
         KScopedLightLock lk(m_pool_locks[static_cast<size_t>(pool)]);
 
@@ -248,6 +250,8 @@ private:
         void DumpFreeList() const {
             UNIMPLEMENTED();
         }
+
+        size_t TrimFree(KernelCore& kernel, bool optimized, size_t& budget);
 
         constexpr size_t GetPageOffset(KPhysicalAddress address) const {
             return m_heap.GetPageOffset(address);
