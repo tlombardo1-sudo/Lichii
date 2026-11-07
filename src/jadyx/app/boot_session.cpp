@@ -80,10 +80,6 @@
 #include "jadyx/library/game_library.h"
 #include "jadyx/library/play_history.h"
 #include "jadyx/mods/mod_settings.h"
-#include "jadyx/pulse/pulse_gate.h"
-#include "jadyx/pulse/pulse_screen.h"
-#include "jadyx/pulse/pulse_sessions.h"
-#include "jadyx/pulse/pulse_store_gate.h"
 #include "jadyx/settings/uwp_system_settings.h"
 #include "jadyx/storage/network_import_gate.h"
 #include "jadyx/storage/utf8.h"
@@ -149,10 +145,7 @@ private:
     // Set only after a failed Load has returned from Core's own synchronous cleanup.
     // Other early Load failures still require the frontend to tear down the kernel.
     bool load_already_shutdown = false;
-    // Shown while Pulse saves or resumes a session (pulse_screen.h); it draws through the GPU
-    // thread, so it goes before anything is torn down.
-    std::optional<PulseScreen> pulse_screen;
-    // The splash over the guest's first frames (launch_splash.h); it draws as the Pulse screen.
+    // The splash over the guest's first frames (launch_splash.h).
     std::optional<LaunchScreen> launch_screen;
     // Only while played. First in Shutdown, as its workers read the System.
     std::optional<SessionMemory> memory;
@@ -161,8 +154,6 @@ private:
     Content::LaunchResolution content;
     Service::AM::FrontendAppletParameters load_parameters;
     std::atomic<bool> guest_exited{false};
-    std::optional<Common::Pulse::Identity> pulse_identity;
-    bool gpu_started = false, resumed = false;
     std::mutex live_mutex;
     std::condition_variable live_cv;
     std::atomic<bool> jit_alive{false};
@@ -187,7 +178,6 @@ int GameSession::Run() {
 // Stops what runs over the System, then the guest. Every way out of a session that got this far.
 void GameSession::Shutdown() {
     memory.reset();
-    pulse_screen.reset();
     launch_screen.reset();
     Common::SamplingProfiler::Stop(); // writes the window in progress, if it runs
     if (config.gpu_failure_probe) WriteDiag("GPU recovery shutdown: input.Stop");
@@ -296,69 +286,13 @@ std::optional<int> GameSession::LoadGuest() {
     // (ILibraryAppletSelfAccessor::ExitProcessAndReturn); here that is the library.
     if (mii_editor)
         system.RegisterExecuteProgramCallback([this](std::size_t) { guest_exited.store(true); });
-    // Pulse: the identity this boot would save under, and the session it resumes if one matches.
-    if (config.pulse_sessions && PulseSessions::Enabled() && !mii_editor) {
-        try {
-            const auto file = system.GetFilesystem()->OpenFile(nro_path, FileSys::OpenMode::Read);
-            const auto user = system.GetProfileManager().GetUser(0);
-            if (file && user) {
-                pulse_identity = PulseSessions::IdentityFor(nro_path, user->uuid, file->GetSize(),
-                                                            content.application, content.version,
-                                                            content.build_id);
-            }
-        } catch (const std::exception& e) {
-            WritePulseLog(std::string("no identity: ") + e.what());
-        }
-    }
     if (boot_screen) {
         D3D12::SetWindowHandoff(ReleaseLaunchSplash);
         D3D12::SetBootScreen(DrawLaunchSplash);
     }
-    Core::SystemResultStatus load_result{Core::SystemResultStatus::ErrorNotInitialized};
-    if (pulse_identity && config.pulse_resume && PulseSessions::CanResume(*pulse_identity)) {
-        WritePulseLog("resuming the kept session | " + MemoryReport());
-        const auto resume_start = std::chrono::steady_clock::now();
-        bool loaded = false;
-        try {
-            PulseSessions::Resume(system, *pulse_identity, [&](const Kernel::ProcessLayoutPin& pin) {
-                system.Kernel().PinNextProcessLayout(pin);
-                loaded = true;
-                load_result = system.Load(emu_window, nro_path, load_parameters);
-                load_already_shutdown = load_result != Core::SystemResultStatus::Success &&
-                                        system.IsShuttingDown();
-                if (load_result != Core::SystemResultStatus::Success) {
-                    throw std::runtime_error("system.Load failed");
-                }
-                // The services the restore rebuilds talk to the GPU, as in the test bench.
-                EndBootScreen();
-                system.GPU().Start();
-                system.GetCpuManager().OnGpuReady();
-                gpu_started = true;
-                std::string title;
-                void(system.GetAppLoader().ReadTitle(title));
-                pulse_screen.emplace(system, PulseScreen::Kind::Resume, Utf8ToUtf16(title));
-            });
-            resumed = true;
-            WritePulseLog("session resumed in " +
-                      std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                         std::chrono::steady_clock::now() - resume_start)
-                                         .count()) +
-                      " ms | " + MemoryReport());
-        } catch (const std::exception& e) {
-            WritePulseLog(std::string("resume failed: ") + e.what());
-            if (loaded) {
-                // This System holds a half-rebuilt process and is never run: a fresh one boots.
-                Shutdown();
-                return PULSE_RESUME_FAILED;
-            }
-            PulseSessions::SetNotice(I18n::ToUtf8(I18n::Tr(I18n::Text::PulseNotResumed)));
-        }
-    }
-    if (!resumed) {
-        load_result = system.Load(emu_window, nro_path, load_parameters);
-        load_already_shutdown = load_result != Core::SystemResultStatus::Success &&
-                                system.IsShuttingDown();
-    }
+    Core::SystemResultStatus load_result = system.Load(emu_window, nro_path, load_parameters);
+    load_already_shutdown = load_result != Core::SystemResultStatus::Success &&
+                            system.IsShuttingDown();
     // Unused when Load failed before the renderer came up.
     D3D12::SetWindowHandoff(nullptr);
     D3D12::SetBootScreen(nullptr);
@@ -405,11 +339,9 @@ void GameSession::WatchSentinels() {
 
 void GameSession::StartGpu() {
     // Start the GPU host thread (null renderer â€” no device) and release the CPU manager.
-    if (!gpu_started) {
-        system.GPU().Start();
-        WriteDiag("step: GPU host thread started");
-        system.GetCpuManager().OnGpuReady();
-    }
+    system.GPU().Start();
+    WriteDiag("step: GPU host thread started");
+    system.GetCpuManager().OnGpuReady();
 
     if (Settings::values.use_disk_shader_cache.GetValue()) {
         // As yuzu_cmd: build the pipelines earlier sessions saved (LocalState/jadyx/shader/<title>/
@@ -417,14 +349,11 @@ void GameSession::StartGpu() {
         // later are appended to the file. The renderer shows the progress on screen.
         WriteDiag("step: building the disk shader cache | " + MemoryReport());
         VideoCore::RendererBase& renderer = system.Renderer();
-        if (pulse_screen) pulse_screen->ShadersStarting();
         renderer.ReadRasterizer()->LoadDiskResources(
             system.GetApplicationProcessProgramID(), std::stop_token{},
             [this, &renderer](VideoCore::LoadCallbackStage, size_t done, size_t total) {
-                // A resume's screen and the splash show the count themselves; two presenters
-                // would race.
-                if (pulse_screen) pulse_screen->Shaders(done, total);
-                else if (boot_screen) SetLaunchStep(LaunchStep::Shaders, done, total);
+                // The splash shows the count itself; two presenters would race.
+                if (boot_screen) SetLaunchStep(LaunchStep::Shaders, done, total);
                 else D3D12::ShowLoadProgress(renderer, done, total);
             });
         WriteDiag("step: disk shader cache built | " + MemoryReport());
@@ -455,14 +384,11 @@ void GameSession::PrepareGame() {
                       std::to_string(prewarm_mib) + " MiB per core" +
                       (config.jit_prewarm_mib != 0 ? " (boot.cfg)" : "") + " | " +
                       MemoryReport());
-            if (pulse_screen) pulse_screen->CpuStarting();
             Core::ConfigureApplicationPrewarm(system,
                 config.jit_prewarm == BootConfig::JitPrewarm::Warm,
                 [this](size_t done, size_t total) {
-                    // A resume's screen and the splash show the count themselves; two presenters
-                    // would race.
-                    if (pulse_screen) pulse_screen->Cpu(done, total);
-                    else if (boot_screen) SetLaunchStep(LaunchStep::Cpu, done, total);
+                    // The splash shows the count itself; two presenters would race.
+                    if (boot_screen) SetLaunchStep(LaunchStep::Cpu, done, total);
                     else D3D12::ShowCpuLoadProgress(system.Renderer(), done, total);
                 },
                 prewarm_mib * PrewarmBudget::MiB);
@@ -482,10 +408,8 @@ void GameSession::StartGuest() {
                   " Hz, " + std::to_string(config.profile_window) + " s windows");
     }
     // Run the guest. CpuManager spins up guest threads; dynarmic compiles + executes their code.
-    // A resume's screen stays over it until the game presents.
-    if (pulse_screen) pulse_screen->GameStarting();
-    // The splash goes on over the guest until the game presents (a resume's screen ended it).
-    if (boot_screen && !pulse_screen) {
+    // The splash goes on over the guest until the game presents.
+    if (boot_screen) {
         EndBootScreen();
         launch_screen.emplace(system);
     }
@@ -536,13 +460,10 @@ int GameSession::PlayLoop() {
     // (never with the menu open), saved each minute since the dashboard can end the process.
     std::optional<PlaySession> play_session;
     if (!mii_editor) play_session.emplace(nro_path, program_id);
-    SessionMenu menu{{system, input, emu_window, config, surface, pulse_screen, launch_screen,
-                      pulse_identity, keyboard_applet, program_id, mii_editor}};
+    SessionMenu menu{{system, input, emu_window, config, surface, launch_screen,
+                      keyboard_applet, program_id, mii_editor}};
     constexpr auto TICK = std::chrono::milliseconds(20);
     memory.emplace(system, config, program_id, prewarm_budget);
-    // Pulse: after a resume the presented frames are logged each second for 30 s, so a guest
-    // that freezes shows when it stopped.
-    u64 resume_frames = 0;
     for (u32 tick = 1;; ++tick) {
         std::this_thread::sleep_for(TICK);
         if (play_session) play_session->Tick(!menu.IsOpen());
@@ -555,14 +476,6 @@ int GameSession::PlayLoop() {
             WriteDiag("GPU command failed; shutting down game for library recovery | " + MemoryReport());
             Shutdown();
             return 15;
-        }
-        if (resumed && tick % TICKS_PER_SECOND == 0 && tick <= 30 * TICKS_PER_SECOND) {
-            const u32 second = tick / TICKS_PER_SECOND;
-            const u64 frames = system.GetPerfStats().TotalGameFrames();
-            WritePulseLog("resumed +" + std::to_string(second) + " s: " +
-                          std::to_string(frames - resume_frames) + " frames" +
-                          (menu.IsOpen() ? " (menu)" : ""));
-            resume_frames = frames;
         }
         if (config.hunt_at > 0 && tick == config.hunt_at * TICKS_PER_SECOND) {
             D3D12::HuntNextFrames();
@@ -718,22 +631,6 @@ int RunHeadlessBoot(const std::string& launch_path, const BootSurface& surface,
         std::filesystem::path{std::wstring{winrt::Windows::Storage::ApplicationData::Current().LocalFolder().Path()}},
         WriteDiag) ? 0 : 15;
     ApplyBootConfig(config, surface, mii_editor);
-
-    if (config.pulse_store) {
-        const auto result = RunPulseStoreGate(
-            {.diag = [](const std::string& line) { WriteDiag(line); }, .restart = [] { RestartApp(); }});
-        if (result != PulseStoreGateResult::Pass) return 17;
-        if (!config.pulse_cycles) return 0;
-    }
-    if (config.pulse_cycles) {
-        return RunPulseGate(launch_path, {.cycles = config.pulse_cycles,
-                                       .seed = config.pulse_seed,
-                                       .core_window = config.null_renderer ? nullptr
-                                                                           : surface.core_window,
-                                       .width = surface.width,
-                                       .height = surface.height,
-                                       .diag = [](const std::string& line) { WriteDiag(line); }});
-    }
 
     Core::System system{};
     g_gpu_command_failed.store(false, std::memory_order_release);

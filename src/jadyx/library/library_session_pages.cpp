@@ -476,7 +476,7 @@ void LibrarySession::Draw() {
         game_options.open && game_options.game < scan.entries.size() && game_graphics_id != 0 &&
                 game_graphics_id == scan.entries[game_options.game].program_id ? &game_graphics : nullptr,
         game_graphics_row, &graphics_page.settings};
-    // Titles, Pulse sessions and plays arrive after the shelf was made: keep it current,
+    // Titles and plays arrive after the shelf was made: keep it current,
     // the focus on the same game.
     if (tab == LibraryTab::Library && !loading) {
         const auto focused = shelf_focus < shelf.size() ? shelf[shelf_focus] : SIZE_MAX;

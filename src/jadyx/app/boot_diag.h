@@ -20,11 +20,8 @@ namespace Jadyx {
 /// Milliseconds since launch, the stamp on every line of these logs.
 unsigned long long ElapsedMs();
 void WriteDiag(const std::string& msg);
-void WritePulseLog(const std::string& msg); ///< jadyx_pulse.txt
 /// For the crash handlers: no WinRT, no lock, no allocation beyond what fopen needs.
 void WriteDiagRaw(const char* line, bool debugger_channel = true);
-/// One line of jadyx_pulse.txt per different rejection, from the first-chance logger.
-void WritePulseRejection(const char* what);
 
 std::string CpuSetReport();
 std::string MemoryReport();
@@ -40,7 +37,6 @@ void SavePrewarmStep(u64 program_id, std::int32_t step);
 
 u64 TrimFreeGuestMemory(Core::System& system, u64 budget);
 void ApplyProcessMemoryLimit(u32 limit_mib);
-[[noreturn]] void RestartApp();
 bool QueryAppMemory(u64& used, u64& limit);
 Common::MemoryCeilings QueryMemoryCeilings();
 

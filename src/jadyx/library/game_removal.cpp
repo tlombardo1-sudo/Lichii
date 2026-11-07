@@ -7,7 +7,6 @@
 #include "common/fs/path_util.h"
 #include "core/file_sys/common_funcs.h"
 #include "jadyx/content/content_actions.h"
-#include "jadyx/pulse/pulse_sessions.h"
 #include "jadyx/storage/storage_path.h"
 #include "jadyx/storage/storage_location.h"
 
@@ -63,7 +62,6 @@ GameFiles Collect(std::span<const LibraryEntry> entries, std::uint64_t applicati
             game.kept = true;
             continue;
         }
-        game.launch_paths.push_back(entry.launch_path);
         game.files.push_back(entry.relative_path);
     }
     game.external = game.files.empty() && game.kept;
@@ -97,7 +95,6 @@ std::string RemoveGame(const fs::path& root, const GameFiles& game) {
     for (const auto& file : game.files)
         if (!(developer(file) ? RemoveDump(DeveloperGames(), file.lexically_normal().lexically_relative(DeveloperGames()))
                               : RemoveDump(root, file))) return "game";
-    for (const auto& path : game.launch_paths) PulseSessions::Discard(path);
     // Another copy still plays: its saves and updates/DLC are its own too.
     if (game.kept) return {};
     if (!Content::RemoveApplicationContent(game.application).empty()) return "content";

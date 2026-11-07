@@ -138,10 +138,10 @@ int main() {
     LeaveGameOptionsPane(options, false);
     check(options.focus == GameOptionsFocus::Sections && !options.confirm_discard);
 
-    // Pulse still requires two confirms; changing category cancels it.
+    // Remove still requires two confirms; changing category cancels it.
     options = {true, 7};
     HandleGameOptionsInput(options, GameOptionsInput::Up);
-    check(GameOptions()[options.selected] == GameOption::Pulse);
+    check(GameOptions()[options.selected] == GameOption::Remove);
     HandleGameOptionsInput(options, GameOptionsInput::Confirm);
     check(options.confirm_discard && !options.discard);
     HandleGameOptionsInput(options, GameOptionsInput::Down);
@@ -155,7 +155,7 @@ int main() {
         SelectGameOption(options, i);
         check(options.selected == i && options.activate && (options.focus == GameOptionsFocus::Sections));
         check(!options.discard && !options.confirm_discard);
-        check(GameOptions()[i] == GameOption::Pulse ? !options.page : options.page == GameOptions()[i]);
+        check(GameOptions()[i] == GameOption::Remove ? !options.page : options.page == GameOptions()[i]);
     }
     SelectGameOption(options, GameOptions().size());
     check(options.selected == GameOptions().size() - 1); // invalid pointer index is ignored

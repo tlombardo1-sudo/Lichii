@@ -95,13 +95,6 @@ int main() {
     check(SystemRowValue(page, SystemPage::AdultMods) == L"Se muestran");
     check(HandleSystemInput(page, SystemInput::Down) == SystemPageEffect::None &&
           page.selected == SystemPage::PerformanceStats);
-    // Pulse sessions are on unless the player turns them off.
-    check(HandleSystemInput(page, SystemInput::Down) == SystemPageEffect::None &&
-          page.selected == SystemPage::PulseSessions && page.settings.pulse_sessions);
-    check(HandleSystemInput(page, SystemInput::Confirm) == SystemPageEffect::Changed &&
-          !page.settings.pulse_sessions);
-    check(HandleSystemInput(page, SystemInput::Confirm) == SystemPageEffect::Changed &&
-          page.settings.pulse_sessions);
     // Play time is on unless the player turns it off.
     check(HandleSystemInput(page, SystemInput::Down) == SystemPageEffect::None &&
           page.selected == SystemPage::PlayTime && page.settings.track_play_time);

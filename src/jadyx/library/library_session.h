@@ -49,7 +49,6 @@
 #include "jadyx/mods/mods_view.h"
 #include "jadyx/library/play_history.h"
 #include "jadyx/library/portal_library.h"
-#include "jadyx/pulse/pulse_sessions.h"
 #include "jadyx/library/library_cache.h"
 #include "jadyx/i18n/localization.h"
 #include "jadyx/settings/graphics_page.h"
@@ -112,7 +111,6 @@ private:
     void ReloadMetadata();
     void ForgetContent(std::uint64_t application);
     void RefreshPlay(std::string_view keep);
-    void RefreshPulse();
     Covers CoversForTab();
     void StartScan(StorageFolder added = nullptr);
     void PollSetup();

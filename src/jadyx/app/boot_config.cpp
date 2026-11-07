@@ -13,7 +13,6 @@
 #include <vector>
 
 #include "common/page_table.h"
-#include "common/pulse_diagnostics.h"
 #include "core/hle/kernel/k_scheduler.h"
 #include "jadyx/app/alloc_watch.h"
 #include "jadyx/app/boot_config.h"
@@ -524,9 +523,6 @@ void ParseBootConfigFile(const std::string& install_path, BootConfig& config) {
             } else if (line == "min_max_filter=off") {
                 config.skip_min_max_filter = true;
                 WriteDiag("boot.cfg: filtered min/max sampler reduction not emulated");
-            } else if (line == "pulse_resume=0") {
-                config.pulse_resume = false;
-                WriteDiag("boot.cfg: Pulse sessions are not resumed");
             } else if (line == "min_max_filter=emulate") {
                 config.emulate_min_max_filter = true;
                 WriteDiag("boot.cfg: filtered min/max sampler reduction always emulated");
@@ -634,25 +630,6 @@ void ParseBootConfigFile(const std::string& install_path, BootConfig& config) {
                     config.memory_limit_mib = static_cast<u32>(parsed);
                 } else {
                     WriteDiag("boot.cfg: invalid memory_limit_mib, ignored");
-                }
-            } else if (line == "pulse_store=1") {
-                config.pulse_store = true;
-                WriteDiag("boot.cfg: Pulse store gate");
-            } else if (line.starts_with("pulse_cycles=") ||
-                       line.starts_with("pulse_seed=")) {
-                const bool cycles = line.starts_with("pulse_cycles=");
-                const std::string_view value =
-                    std::string_view{line}.substr(line.find('=') + 1);
-                u32 parsed{};
-                const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
-                if (result.ec != std::errc{} || result.ptr != value.data() + value.size() ||
-                    (cycles && parsed > 100000)) {
-                    WriteDiag("boot.cfg: invalid " + line + ", ignored");
-                } else if (cycles) {
-                    config.pulse_cycles = parsed;
-                    WriteDiag("boot.cfg: Pulse gate, " + std::to_string(parsed) + " cycles");
-                } else {
-                    config.pulse_seed = parsed;
                 }
             } else if (line.starts_with("jit_cache_mib=")) {
                 const std::string_view value = std::string_view{line}.substr(14);
@@ -955,9 +932,6 @@ void ParseBootConfigFile(const std::string& install_path, BootConfig& config) {
             } else if (line == "memory_audit=1" || line == "memory_audit=0") {
                 config.memory_audit = line == "memory_audit=1";
                 WriteDiag("boot.cfg: " + line);
-            } else if (line == "pulse_diag=1") {
-                Common::Pulse::SetDiagnostics(true);
-                WriteDiag("boot.cfg: Pulse diagnostics on (GPU VA, shader code, page watch)");
             } else if (line == "play=1") {
                 config.play = true;
                 WriteDiag("boot.cfg: played by hand, no time limit or frame dumps");

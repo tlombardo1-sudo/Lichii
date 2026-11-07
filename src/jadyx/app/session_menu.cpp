@@ -61,7 +61,6 @@ void SessionMenu::CaptureFrame() {
 }
 
 void SessionMenu::DrawMenu() {
-    pulse_screen.reset(); // The menu takes the screen.
     launch_screen.reset();
     const auto screen = D3D12::GameMenuScreenSize(system.Renderer());
     D3D12::MenuImage image;
@@ -137,7 +136,6 @@ void SessionMenu::Open() {
     menu.emplace(GameMenuSettings{options.style, options.swap_face_buttons,
                                   options.deadzone, g_can_fullscreen.load(),
                                   g_fullscreen.load(), system_settings.show_performance_stats,
-                                  pulse_identity.has_value(),
                                   config.material_capture_menu, config.hunt_menu,
                                   !game_frame.pixels.empty(), LoadGameOfflineMode(program_id),
                                   system_settings.offline_mode, LoadGraphicsSettings(),
@@ -188,73 +186,6 @@ void SessionMenu::HandleCheatsAction(MenuAction action) {
         cheats.reset();
     }
     if (menu_surface) DrawMenu();
-}
-
-void SessionMenu::SavePulseSession() {
-    // The only capture: when the player leaves, never while playing.
-    WritePulseLog("saving the session | " + MemoryReport() + " | " + MemoryOwners());
-    pulse_screen.emplace(system, PulseScreen::Kind::Save, game_title);
-    const auto save_start = std::chrono::steady_clock::now();
-    // Samples the app memory while the save runs: the highest use of each
-    // step against the use before it, so the step that peaks is known.
-    constexpr std::array<const char*, 7> save_steps{
-        "idle", "process", "gpu", "write", "verify", "sync", "replace"};
-    std::array<std::atomic<u64>, save_steps.size()> step_peak{};
-    std::atomic<int> step{-1};
-    u64 save_base{}, save_limit{};
-    QueryAppMemory(save_base, save_limit);
-    std::string reason;
-    {
-        std::jthread sampler{[&](std::stop_token stop) {
-            while (!stop.stop_requested()) {
-                const int at = step.load(std::memory_order_relaxed);
-                if (u64 used{}, limit{}; at >= 0 && QueryAppMemory(used, limit)) {
-                    auto& peak = step_peak[at];
-                    u64 seen = peak.load(std::memory_order_relaxed);
-                    while (used > seen && !peak.compare_exchange_weak(seen, used)) {
-                    }
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds{2});
-            }
-        }};
-        reason = PulseSessions::Save(
-            system, *pulse_identity,
-            [] {
-                u64 used{}, limit{};
-                if (!QueryAppMemory(used, limit)) return ~u64{};
-                return limit > used ? limit - used : u64{};
-            },
-            [&](const char* name) {
-                pulse_screen->SaveStep(name);
-                for (int i = 0; i < static_cast<int>(save_steps.size()); ++i) {
-                    if (std::string_view{name} == save_steps[i]) step.store(i);
-                }
-            });
-    }
-    std::string peaks = "save peak over " + std::to_string(save_base >> 20) +
-                        " MiB:";
-    for (std::size_t i = 0; i < save_steps.size(); ++i) {
-        const u64 peak = step_peak[i].load();
-        if (peak == 0) continue;
-        peaks += std::string{" "} + save_steps[i] + " " +
-                 (peak >= save_base ? "+" + std::to_string((peak - save_base) >> 20)
-                                    : "-" + std::to_string((save_base - peak) >> 20));
-    }
-    WritePulseLog(peaks + " MiB");
-    const auto save_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now() - save_start)
-                             .count();
-    if (reason.empty()) {
-        WritePulseLog("session saved in " + std::to_string(save_ms) + " ms | " +
-                      MemoryReport() + " | " + MemoryOwners());
-        PulseSessions::SetNotice(I18n::ToUtf8(I18n::Tr(I18n::Text::PulseKept)));
-    } else {
-        WritePulseLog("no session (" + reason + ") after " +
-                  std::to_string(save_ms) + " ms");
-        PulseSessions::SetNotice(I18n::ToUtf8(
-            I18n::Format(I18n::Text::PulseNotKept, {Utf8ToUtf16(reason)})));
-    }
-    pulse_screen->Finish(reason.empty());
 }
 
 void SessionMenu::OpenCheats() {
@@ -397,9 +328,7 @@ SessionMenu::Outcome SessionMenu::Update() {
         const GameMenuResult result = menu->Apply(action);
         WriteDiag("menu: action " + std::to_string(static_cast<int>(action)) + ", row " +
                   std::to_string(menu->Selected()));
-        if (result == GameMenuResult::Library ||
-            result == GameMenuResult::LibraryWithoutSession) {
-            if (result == GameMenuResult::Library && pulse_identity) SavePulseSession();
+        if (result == GameMenuResult::Library) {
             WriteDiag("menu: back to the library, shutting the game down | " +
                       MemoryReport());
             return Outcome::BackToLibrary;

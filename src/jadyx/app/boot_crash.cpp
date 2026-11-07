@@ -294,12 +294,6 @@ void LogCxxThrow(const EXCEPTION_RECORD* rec) {
             what = reinterpret_cast<const std::exception*>(object + type[2])->what();
         }
     }
-    // Pulse rejects by throwing and retries for up to 3 s: each attempt is one line of its own log
-    // (the reason it waited on), never the diag's budget or a stack.
-    if (std::string_view{first_name}.find("@Pulse@") != std::string_view::npos) {
-        WritePulseRejection(what);
-        return;
-    }
     // The platform throws dozens of _com_error at startup and handles them itself; they used up
     // the budget before anything interesting was thrown.
     if (std::string_view{first_name} == ".?AV_com_error@@" ||

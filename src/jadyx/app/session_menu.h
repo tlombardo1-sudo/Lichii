@@ -21,8 +21,6 @@
 #include "jadyx/game/game_menu.h"
 #include "jadyx/game/game_menu_surface.h"
 #include "jadyx/input/uwp_input.h"
-#include "jadyx/pulse/pulse_screen.h"
-#include "jadyx/pulse/pulse_sessions.h"
 #include "jadyx/ui/launch_splash.h"
 #include "video_core/renderer_d3d12/d3d12_menu_image.h"
 
@@ -41,9 +39,7 @@ struct SessionMenuContext {
     HeadlessEmuWindow& emu_window;
     const BootConfig& config;
     const BootSurface& surface;
-    std::optional<PulseScreen>& pulse_screen;
     std::optional<LaunchScreen>& launch_screen;
-    const std::optional<Common::Pulse::Identity>& pulse_identity;
     UwpSoftwareKeyboard* keyboard_applet;
     u64 program_id;
     bool mii_editor;
@@ -68,7 +64,6 @@ private:
     void KeyboardPress(std::optional<KeyboardReply> reply);
     void Open();
     void HandleCheatsAction(MenuAction action);
-    void SavePulseSession();
     void OpenCheats();
     void SaveMenuScreenshot();
     void Close(GameMenuResult result);

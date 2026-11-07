@@ -95,9 +95,6 @@ struct GameMenuSettings {
     bool can_fullscreen{};
     bool fullscreen{};
     bool show_performance_stats{};
-    /// Pulse sessions are on: leaving for home keeps the game where it is, unless the player
-    /// turns that off on the row (pulse_sessions.h).
-    bool pulse_sessions{};
     /// Opt-in diagnostic package: capture from a controller without a keyboard.
     bool material_capture{};
     /// Opt-in diagnostic package ("hunt=1"): bottleneck capture of the next frames.
@@ -112,11 +109,9 @@ struct GameMenuSettings {
     GameGraphics graphics{};
 };
 
-/// Library: back to home, keeping a Pulse session when they are on. LibraryWithoutSession: the
-/// player chose to leave without one.
+/// Library: back to home.
 enum class GameMenuResult : std::uint8_t {
     None, Resume, Library, SettingsChanged, FullScreen, Cheats, PerformanceStatsChanged,
-    LibraryWithoutSession,
     CaptureGraphics,
     CapturePerformance,
     Screenshot,
@@ -337,9 +332,7 @@ private:
                     Choice, Tr(Text::MenuOfflineThisGame), UiIcon::Airplane};
         }
         case Library:
-            if (!settings.pulse_sessions) return {Tr(Text::MenuBackToHome), {}, Action, {}, UiIcon::Exit};
-            return {Tr(Text::MenuBackToHome), {}, Choice,
-                    Tr(keep_session ? Text::MenuKeepSession : Text::MenuSkipSession), UiIcon::Exit};
+            return {Tr(Text::MenuBackToHome), {}, Action, {}, UiIcon::Exit};
         }
         return {};
     }
@@ -389,12 +382,7 @@ private:
             return changed ? GameMenuResult::GraphicsChanged : GameMenuResult::None;
         }
         case Library:
-            if (!confirm) {
-                if (settings.pulse_sessions) keep_session = !keep_session;
-                return GameMenuResult::None;
-            }
-            return !settings.pulse_sessions || keep_session ? GameMenuResult::Library
-                                                            : GameMenuResult::LibraryWithoutSession;
+            return confirm ? GameMenuResult::Library : GameMenuResult::None;
         case Style:
             settings.style = StepConsoleControllerStyle(settings.style, back);
             UpdateGraphicsItems();
@@ -435,6 +423,5 @@ private:
     std::size_t cheats_on{};
     std::size_t mods_on{};
     std::wstring screenshot_note;
-    bool keep_session{true};
 };
 } // namespace Jadyx

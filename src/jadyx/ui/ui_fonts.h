@@ -15,7 +15,7 @@ struct InterfaceTypeface {
 };
 
 /// Built once from the first factory that asks; DirectWrite's shared factory is a singleton, so
-/// every surface (library, in-game menu, Pulse) gets the same collection.
+/// every surface (library, in-game menu) gets the same collection.
 InterfaceTypeface InterfaceFonts(IDWriteFactory* write);
 
 } // namespace Jadyx

@@ -83,17 +83,6 @@ void LibrarySession::RefreshPlay(std::string_view keep) {
     dirty = true;
 }
 
-// The Pulse session each game keeps, as the tiles and the options show it.
-void LibrarySession::RefreshPulse() {
-    PulseSessions::Prune();
-    for (auto& entry : scan.entries) {
-        const auto kept = PulseSessions::Find(entry.launch_path);
-        entry.pulse_saved = kept ? PulseSessions::FormatTime(kept->saved) : std::wstring{};
-        entry.pulse_current = kept && kept->current;
-    }
-    dirty = true;
-}
-
 LibrarySession::Covers LibrarySession::CoversForTab() {
     Covers result;
     result.shown.assign(scan.entries.size(), false);
@@ -233,7 +222,6 @@ void LibrarySession::FinishScan() {
         loading = false;
         keep_titles.reset();
         RefreshPlay(kept);
-        RefreshPulse();
         if (!configuration.busy) RefreshSetup();
         notice = Wide(scan.error);
         if (notice.empty() && !initial_notice.empty()) notice = Wide(initial_notice);

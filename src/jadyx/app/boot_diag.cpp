@@ -53,25 +53,6 @@ namespace {
 // crash handlers (boot_crash.cpp) must not call into WinRT from a dying process.
 std::string g_diag_path;
 std::mutex g_diag_mutex;
-// Pulse's own log (jadyx_pulse.txt): saves, resumes and every rejection, apart from the diag.
-std::string g_pulse_path;
-std::mutex g_pulse_mutex;
-// A save retries for up to 3 s and throws the same rejection on every attempt: identical
-// consecutive rejections are counted under g_pulse_mutex and written as one line.
-std::string g_pulse_last_rejection;
-unsigned g_pulse_rejection_repeats = 0;
-
-// Under g_pulse_mutex: the line closing a run of repeated rejections (empty when there is none).
-std::string TakePulseRepeats() {
-    std::string line;
-    if (g_pulse_rejection_repeats != 0) {
-        line = "[pulse]   (repeated " + std::to_string(g_pulse_rejection_repeats) + " more times)\n";
-    }
-    g_pulse_last_rejection.clear();
-    g_pulse_rejection_repeats = 0;
-    return line;
-}
-
 // LocalState\jadyx\log, next to jadyx_log.txt. Created here: the diag starts before Eden's
 // logging creates the folder. These logs append across launches, so one past 8 MiB moves to its
 // .old copy first instead of growing without end.
@@ -115,21 +96,6 @@ void WriteDiag(const std::string& msg) {
         f << line;
     } catch (...) {
         OutputDebugStringW(L"[jadyx] WriteDiag: could not write diag file\n");
-    }
-}
-
-void WritePulseLog(const std::string& msg) {
-    const std::string line = "[pulse] [+" + std::to_string(ElapsedMs()) + "ms] " + msg + "\n";
-    OutputDebugStringA(line.c_str());
-    try {
-        std::scoped_lock lock{g_pulse_mutex};
-        if (g_pulse_path.empty()) {
-            g_pulse_path = LogFilePath("jadyx_pulse.txt");
-        }
-        std::ofstream f(g_pulse_path, std::ios::app);
-        f << TakePulseRepeats() << line;
-    } catch (...) {
-        OutputDebugStringW(L"[jadyx] WritePulseLog: could not write pulse log\n");
     }
 }
 
@@ -362,23 +328,6 @@ void ApplyProcessMemoryLimit(u32 limit_mib) {
     WriteDiag("memory limit: process commit capped at " + std::to_string(limit_mib) + " MiB");
 }
 
-// Pulse store gate: ends this process where it stands, as a crash or a power loss would (no
-// unwinding, no flush of anything still in the process), and asks the system to start the app
-// again. Without a restart (refused, or not supported here) the next manual launch resumes.
-[[noreturn]] void RestartApp() {
-    try {
-        const auto reason = CoreApplication::RequestRestartAsync(L"").get();
-        if (reason != AppRestartFailureReason::RestartPending) {
-            WriteDiag("restart refused (" + std::to_string(static_cast<int>(reason)) +
-                      "): launch the app again to continue");
-        }
-    } catch (...) {
-        WriteDiag("restart unavailable: launch the app again to continue");
-    }
-    TerminateProcess(GetCurrentProcess(), 73);
-    for (;;) Sleep(INFINITE);
-}
-
 // Where the app's memory is: committed bytes by kind over the whole address space, then the
 // largest allocations (base, committed MiB, kind), whose sizes tell their owners apart.
 std::string LargestAllocations() {
@@ -559,25 +508,6 @@ void WriteDiagRaw(const char* line, bool debugger_channel) {
     // Shared, as WriteDiag's stream: fopen_s opens without sharing, so it failed and lost the
     // crash report whenever another process had the diag open (a tail -F watching it).
     if (std::FILE* const f = _fsopen(g_diag_path.c_str(), "a", _SH_DENYNO)) {
-        std::fputs(line, f);
-        std::fclose(f);
-    }
-}
-
-void WritePulseRejection(const char* what) {
-    std::scoped_lock lock{g_pulse_mutex};
-    if (g_pulse_path.empty()) return;
-    if (g_pulse_last_rejection == what) {
-        ++g_pulse_rejection_repeats;
-        return;
-    }
-    const std::string repeats = TakePulseRepeats();
-    g_pulse_last_rejection = what;
-    char line[512];
-    std::snprintf(line, sizeof(line), "[pulse] [+%llums] rejected: %s | thread %lu\n",
-                  ElapsedMs(), what, GetCurrentThreadId());
-    if (std::FILE* const f = _fsopen(g_pulse_path.c_str(), "a", _SH_DENYNO)) {
-        std::fputs(repeats.c_str(), f);
         std::fputs(line, f);
         std::fclose(f);
     }

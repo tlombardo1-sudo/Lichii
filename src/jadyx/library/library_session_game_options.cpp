@@ -428,19 +428,7 @@ void LibrarySession::HandlePlainOption(TimePoint now) {
             options_notice = Tr(files.kept ? T::GameRemoveCopyConfirm : T::GameRemoveConfirm);
             options_notice_until = std::chrono::steady_clock::time_point::max();
         }
-    } else if (game_options.confirm_discard || game_options.discard) {
-        auto& game = scan.entries[game_options.game];
-        if (game.pulse_saved.empty()) {
-            game_options.confirm_discard = game_options.discard = false;
-            Notify(now, T::PulseNone);
-        } else if (std::exchange(game_options.discard, false)) {
-            Notify(now, PulseSessions::Discard(game.launch_path) ? T::PulseDiscarded : T::PulseDiscardFailed);
-            RefreshPulse();
-        } else {
-            options_notice = Tr(T::PulseDiscardConfirm);
-            options_notice_until = std::chrono::steady_clock::time_point::max();
-        }
-    } else if (options_notice == Tr(T::PulseDiscardConfirm) || options_notice == Tr(T::GameRemoveConfirm) ||
+    } else if (options_notice == Tr(T::GameRemoveConfirm) ||
                options_notice == Tr(T::GameRemoveCopyConfirm)) {
         options_notice.clear();
     }

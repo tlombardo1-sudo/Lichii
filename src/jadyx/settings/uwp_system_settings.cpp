@@ -20,7 +20,6 @@ constexpr auto RegionKey = L"system_region";
 constexpr auto UserNameKey = L"system_user_name";
 constexpr auto PerformanceStatsKey = L"system_show_performance_stats";
 constexpr auto AdultModsKey = L"system_show_adult_mods";
-constexpr auto PulseSessionsKey = L"system_pulse_sessions";
 constexpr auto PlayTimeKey = L"system_track_play_time";
 constexpr auto MultipleControllersKey = L"system_multiple_controllers";
 constexpr auto OfflineModeKey = L"system_offline_mode";
@@ -62,7 +61,6 @@ SystemSettings LoadSystemSettings() {
                 winrt::unbox_value<winrt::hstring>(values.Lookup(UserNameKey)).c_str());
         if (values.HasKey(PerformanceStatsKey)) settings.show_performance_stats = winrt::unbox_value<bool>(values.Lookup(PerformanceStatsKey));
         if (values.HasKey(AdultModsKey)) settings.show_adult_mods = winrt::unbox_value<bool>(values.Lookup(AdultModsKey));
-        if (values.HasKey(PulseSessionsKey)) settings.pulse_sessions = winrt::unbox_value<bool>(values.Lookup(PulseSessionsKey));
         if (values.HasKey(PlayTimeKey)) settings.track_play_time = winrt::unbox_value<bool>(values.Lookup(PlayTimeKey));
         if (values.HasKey(MultipleControllersKey))
             settings.multiple_controllers = winrt::unbox_value<bool>(values.Lookup(MultipleControllersKey));
@@ -80,7 +78,6 @@ bool SaveSystemSettings(const SystemSettings& settings) {
         values.Insert(UserNameKey, winrt::box_value(winrt::hstring{SanitizeUserName(settings.user_name)}));
         values.Insert(PerformanceStatsKey, winrt::box_value(settings.show_performance_stats));
         values.Insert(AdultModsKey, winrt::box_value(settings.show_adult_mods));
-        values.Insert(PulseSessionsKey, winrt::box_value(settings.pulse_sessions));
         values.Insert(PlayTimeKey, winrt::box_value(settings.track_play_time));
         values.Insert(MultipleControllersKey, winrt::box_value(settings.multiple_controllers));
         values.Insert(OfflineModeKey, winrt::box_value(settings.offline_mode));

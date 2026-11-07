@@ -698,9 +698,6 @@ private:
         const auto extension = game.relative_path.extension().wstring();
         if (extension.size() > 1) chip(Upper(std::wstring_view{extension}.substr(1)));
         if (!game.source_name.empty()) chip(game.source_name);
-        if (!game.pulse_saved.empty())
-            chip(I18n::Format(T::PulseBadge, {game.pulse_saved}),
-                 game.pulse_current ? Palette::Text : Palette::TextSecondary);
         const auto play = PromptKey(Navigation::Play);
         const auto menu = PromptKey(Navigation::Options);
         const float play_width = PillButton(Tr(T::Play), play.letters, play.color, Margin, PillTop, true, PillHeight);
@@ -793,7 +790,6 @@ private:
             if (!under.empty()) under += L" · ";
             under += FormatPlayTimeShort(entry.play_seconds);
         }
-        if (!entry.pulse_saved.empty()) under += under.empty() ? L"Pulse" : L" · Pulse";
         if (!under.empty())
             Type(under, TypeRole::Label, x, text + 20, Tile, Palette::TextSecondary, alpha * (0.7f + 0.3f * amount));
     }
@@ -808,7 +804,7 @@ private:
         Type(Tr(T::FullCollection), TypeRole::HeadlineLarge, Margin, ShelfHeadingTop - 6, 560, Palette::Text);
         Type(TitlesCount(shelf.size()), TypeRole::Body, Margin, ShelfHeadingTop + 46, 400, Palette::TextSecondary);
         const std::vector<std::wstring_view> filters{Tr(T::FilterAll),    Tr(T::FilterPlayed), Tr(T::FilterAlphabetical),
-                                                     Tr(T::FilterPinned), Tr(T::FilterRecent), Tr(T::FilterPulse)};
+                                                     Tr(T::FilterPinned), Tr(T::FilterRecent)};
         const auto active = static_cast<std::size_t>(view.filter);
         if (rows_shown) filter_slide.Set(static_cast<float>(active), now);
         else filter_slide.Snap(static_cast<float>(active));
@@ -1162,7 +1158,6 @@ private:
                 case SystemPage::MiiEditor: item.kind = Kind::Open; break;
                 case SystemPage::AdultMods: item.kind = Kind::Toggle; item.on = settings.show_adult_mods; break;
                 case SystemPage::PerformanceStats: item.kind = Kind::Toggle; item.on = settings.show_performance_stats; break;
-                case SystemPage::PulseSessions: item.kind = Kind::Toggle; item.on = settings.pulse_sessions; break;
                 case SystemPage::PlayTime: item.kind = Kind::Toggle; item.on = settings.track_play_time; break;
                 case SystemPage::MultipleControllers: item.kind = Kind::Toggle; item.on = settings.multiple_controllers; break;
                 case SystemPage::OfflineMode: item.kind = Kind::Toggle; item.on = settings.offline_mode; break;
@@ -1827,12 +1822,7 @@ private:
                 if (!action.empty()) Prompt(PromptKey(Navigation::Play).letters, Palette::Text, action, 80, 404);
             };
             const auto option = GameOptions()[view.page.selected];
-            if (option == GameOption::Pulse) {
-                const auto pulse = game.pulse_saved.empty() ? std::wstring{Tr(T::PulseNone)} :
-                    I18n::Format(game.pulse_current ? T::PulseSavedOn : T::PulseSavedOther, {game.pulse_saved});
-                const auto discard = I18n::Format(T::PulseDiscardConfirm, {PromptKey(Navigation::Play).letters});
-                in_place(option, pulse, game.pulse_saved.empty() ? std::wstring_view{} : std::wstring_view{discard});
-            } else if (option == GameOption::Graphics && view.graphics && view.global_graphics) {
+            if (option == GameOption::Graphics && view.graphics && view.global_graphics) {
                 // The rows of Settings > Graphics, each one the game's own or what it follows, then
                 // the ones only a game has. They do not all fit: the window follows the focus.
                 const bool advanced = IsAdvancedRow(static_cast<GraphicsRow>(view.graphics_row));

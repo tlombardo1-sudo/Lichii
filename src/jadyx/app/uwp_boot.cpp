@@ -48,7 +48,6 @@
 #include "jadyx/input/uwp_controllers.h"
 #include "jadyx/library/game_library.h"
 #include "jadyx/library/uwp_library.h"
-#include "jadyx/pulse/pulse_sessions.h"
 #include "jadyx/settings/uwp_system_settings.h"
 #include "jadyx/storage/storage_path.h"
 #include "jadyx/storage/utf8.h"
@@ -325,7 +324,6 @@ void RunBootWorker(const Jadyx::BootSurface& surface, const std::optional<std::s
         if (library_game) {
             config.play = true;
             config.run_seconds = 0;
-            config.pulse_sessions = *library_game != Jadyx::MiiEditorLaunch;
         }
         if (library_game || !config.game.empty()) {
             // A game= path on the player's storage (jadyx-usb:/...) opens as in the library.
@@ -346,14 +344,7 @@ void RunBootWorker(const Jadyx::BootSurface& surface, const std::optional<std::s
     // Capture any early throw to the diag file instead of a silent exit.
     try {
         WriteDiag("calling RunHeadlessBoot");
-        int rc = Jadyx::RunHeadlessBoot(nro_path, surface, config);
-        if (rc == Jadyx::PULSE_RESUME_FAILED) {
-            Jadyx::PulseSessions::SetNotice(Jadyx::I18n::ToUtf8(
-                Jadyx::I18n::Tr(Jadyx::I18n::Text::PulseNotResumed)));
-            WritePulseLog("booting the game fresh after a failed resume");
-            config.pulse_resume = false;
-            rc = Jadyx::RunHeadlessBoot(nro_path, surface, config);
-        }
+        const int rc = Jadyx::RunHeadlessBoot(nro_path, surface, config);
         boot_status.store(rc);
         WriteDiag("RunHeadlessBoot returned " + std::to_string(rc) + " | " + MemoryReport());
     } catch (winrt::hresult_error const& e) {
@@ -460,7 +451,7 @@ std::optional<std::string> LibraryNotice(int status) {
         return text(Text::GameStoppedGpu);
     case Jadyx::RETURN_TO_LIBRARY:
         WriteDiag("boot worker joined; back to the library");
-        return Jadyx::PulseSessions::TakeNotice();
+        return std::string{};
     default:
         return std::nullopt;
     }

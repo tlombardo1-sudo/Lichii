@@ -69,8 +69,8 @@ $deadline = (Get-Date).AddSeconds($TimeoutSec)
 $relaunches = 0
 while ((Get-Date) -lt $deadline) {
     if ((Test-Path $diag) -and (Select-String -Path $diag -Pattern 'exiting|CRASH' -Quiet)) { break }
-    # The Pulse store gate ends the process on purpose and asks for a restart, which Windows refuses
-    # to an app out of the foreground: launch it again once it is gone.
+    # A process that ends on purpose and asks for a restart is refused by Windows when the app is out
+    # of the foreground: launch it again once it is gone.
     if ((Test-Path $diag) -and -not (Get-Process -Name jadyx -ErrorAction SilentlyContinue)) {
         $asked = @(Select-String -Path $diag -Pattern 'launch the app again').Count
         if ($asked -gt $relaunches) {

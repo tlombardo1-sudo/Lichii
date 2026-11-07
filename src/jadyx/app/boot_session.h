@@ -11,9 +11,6 @@ namespace Jadyx {
 
 /// RunHeadlessBoot's status when the player chose "back to the library" in the in-game menu.
 constexpr int RETURN_TO_LIBRARY = 10;
-/// A Pulse session failed to resume after the game was loaded into this System: boot it again,
-/// fresh (BootConfig::pulse_resume off). The session stays where it was.
-constexpr int PULSE_RESUME_FAILED = 18;
 /// The library asked for the Mii editor and the firmware does not have it.
 constexpr int MII_EDITOR_MISSING = 19;
 /// The game's program has no ExeFS of its own (a sparse base) and no update brings one.

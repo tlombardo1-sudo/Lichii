@@ -17,7 +17,6 @@ en documentación histórica ya no son carpetas de entrega vigentes.
 
 - [Actualizador de Jadyx](xbox_updater.md): versiones firmadas, descarga reanudable, pantalla de actualizaciones y asistencia web; instalación interna Xbox pendiente de gate.
 
-- [Pulse: sesiones persistentes](xbox_pulse.md): guarda y reanuda sesiones desde la biblioteca; juegos comerciales de 64 y 32 bits probados en la Series y en PC.
 
 - [Direct3D 12, fase 3](xbox_d3d12_phase3.md): scheduler, recursos, cachés y fences.
 - [Direct3D 12, fase 4](xbox_d3d12_phase4.md): pipelines y shaders del guest.

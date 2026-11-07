@@ -3,13 +3,13 @@
 Branch `uwp-xbox`, based on Lichii `nx2` at 30d6061.
 
 **Done:** commit 5de792b copies in the 969 files that exist in Jadyx (JulianDr14/jadyx, b88ec06) and not in Lichii:
-`src/jadyx/`, `src/video_core/renderer_d3d12/`, the D3D12 helper shaders, Pulse core files, memory ledger and
+`src/jadyx/`, `src/video_core/renderer_d3d12/`, the D3D12 helper shaders, memory ledger and
 guard, `tools/xbox/`, `dist/uwp/`, `externals/spirv-to-dxil`, `externals/libarchive`. Nothing is wired into the
 build yet, and nothing has been compiled (no MSVC or UWP toolchain in the authoring environment).
 
 **Not done:** the files below exist in both trees and Jadyx changed them for UWP. Each has to be merged by hand,
 keeping Lichii's NX2 changes. No merge-base was available (shallow clones), so there is no automatic 3-way merge.
-Lists come from a marker search (UWP/D3D12/ledger/bug-tracker/Pulse names), so expect misses.
+Lists come from a marker search (UWP/D3D12/ledger/bug-tracker names), so expect misses.
 
 ## 1. Build wiring (done, not yet configured or compiled)
 
@@ -27,7 +27,7 @@ Done:
 - `src/common/host_memory.{h,cpp}`: Jadyx's file (FromApp placeholder memory, demand commit, decommit on clear,
   guest swap, fastmem hot region) with nx2's granule API on top (`MarkUsed`, `MarkDirty`, `ForgetContents`,
   `HintCold`, `VirtualSize`) and nx2's skip-clean `ClearBackingRegion`. nx2's POSIX-only macOS work is not carried over.
-- `src/core/device_memory.{h,cpp}`: Jadyx's (fastmem region, Pulse checkpoint access).
+- `src/core/device_memory.{h,cpp}`: Jadyx's (fastmem region).
 - `src/core/hle/kernel/k_memory_manager.{h,cpp}`: nx2's with Jadyx's `TrimFree` (gives freed guest pages back to the
   host) and run-coalesced `ProcessOptimizedAllocation`.
 - `src/common/settings.cpp`, `fs/fs_paths.h`, `fs/path_util.cpp`: Jadyx's UWP guards only (LocalFolder user dir,
@@ -79,10 +79,10 @@ Also done, to match what `src/jadyx` calls:
 Checked: every quoted include in `src/jadyx` and `renderer_d3d12` resolves, except the 45 generated `*_spv.h`
 shader headers. Each of those has a source in `host_shaders` and a CMake entry or variant row.
 
-Left as nx2, deliberately: `arm_dynarmic_64.cpp` (Jadyx's differences are CPU profiling, JIT prewarm, Pulse and the
+Left as nx2, deliberately: `arm_dynarmic_64.cpp` (Jadyx's differences are CPU profiling, JIT prewarm and the
 JIT read table `jit_entries`, none needed to boot; nx2's CNTPCT pause and sign-extension handling stay),
-`exclusive_monitor.h` (Pulse checkpoint only), `cpu_manager.cpp` (Pulse restore hooks only), the rest of
-`core_timing` (Pulse checkpoint plus guest clock scaling; nx2 has its own guest CNTFRQ and the timer-thread stop fix).
+`exclusive_monitor.h`, `cpu_manager.cpp`, the rest of `core_timing` (guest clock scaling; nx2 has its own guest
+CNTFRQ and the timer-thread stop fix).
 
 Still open:
 - Inline page-table exclusives in dynarmic (`a64_emit_x64_memory.cpp`, `emit_x64_memory.cpp.inc`) and the JIT read table.
@@ -113,10 +113,15 @@ Lichii's Vulkan work since Jadyx's Eden base has to be mirrored in `renderer_d3d
 texture array / sampler fixes, native QMD and indirect reset, `ULDC.U16` and atomic compute lowering, pipeline cache v50.
 Not portable: DLSS (Streamline), Aftermath, Vulkan-only FSR3 paths.
 
-## 7. Optional later: Pulse save/resume in HLE services
+## 7. Pulse removed
 
-About 200 files under `src/core/hle`, plus `hid_core/resources` and `audio_core/renderer`, carry Pulse serializers.
-The Pulse core files are already copied. Skip until the game boots, then port service by service.
+Jadyx's Pulse (save and resume a whole session) is not part of this port, and the ~200 HLE serializer files are not
+carried over. Removed from the tree: `common/pulse_*`, `core/pulse_*`, the kernel wait graph and handle state, the
+service and npad Pulse state, `src/jadyx/pulse`, the D3D12 checkpoint readbacks and rasterizer hooks, the XAudio2
+checkpoint park, the `host_memory` write-watch and decommit diagnostics, `tools/xbox/pulse_*` and its tests, the
+Pulse docs page, the "keep the session" row of the in-game menu, the library's Pulse filter, badge and option pane,
+the Pulse system setting, the `pulse_*` boot.cfg keys and the Pulse i18n strings. Leaving a game now just ends it.
+Not compiled. `docs/xbox/xbox_internal.md` and the other dated dev logs still mention Pulse as history.
 
 ## Known blockers
 

@@ -122,7 +122,7 @@ inline CoverWindow CoversAround(Focus focus, std::size_t count, std::size_t rail
 
 // ---- The Library tab: the collection as a grid under a filter ----
 
-enum class Filter : unsigned { All, Played, Alphabetical, Pinned, Recent, Pulse, Count };
+enum class Filter : unsigned { All, Played, Alphabetical, Pinned, Recent, Count };
 inline constexpr std::size_t FilterCount = static_cast<std::size_t>(Filter::Count);
 
 /// The heading, its count and the filter bar on one line; the grid under them.
@@ -140,7 +140,6 @@ inline std::vector<std::size_t> Shelf(const std::vector<LibraryEntry>& entries, 
         const auto& entry = entries[i];
         const bool shown = filter == Filter::Played ? entry.last_played > 0
                          : filter == Filter::Pinned ? entry.pinned
-                         : filter == Filter::Pulse  ? !entry.pulse_saved.empty()
                                                     : true;
         if (shown) shelf.push_back(i);
     }

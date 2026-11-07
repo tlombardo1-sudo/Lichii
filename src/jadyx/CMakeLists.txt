@@ -26,10 +26,6 @@ add_executable(jadyx WIN32
     app/user_data_seed.cpp
     app/user_data_seed.h
     app/uwp_boot.cpp
-    pulse/pulse_gate.cpp
-    pulse/pulse_gate.h
-    pulse/pulse_sessions.cpp
-    pulse/pulse_sessions.h
     library/favorites.cpp
     library/favorites.h
     library/game_removal.cpp
@@ -38,10 +34,6 @@ add_executable(jadyx WIN32
     library/play_history.h
     library/portal_library.cpp
     library/portal_library.h
-    pulse/pulse_screen.cpp
-    pulse/pulse_screen.h
-    pulse/pulse_store_gate.cpp
-    pulse/pulse_store_gate.h
     app/alloc_watch.cpp
     app/alloc_watch.h
     app/cpu_probe.cpp

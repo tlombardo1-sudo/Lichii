@@ -404,18 +404,6 @@ struct BootConfig {
     bool async_shaders{true};
     /// Buttons to press at given times ("input=25:L+R" lines).
     std::vector<InputStep> input_script;
-    /// Pulse phase-2 gate ("pulse_cycles=", with tools/xbox/pulse_nro as boot.nro): capture,
-    /// destroy and restore the homebrew this many times (pulse_gate.h). 0 runs normally.
-    u32 pulse_cycles{};
-    u32 pulse_seed{1}; ///< "pulse_seed=": the random delays between captures
-    /// Pulse phase-1 gate ("pulse_store=1", pulse_store_gate.h): the Store in LocalState, with
-    /// process terminations across restarts. Runs before the phase-2 gate when both are set.
-    bool pulse_store{};
-    /// Played from the library: Pulse sessions (pulse_sessions.h), when the player has them on.
-    bool pulse_sessions{};
-    /// Off after a failed resume, for the fresh boot that follows, or by "pulse_resume=0": the
-    /// game boots fresh and the stored session is left as it was.
-    bool pulse_resume{true};
     /// "airplane=1": the game sees no internet connection, as in the Switch's airplane mode.
     bool airplane_mode{};
 };
