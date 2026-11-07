@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <unordered_set>
 #include <cstring>
@@ -68,11 +69,18 @@ bool IsTopologySafe(Maxwell3D::Regs::PrimitiveTopology topology) {
     }
 }
 
+std::atomic<bool> indirect_macro_cpu_read{};
+
 } // Anonymous namespace
+
+void SetIndirectMacroCpuRead(bool enabled) {
+    indirect_macro_cpu_read.store(enabled, std::memory_order_relaxed);
+}
 
 void HLE_DrawArraysIndirect::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
     auto topology = static_cast<Maxwell3D::Regs::PrimitiveTopology>(parameters[0]);
-    if (!maxwell3d.AnyParametersDirty() || !IsTopologySafe(topology)) {
+    if (!maxwell3d.AnyParametersDirty() || !IsTopologySafe(topology) ||
+        indirect_macro_cpu_read.load(std::memory_order_relaxed)) {
         Fallback(system, maxwell3d, parameters);
         return;
     }
@@ -131,7 +139,8 @@ void HLE_DrawArraysIndirect::Fallback(Core::System& system, Engines::Maxwell3D& 
 
 void HLE_DrawIndexedIndirect::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
     auto topology = static_cast<Maxwell3D::Regs::PrimitiveTopology>(parameters[0]);
-    if (!maxwell3d.AnyParametersDirty() || !IsTopologySafe(topology)) {
+    if (!maxwell3d.AnyParametersDirty() || !IsTopologySafe(topology) ||
+        indirect_macro_cpu_read.load(std::memory_order_relaxed)) {
         Fallback(system, maxwell3d, parameters);
         return;
     }

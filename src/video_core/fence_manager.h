@@ -15,6 +15,7 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <atomic>
 #include <queue>
 
 #include "common/common_types.h"
@@ -29,6 +30,15 @@
 #include "video_core/rasterizer_interface.h"
 
 namespace VideoCommon {
+
+/// With the default fence behavior, signal the host side of a syncpoint as soon as the GPU thread
+/// reaches it while nothing queued before it waits on the host GPU. Stored only: nx2's fence
+/// manager skips empty fences by its own rule (worklist section 4).
+inline std::atomic<bool> early_syncpoints{true};
+
+inline void SetEarlySyncpoints(bool enabled) {
+    early_syncpoints.store(enabled, std::memory_order_relaxed);
+}
 
 class FenceBase {
 public:
