@@ -106,6 +106,19 @@ struct GPU::Impl {
         renderer->ReadRasterizer()->FlushCommands();
     }
 
+    /// Queues a flush on the GPU thread and returns. Requests made before the GPU thread reaches
+    /// the queued one are folded into it.
+    void RequestFlushCommands() {
+        if (flush_requested.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        static_cast<void>(RequestSyncOperation([this] {
+            flush_requested.store(false, std::memory_order_release);
+            FlushCommands();
+        }));
+        gpu_thread.TickGPU(is_async);
+    }
+
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
         std::function<void(PAddr, size_t)> callback_writes([this](PAddr address, size_t size) {
@@ -350,6 +363,7 @@ struct GPU::Impl {
     VideoCore::ShaderNotify shader_notify;
     /// When true, we are about to shut down emulation session, so terminate outstanding tasks
     std::atomic_bool shutting_down{};
+    std::atomic_bool flush_requested{};
 
     std::array<std::atomic<u32>, Service::Nvidia::MaxSyncPoints> syncpoints{};
 
@@ -415,6 +429,10 @@ void GPU::BindRenderer(std::unique_ptr<VideoCore::RendererBase> renderer) {
 
 void GPU::FlushCommands() {
     impl->FlushCommands();
+}
+
+void GPU::RequestFlushCommands() {
+    impl->RequestFlushCommands();
 }
 
 void GPU::InvalidateGPUCache() {

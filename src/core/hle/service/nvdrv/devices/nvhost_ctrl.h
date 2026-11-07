@@ -35,6 +35,10 @@ public:
     void OnOpen(NvCore::SessionId session_id, DeviceFD fd) override;
     void OnClose(DeviceFD fd) override;
 
+    /// A guest wait on an event that failed repeatedly blocks nvservices until the GPU reaches the
+    /// value (true), or flushes the GPU thread and lets the wait go on as usual (false).
+    static void SetFailingEventStall(bool stall);
+
     Kernel::KEvent* QueryEvent(u32 event_id) override;
 
     union SyncpointEventValue {

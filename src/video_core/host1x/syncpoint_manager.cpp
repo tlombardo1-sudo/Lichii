@@ -96,9 +96,19 @@ void SyncpointManager::Increment(std::atomic<u32>& syncpoint, std::condition_var
     wait_cv.notify_all();
 }
 
+void SyncpointManager::CancelWaits() {
+    std::scoped_lock lk(guard);
+    stopping.store(true, std::memory_order_release);
+    wait_guest_cv.notify_all();
+    wait_host_cv.notify_all();
+}
+
 void SyncpointManager::Wait(std::atomic<u32>& syncpoint, std::condition_variable& wait_cv,
                             u32 expected_value) {
-    const auto pred = [&]() { return syncpoint.load(std::memory_order_acquire) >= expected_value; };
+    const auto pred = [&]() {
+        return syncpoint.load(std::memory_order_acquire) >= expected_value ||
+               stopping.load(std::memory_order_acquire);
+    };
     if (pred()) {
         return;
     }

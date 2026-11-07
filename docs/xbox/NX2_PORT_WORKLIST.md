@@ -103,14 +103,17 @@ Done: `Direct3D12` in `RendererBackend`, `XAudio2` in `AudioEngine` (appended, v
 factory in `video_core.cpp` (Vulkan and D3D12 behind `HAS_VULKAN`/`HAS_D3D12`), the XAudio2 sink in
 `sink_details.cpp` and `audio_core/CMakeLists.txt`, SDL3 not linked on WindowsStore.
 
+Also done (core group): `System::GetCheatEngine`/`EnsureCheatEngine`/`SetApplicationProcessMainRegion` (set by the NSO
+loader), `SyncpointManager::CancelWaits` (called from shutdown), `PerfStats::TotalGameFrames`, `CoreWindow` window type,
+`GpuThread` exception observer (non-split path; a failed command is reported and still counts as run),
+`GPU::RequestFlushCommands`, `KScheduler::SetEmptyYieldPause`/`PauseEmptyYield` (called from the three yield SVCs),
+`nvhost_ctrl::SetFailingEventStall` (flush instead of stalling), the debug-string observer, bug-tracker keys on guest
+break/panic and a memory line at break, `FramebufferConfig` `vsync_index`/`new_frame`/`queue_time_ns`.
+Stored only, no effect yet: `nvdisp_disp0::SetReleaseFence` (nx2's composite has no release fence), and the
+`GpuThread` observer is not hooked into the split back thread.
+
 Still missing, grouped (each is called by `src/jadyx` or `renderer_d3d12` and does not exist here):
-- Core: `System::EnsureCheatEngine`, `System::CancelWaits`; `PerfStats::TotalGameFrames`; `EmuWindow` `CoreWindow`/`IUnknown`
-  handle for the D3D12 swap chain; `KScheduler::SetEmptyYieldPause`; `NvHostCtrl::SetFailingEventStall`;
-  `nvdisp_disp0` `SetReleaseFence`, and `FramebufferConfig` `new_frame`/`queue_time_ns`/`vsync_index`;
-  svc `bug_tracker_mute` and the debug-string observer.
-- GPU thread and sync: `GpuThread` `SetExceptionObserver`/`ReportException`/`HasExceptionReported`;
-  `SyncpointManager::CancelWaits`; `FenceManager::SetEarlySyncpoints`; `Macro` `SetIndirectMacroCpuRead`;
-  `QueryCache` occlusion override.
+- GPU thread and sync: `FenceManager::SetEarlySyncpoints`; `Macro` `SetIndirectMacroCpuRead`; `QueryCache` occlusion override.
 - Texture cache: policy setters `SetMipRenderTargets`, `SetReclaimSupersededImages`, `SetRenderTargetEarlyOut`,
   `SetRenderTargetInheritance`; GC download (`PrepareGcDownload`, `CompleteGcDownload`, `GetTextureGcPolicy`,
   `RelocateImage`, `TransferPoolBytes`); `BlitCanReplaceDestination`; `SetBcGuestPalette`/`GetBcGuestPalette`;

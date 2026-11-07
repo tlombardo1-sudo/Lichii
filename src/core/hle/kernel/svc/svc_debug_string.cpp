@@ -13,9 +13,20 @@
 #include "core/core.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/svc.h"
+#include "core/hle/kernel/svc/svc_debug_string.h"
 #include "core/memory.h"
 
 namespace Kernel::Svc {
+
+namespace {
+std::mutex g_debug_observer_mutex;
+DebugStringObserver g_debug_observer;
+} // namespace
+
+void SetDebugStringObserver(DebugStringObserver observer) {
+    std::lock_guard lock(g_debug_observer_mutex);
+    g_debug_observer = std::move(observer);
+}
 
 /// Used to output a message on a debug hardware unit - does nothing on a retail unit
 Result OutputDebugString(Core::System& system, u64 address, u64 len) {
@@ -23,6 +34,12 @@ Result OutputDebugString(Core::System& system, u64 address, u64 len) {
     std::string msg_buffer(len, 0);
     GetCurrentMemory(system.Kernel()).ReadBlock(address, msg_buffer.data(), len);
     LOG_INFO(Debug_Emulated, "{}", msg_buffer);
+    // The headless UWP boot frontend installs an observer to watch for its liveness sentinel;
+    // normal builds do not, and pay only the lock.
+    std::lock_guard observer_lock(g_debug_observer_mutex);
+    if (g_debug_observer) {
+        g_debug_observer(msg_buffer);
+    }
     R_SUCCEED();
 }
 

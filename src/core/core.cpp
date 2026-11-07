@@ -488,6 +488,9 @@ struct System::Impl {
         is_powered_on = false;
         exit_locked = false;
         exit_requested = false;
+        // Wake host threads blocked on a syncpoint the guest will never signal.
+        if (host1x_core)
+            host1x_core->GetSyncpointManager().CancelWaits();
         if (gpu_core)
             gpu_core->NotifyShutdown();
 
@@ -585,6 +588,8 @@ struct System::Impl {
 
     std::array<u64, Core::Hardware::NUM_CPU_CORES> dynarmic_ticks{};
     std::array<u8, 0x20> build_id{};
+    u64 main_region_begin{};
+    u64 main_region_size{};
 
     std::string current_application_filepath;
 
@@ -968,6 +973,23 @@ void System::SetExitRequested(bool requested) {
 
 bool System::GetExitRequested() const {
     return impl->exit_requested;
+}
+
+Memory::CheatEngine* System::GetCheatEngine() {
+    return impl->cheat_engine ? &*impl->cheat_engine : nullptr;
+}
+
+Memory::CheatEngine& System::EnsureCheatEngine() {
+    if (!impl->cheat_engine) {
+        RegisterCheatList({}, impl->build_id, impl->main_region_begin, impl->main_region_size);
+        impl->cheat_engine->Initialize();
+    }
+    return *impl->cheat_engine;
+}
+
+void System::SetApplicationProcessMainRegion(u64 begin, u64 size) {
+    impl->main_region_begin = begin;
+    impl->main_region_size = size;
 }
 
 void System::SetApplicationProcessBuildID(const CurrentBuildProcessID& id) {

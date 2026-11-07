@@ -61,6 +61,9 @@ public:
 
     void WaitHost(u32 syncpoint_id, u32 expected_value);
 
+    /// Cancel blocking waits during emulation teardown without advancing guest counters.
+    void CancelWaits();
+
     bool IsReadyGuest(u32 syncpoint_id, u32 expected_value) const {
         return syncpoints_guest[syncpoint_id].load(std::memory_order_acquire) >= expected_value;
     }
@@ -88,6 +91,7 @@ private:
     std::array<std::list<RegisteredAction>, NUM_MAX_SYNCPOINTS> host_action_storage;
 
     std::mutex guard;
+    std::atomic<bool> stopping{};
     u64 last_action_id{};
     std::condition_variable wait_guest_cv;
     std::condition_variable wait_host_cv;

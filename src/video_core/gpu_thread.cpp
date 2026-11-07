@@ -4,11 +4,14 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <chrono>
+#include <exception>
 #include <thread>
 
 #include "common/assert.h"
 #include "common/dkb_cpu_trace.h"
+#include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/thread.h"
@@ -27,6 +30,9 @@ namespace VideoCommon::GPUThread {
 
 namespace {
 
+std::atomic<ExceptionObserver> exception_observer{};
+std::atomic_bool exception_reported{};
+
 // Tells a CPU thread waiting in PushCommand that its command ran.
 void SignalCommand(SynchState& state, u64 fence, bool block) {
     state.signaled_fence.store(fence);
@@ -39,6 +45,24 @@ void SignalCommand(SynchState& state, u64 fence, bool block) {
 }
 
 } // Anonymous namespace
+
+void SetExceptionObserver(ExceptionObserver observer) {
+    exception_reported.store(false, std::memory_order_release);
+    exception_observer.store(observer, std::memory_order_release);
+}
+
+bool HasExceptionReported() {
+    return exception_reported.load(std::memory_order_acquire);
+}
+
+bool ReportException(const char* message) {
+    if (const auto observer = exception_observer.load(std::memory_order_acquire)) {
+        exception_reported.store(true, std::memory_order_release);
+        observer(message);
+        return true;
+    }
+    return false;
+}
 
 ThreadManager::ThreadManager(Core::System& system_)
     : system{system_}
@@ -125,23 +149,33 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 split.Publish();
                 continue;
             }
-            if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
-                Profile::Scope scope{Profile::Zone::Push};
-                scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
-            } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
-                Profile::Scope scope{Profile::Zone::Tick};
-                system.GPU().TickWork();
-            } else if (auto* run = std::get_if<RunCommand>(&next.data)) {
-                Profile::Scope scope{Profile::Zone::Run};
-                run->func();
-            } else if (const auto* flush = std::get_if<FlushRegionCommand>(&next.data)) {
-                Profile::Scope scope{Profile::Zone::FlushInvalidate};
-                renderer.ReadRasterizer()->FlushRegion(flush->addr, flush->size);
-            } else if (const auto* invalidate = std::get_if<InvalidateRegionCommand>(&next.data)) {
-                Profile::Scope scope{Profile::Zone::FlushInvalidate};
-                renderer.ReadRasterizer()->OnCacheInvalidation(invalidate->addr, invalidate->size);
-            } else {
-                ASSERT(false);
+            // A failed command is reported to a headless frontend, which stops emulation on its own
+            // thread; the command still counts as run so no CPU thread waits on it forever.
+            try {
+                if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+                    Profile::Scope scope{Profile::Zone::Push};
+                    scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
+                } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
+                    Profile::Scope scope{Profile::Zone::Tick};
+                    system.GPU().TickWork();
+                } else if (auto* run = std::get_if<RunCommand>(&next.data)) {
+                    Profile::Scope scope{Profile::Zone::Run};
+                    run->func();
+                } else if (const auto* flush = std::get_if<FlushRegionCommand>(&next.data)) {
+                    Profile::Scope scope{Profile::Zone::FlushInvalidate};
+                    renderer.ReadRasterizer()->FlushRegion(flush->addr, flush->size);
+                } else if (const auto* invalidate = std::get_if<InvalidateRegionCommand>(&next.data)) {
+                    Profile::Scope scope{Profile::Zone::FlushInvalidate};
+                    renderer.ReadRasterizer()->OnCacheInvalidation(invalidate->addr, invalidate->size);
+                } else {
+                    ASSERT(false);
+                }
+            } catch (const std::exception& error) {
+                if (!ReportException(error.what())) {
+                    throw;
+                }
+                LOG_ERROR(Render, "GPU command failed; requesting controlled shutdown: {}",
+                          error.what());
             }
             SignalCommand(state, next.fence, next.block);
         }

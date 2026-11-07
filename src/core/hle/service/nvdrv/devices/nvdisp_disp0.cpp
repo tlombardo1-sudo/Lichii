@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+
 #include <boost/container/small_vector.hpp>
 
 #include "common/adpf.h"
@@ -59,6 +61,14 @@ NvResult nvdisp_disp0::Ioctl3(DeviceFD fd, Ioctl command, std::span<const u8> in
 
 void nvdisp_disp0::OnOpen(NvCore::SessionId session_id, DeviceFD fd) {}
 void nvdisp_disp0::OnClose(DeviceFD fd) {}
+
+namespace {
+std::atomic_bool release_fence_enabled{true};
+} // namespace
+
+void nvdisp_disp0::SetReleaseFence(bool enabled) {
+    release_fence_enabled.store(enabled, std::memory_order_relaxed);
+}
 
 void nvdisp_disp0::Composite(std::span<const Nvnflinger::HwcLayer> sorted_layers) {
     std::vector<Tegra::FramebufferConfig> output_layers;

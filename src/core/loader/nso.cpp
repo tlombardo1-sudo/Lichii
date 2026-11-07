@@ -306,6 +306,7 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         // TODO(Maufeat): Check if there is a better way to check
         if (name == "main")
             system.SetApplicationProcessBuildID(nso_header.build_id);
+            system.SetApplicationProcessMainRegion(load_base, image_size);
 
         const auto cheats = pm->CreateCheatList(nso_header.build_id);
         if (!cheats.empty()) {

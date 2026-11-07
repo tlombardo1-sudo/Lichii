@@ -44,6 +44,10 @@ public:
 
     Kernel::KEvent* QueryEvent(u32 event_id) override;
 
+    /// Whether display buffers are released on a syncpoint instead of by the composite wait.
+    /// Stored only: nx2's composite has no release fence yet (worklist section 4).
+    static void SetReleaseFence(bool enabled);
+
 private:
     NvCore::Container& container;
     NvCore::NvMap& nvmap;

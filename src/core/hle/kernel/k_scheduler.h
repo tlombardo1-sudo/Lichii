@@ -115,6 +115,12 @@ public:
     static void YieldWithCoreMigration(KernelCore& kernel);
     static void YieldToAnyThread(KernelCore& kernel);
 
+    /// "guest_yield_pause=<max pauses>": a yield with nothing else to run spins on the host with
+    /// PAUSE, growing while the thread keeps yielding, so a guest spin wait leaves its SMT sibling
+    /// the core. 0 turns it off.
+    static void SetEmptyYieldPause(u32 max_pauses);
+    static void PauseEmptyYield(KernelCore& kernel);
+
 private:
     // Static private API.
     static KSchedulerPriorityQueue& GetPriorityQueue(KernelCore& kernel) {
