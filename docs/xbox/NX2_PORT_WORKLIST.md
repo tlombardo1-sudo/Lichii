@@ -90,14 +90,40 @@ Still open:
 - Jadyx's `writable_code_ranges.h` / profile changes may collide with nx2's LSE atomics, pointer authentication and
   memory tagging work.
 
-## 4. GPU front end (Lichii split GPU thread vs Jadyx hooks)
+## 4. GPU front end and shared API surface
 
-- `src/video_core/gpu.cpp`, `video_core.cpp`, `rasterizer_interface.h`, `cdma_pusher.h`, `shader_cache.cpp`,
-  `shader_environment.cpp`
-- `control/channel_state.{h,cpp}`, `engines/maxwell_3d.h`, `maxwell_dma.h`, `puller.h`
-- `host1x/host1x.h`, `syncpoint_manager.{h,cpp}`
-- `buffer_cache/buffer_cache{,_base}.h`, `texture_cache/texture_cache{,_base}.h`, `util.h`, `textures/decoders.cpp`
-- `renderer_vulkan/fixed_pipeline_state.h` (shared with the D3D12 backend)
+Method: for every shared file Jadyx changed, take the identifiers that Jadyx's version defines, that exist nowhere in
+this tree, and that `src/jadyx` or `renderer_d3d12` actually use. That replaces the earlier marker-based list.
+Lichii's `rasterizer_interface.h` is a superset of Jadyx's (Jadyx only adds the removed Pulse hooks) and stays as is;
+the D3D12 rasterizer's overrides all exist in it. The shared `TextureCache`/`BufferCache` templates call their runtime
+through `requires`-gated paths for almost everything Lichii added, and class-template members are only instantiated
+when used, so Lichii's templates can stay and the D3D12 runtime only needs the members that nothing gates.
+
+Done: `Direct3D12` in `RendererBackend`, `XAudio2` in `AudioEngine` (appended, values are persisted), the renderer
+factory in `video_core.cpp` (Vulkan and D3D12 behind `HAS_VULKAN`/`HAS_D3D12`), the XAudio2 sink in
+`sink_details.cpp` and `audio_core/CMakeLists.txt`, SDL3 not linked on WindowsStore.
+
+Still missing, grouped (each is called by `src/jadyx` or `renderer_d3d12` and does not exist here):
+- Core: `System::EnsureCheatEngine`, `System::CancelWaits`; `PerfStats::TotalGameFrames`; `EmuWindow` `CoreWindow`/`IUnknown`
+  handle for the D3D12 swap chain; `KScheduler::SetEmptyYieldPause`; `NvHostCtrl::SetFailingEventStall`;
+  `nvdisp_disp0` `SetReleaseFence`, and `FramebufferConfig` `new_frame`/`queue_time_ns`/`vsync_index`;
+  svc `bug_tracker_mute` and the debug-string observer.
+- GPU thread and sync: `GpuThread` `SetExceptionObserver`/`ReportException`/`HasExceptionReported`;
+  `SyncpointManager::CancelWaits`; `FenceManager::SetEarlySyncpoints`; `Macro` `SetIndirectMacroCpuRead`;
+  `QueryCache` occlusion override.
+- Texture cache: policy setters `SetMipRenderTargets`, `SetReclaimSupersededImages`, `SetRenderTargetEarlyOut`,
+  `SetRenderTargetInheritance`; GC download (`PrepareGcDownload`, `CompleteGcDownload`, `GetTextureGcPolicy`,
+  `RelocateImage`, `TransferPoolBytes`); `BlitCanReplaceDestination`; `SetBcGuestPalette`/`GetBcGuestPalette`;
+  `SetOpaqueAstcToBc1`, `SetAstcArrayRecompression`, `HostRowLayout`; graphics binding stamps.
+- Buffer cache: `BindGuestUniformBuffer`, `KeepVertexBufferReadable`, `SetInlineIndices`, `UniformNeedsPadding`,
+  `UseWriteCombinedUniformCopy`, the immediate-release constants.
+- Pipeline state: `FixedPipelineState` fields used for D3D12 geometry emulation (`generated_lines`,
+  `generated_polygon_points`, `generated_fill_rectangle`, `shader_polygon_stipple`, `RefreshStatic`);
+  `TransformFeedbackVaryings`/`CapturesGeneric`.
+- File system: `NcaMetadata` `GetDataPatchId`/`GetRequiredApplicationVersion`/`GetRequiredSystemVersion`,
+  `PatchManager::ReadCheatFiles` and cheat toggles, `RegisteredCache::InstallContentSet` (used by the library and cheats pages).
+- JIT: `PageTable::SetJitReadTable` (section 3).
+- Shader recompiler fields: section 5.
 
 ## 5. Shader path (SPIR-V to DXIL via Mesa)
 

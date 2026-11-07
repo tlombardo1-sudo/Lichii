@@ -92,7 +92,8 @@ struct EnumMetadata {
 // AudioEngine must be specified discretely due to having existing but slightly different
 // canonicalizations
 // TODO (lat9nq): Remove explicit definition of AudioEngine/sink_id
-enum class AudioEngine : u32 { Auto, Cubeb, Sdl3, Null, };
+// Keep new entries at the end: these values are persisted in user configurations.
+enum class AudioEngine : u32 { Auto, Cubeb, Sdl3, Null, XAudio2, };
 template<>
 inline std::vector<std::pair<std::string_view, AudioEngine>> EnumMetadata<AudioEngine>::Canonicalizations() {
     return {
@@ -100,6 +101,7 @@ inline std::vector<std::pair<std::string_view, AudioEngine>> EnumMetadata<AudioE
         {"cubeb", AudioEngine::Cubeb},
         {"sdl3", AudioEngine::Sdl3},
         {"null", AudioEngine::Null},
+        {"xaudio2", AudioEngine::XAudio2},
     };
 }
 /// @brief This is just a sufficiently large number that is more than the number of other enums declared here
@@ -113,7 +115,7 @@ inline AudioEngine EnumMetadata<AudioEngine>::GetFirst() {
 }
 template<>
 inline AudioEngine EnumMetadata<AudioEngine>::GetLast() {
-    return AudioEngine::Null;
+    return AudioEngine::XAudio2;
 }
 
 ENUM(AudioMode, Mono, Stereo, Surround);
@@ -134,7 +136,7 @@ ENUM(AstcRecompression, Uncompressed, Bc1, Bc3);
 ENUM(FramePacingMode, Target_Auto, Target_30, Target_60, Target_90, Target_120);
 ENUM(VSyncMode, Immediate, Mailbox, Fifo, FifoRelaxed);
 ENUM(VramUsageMode, Conservative, Aggressive);
-ENUM(RendererBackend, OpenGL_GLSL, Vulkan, Null, OpenGL_GLASM, OpenGL_SPIRV);
+ENUM(RendererBackend, OpenGL_GLSL, Vulkan, Null, OpenGL_GLASM, OpenGL_SPIRV, Direct3D12);
 ENUM(GpuAccuracy, Low, High);
 ENUM(DmaAccuracy, Default, Unsafe, Safe);
 ENUM(GpuFenceBehavior, Default, Immediate, Balanced, Accurate);

@@ -208,6 +208,7 @@ add_library(audio_core STATIC
     renderer/voice/voice_info.h
     renderer/voice/voice_state.h
     sink/null_sink.h
+    sink/realtime_pacer.h
     sink/sink.h
     sink/sink_details.cpp
     sink/sink_details.h
@@ -241,11 +242,24 @@ if (ENABLE_CUBEB)
     target_compile_definitions(audio_core PRIVATE HAVE_CUBEB=1)
 endif()
 
-target_sources(audio_core PRIVATE
-    sink/sdl3_sink.cpp
-    sink/sdl3_sink.h)
+if (CMAKE_SYSTEM_NAME STREQUAL "WindowsStore")
+    target_sources(audio_core PRIVATE
+        sink/xaudio2_sink.cpp
+        sink/xaudio2_sink.h)
+    target_link_libraries(audio_core PRIVATE xaudio2.lib)
+    target_compile_definitions(audio_core PRIVATE HAVE_XAUDIO2=1)
+endif()
 
-target_link_libraries(audio_core PRIVATE SDL3::SDL3)
-target_compile_definitions(audio_core PRIVATE HAVE_SDL3)
+# The Xbox/UWP AppContainer uses the native XAudio2 sink above. SDL3 would pull its whole desktop
+# windowing and input stack (GDI32, SHELL32, USER32, IMM32, SETUPAPI, HID, WINMM) into the app, none
+# of which the AppContainer provides, and the package then fails to activate at load.
+if (NOT CMAKE_SYSTEM_NAME STREQUAL "WindowsStore")
+    target_sources(audio_core PRIVATE
+        sink/sdl3_sink.cpp
+        sink/sdl3_sink.h)
+
+    target_link_libraries(audio_core PRIVATE SDL3::SDL3)
+    target_compile_definitions(audio_core PRIVATE HAVE_SDL3)
+endif()
 
 create_target_directory_groups(audio_core)
