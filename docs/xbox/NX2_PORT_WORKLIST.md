@@ -175,3 +175,13 @@ Ported into shared `buffer_cache.h` as `if constexpr (requires ...)` calls (no-o
 `SetInlineIndices`, `KeepVertexBufferReadable`, `UniformNeedsPadding`, `BindGuestUniformBuffer`,
 `UseWriteCombinedUniformCopy` (with `DeviceMemoryManager::ReadBlockUnsafeToWriteCombined`, which
 skips the translation-cache fast path). Immediate-release constants are still open.
+
+### Section 4 addendum: pipeline state and transform feedback
+
+`FixedPipelineState` gained `VertexAttribute::bgra`, the D3D12-only `generated_lines`,
+`generated_polygon_points`, `generated_fill_rectangle`, `shader_polygon_stipple`,
+`shader_mirror_border` (dynamic state) and `sample_mask_rest` (static). `RefreshStatic` already
+lives in the D3D12 key. Transform feedback now follows Jadyx: `TransformFeedbackState::Refresh`
+(disabled buffers contribute nothing), `TransformFeedbackVaryings` with `CapturesGeneric`/`Apply`,
+and `RuntimeInfo::xfb_repeats`. The SPIR-V backend does not emit repeats yet (section 5), so a
+repeated capture is dropped (the first one wins; Lichii's old code let the last win).

@@ -83,6 +83,14 @@ struct TransformFeedbackVarying {
     u32 components{};
 };
 
+/// A capture of components that another TransformFeedbackVarying already captures: the same
+/// attribute in a second buffer, or twice in one. The shader backends do not emit these yet
+/// (docs/xbox/NX2_PORT_WORKLIST.md section 5).
+struct TransformFeedbackRepeat {
+    u32 attribute{};
+    TransformFeedbackVarying varying;
+};
+
 struct RuntimeInfo {
     std::array<AttributeType, 32> generic_input_types{};
     VaryingState previous_stage_stores;
@@ -111,6 +119,8 @@ struct RuntimeInfo {
     /// Transform feedback state for each varying
     std::array<TransformFeedbackVarying, 256> xfb_varyings{};
     u32 xfb_count{0};
+    /// Captures that overlap one in xfb_varyings, which holds one per attribute.
+    std::vector<TransformFeedbackRepeat> xfb_repeats;
 
     /// Output types for each color attachment
     std::array<AttributeType, 8> color_output_types{};

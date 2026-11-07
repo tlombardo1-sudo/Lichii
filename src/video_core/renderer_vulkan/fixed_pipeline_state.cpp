@@ -90,17 +90,6 @@ bool ComputeAttachment0DualSourceBlend(const Maxwell& regs) {
                                          : uses_dual_source(regs.blend);
 }
 
-void RefreshXfbState(VideoCommon::TransformFeedbackState& state, const Maxwell& regs) {
-    std::ranges::transform(regs.transform_feedback.controls, state.layouts.begin(),
-                           [](const auto& layout) {
-                               return VideoCommon::TransformFeedbackState::Layout{
-                                   .stream = layout.stream,
-                                   .varying_count = layout.varying_count,
-                                   .stride = layout.stride,
-                               };
-                           });
-    state.varyings = regs.stream_out_layout;
-}
 } // Anonymous namespace
 
 void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFeatures& features) {
@@ -232,6 +221,7 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
                 attribute.offset.Assign(input.offset);
                 attribute.type.Assign(static_cast<u32>(input.type.Value()));
                 attribute.size.Assign(static_cast<u32>(input.size.Value()));
+                attribute.bgra.Assign(input.bgra);
             }
         }
     }
@@ -272,7 +262,7 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
     }
     dynamic_state.Refresh3(regs, features);
     if (xfb_enabled) {
-        RefreshXfbState(xfb_state, regs);
+        xfb_state.Refresh(regs);
     }
     if (!dynamic_vertex_input && features.has_static_vertex_repack) {
         const u32 repack_mask = VertexRepackMask(regs);
