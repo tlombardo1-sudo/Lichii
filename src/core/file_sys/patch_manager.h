@@ -9,7 +9,9 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
+#include <vector>
 #include "common/common_types.h"
 #include "core/file_sys/nca_metadata.h"
 #include "core/file_sys/vfs/vfs_types.h"
@@ -49,6 +51,16 @@ struct Patch {
     PatchSource source;
     std::string location;
     u32 numeric_version{0};
+};
+
+/// One cheats file a game loads, with its toggles applied: `<mod>/cheats/<build id>.txt` (toggled
+/// by `toggles.txt` next to it, as Atmosphere does) or a loose `cheat_*.txt` in the title's load
+/// folder (toggled by `<name>.toggles`).
+struct CheatFile {
+    std::string mod;                              ///< Mod folder, or the loose file's name.
+    std::vector<Core::Memory::CheatEntry> cheats; ///< As TextCheatParser returns them.
+    VirtualDir toggles_dir;                       ///< Where the toggles file is (or would be).
+    std::string toggles_name;
 };
 
 // A centralized class to manage patches to games.
@@ -111,6 +123,8 @@ public:
 private:
     [[nodiscard]] VirtualDir GetModificationLoadRoot(bool sdmc = false) const;
     [[nodiscard]] std::vector<std::string> GetDisabledAddons() const;
+    /// Mod folders in the order they apply (mod_priority.h); drops null roots.
+    void SortModDirectories(std::vector<VirtualDir>& dirs) const;
     void ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) const;
     [[nodiscard]] std::vector<VirtualFile> CollectPatches(const std::vector<VirtualDir>& patch_dirs,
                                                           const std::string& build_id) const;
@@ -120,5 +134,11 @@ private:
     const Service::FileSystem::FileSystemController& fs_controller;
     const ContentProvider& content_provider;
 };
+
+/// The cheats files under one title's load folder (`load/<title id>`), in the order the loader
+/// joins them into the cheat list; mods named in `disabled` are left out.
+[[nodiscard]] std::vector<CheatFile> ReadCheatFiles(const VirtualDir& title_load_dir,
+                                                    const PatchManager::BuildID& build_id,
+                                                    std::span<const std::string> disabled);
 
 } // namespace FileSys

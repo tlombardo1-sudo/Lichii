@@ -159,25 +159,6 @@ static std::shared_ptr<NSP> OpenContainerAsNsp(const VirtualFile& file, Loader::
     return nullptr;
 }
 
-// Checks that every .ncz entry in the container is NCZBLOCK. Solid NCZ has no random access,
-// and the whole point of this build is to reject it at scan time so such files never appear
-// in the game list. Containers without any .ncz (plain NSP/XCI) pass through.
-static bool ContainerIsFullyBlockCompressed(const std::shared_ptr<NSP>& nsp) {
-    if (!nsp) {
-        return false;
-    }
-    for (const auto& entry : nsp->GetFiles()) {
-        const auto name = entry->GetName();
-        if (name.size() < 4 || name.substr(name.size() - 4) != ".ncz") {
-            continue;
-        }
-        if (!Core::Crypto::IsBlockCompressedNCZ(entry)) {
-            return false; // solid NCZ -> reject the whole container
-        }
-    }
-    return true; // no .ncz at all, or all block-compressed
-}
-
 template <typename Callback>
 bool ForEachContainerEntry(const std::shared_ptr<NSP>& nsp, bool only_content,
                            std::optional<u64> base_program_id, Callback&& on_entry) {
@@ -345,12 +326,6 @@ ContentRecordType GetCRTypeFromNCAType(NCAContentType type) {
         ASSERT_MSG(false, "Invalid NCAContentType={:02X}", type);
         return ContentRecordType{};
     }
-}
-
-ContentProvider::~ContentProvider() = default;
-
-bool ContentProvider::HasEntry(ContentProviderEntry entry) const {
-    return HasEntry(entry.title_id, entry.type);
 }
 
 VirtualFile ContentProvider::GetEntryUnparsed(ContentProviderEntry entry) const {
@@ -830,6 +805,25 @@ std::vector<ContentProviderEntry> RegisteredCache::ListEntriesFilter(
     return out;
 }
 
+// Checks that every .ncz entry in the container is NCZBLOCK. Solid NCZ has no random access,
+// and the whole point of this build is to reject it at scan time so such files never appear
+// in the game list. Containers without any .ncz (plain NSP/XCI) pass through.
+static bool ContainerIsFullyBlockCompressed(const std::shared_ptr<NSP>& nsp) {
+    if (!nsp) {
+        return false;
+    }
+    for (const auto& entry : nsp->GetFiles()) {
+        const auto name = entry->GetName();
+        if (name.size() < 4 || name.substr(name.size() - 4) != ".ncz") {
+            continue;
+        }
+        if (!Core::Crypto::IsBlockCompressedNCZ(entry)) {
+            return false; // solid NCZ -> reject the whole container
+        }
+    }
+    return true; // no .ncz at all, or all block-compressed
+}
+
 static std::shared_ptr<NCA> GetNCAFromNSPForID(const NSP& nsp, const NcaID& id) {
     const auto id_string = Common::HexToString(id, false);
     auto file = nsp.GetFile(fmt::format("{}.nca", id_string));
@@ -843,6 +837,34 @@ static std::shared_ptr<NCA> GetNCAFromNSPForID(const NSP& nsp, const NcaID& id) 
         return nullptr;
     }
     return std::make_shared<NCA>(std::move(file));
+}
+
+InstallResult RegisteredCache::InstallContentSet(const CNMT& cnmt, const VirtualFile& meta_file,
+        const std::vector<VirtualFile>& files, const VfsCopyFunction& copy) {
+    if (!cnmt.IsValid() || (cnmt.GetType() != TitleType::Update && cnmt.GetType() != TitleType::AOC) ||
+        !meta_file || meta_file->GetName().size() < 32) return InstallResult::ErrorMetaFailed;
+    const auto meta_name = meta_file->GetName().substr(0, 32);
+    if (!std::all_of(meta_name.begin(), meta_name.end(), [](unsigned char c) { return std::isxdigit(c); }))
+        return InstallResult::ErrorMetaFailed;
+    NCA meta_nca{meta_file};
+    if (meta_nca.GetStatus() != Loader::ResultStatus::Success) return InstallResult::ErrorMetaFailed;
+    const auto meta_result = RawInstallNCA(meta_nca, copy, false, Common::HexStringToArray<16>(meta_name));
+    if (meta_result != InstallResult::Success) return meta_result;
+    for (const auto& record : cnmt.GetContentRecords()) {
+        if (record.type == ContentRecordType::DeltaFragment) continue;
+        const auto name = Common::HexToString(record.nca_id, false);
+        const auto found = std::find_if(files.begin(), files.end(), [&](const auto& f) {
+            return f && Common::ToLower(f->GetName().substr(0, 32)) == name;
+        });
+        if (found == files.end() || (*found)->GetSize() != record.GetSize()) return InstallResult::ErrorCopyFailed;
+        NCA nca{*found};
+        if (nca.GetStatus() != Loader::ResultStatus::Success &&
+            nca.GetStatus() != Loader::ResultStatus::ErrorMissingBKTRBaseRomFS) return InstallResult::ErrorCopyFailed;
+        const auto result = RawInstallNCA(nca, copy, false, record.nca_id);
+        if (result != InstallResult::Success) return result;
+    }
+    Refresh();
+    return InstallResult::Success;
 }
 
 InstallResult RegisteredCache::InstallEntry(const XCI& xci, bool overwrite_if_exists,
@@ -1141,111 +1163,6 @@ bool RegisteredCache::RawInstallYuzuMeta(const CNMT& cnmt) {
     }) != yuzu_meta.end();
 }
 
-ContentProviderUnion::~ContentProviderUnion() = default;
-
-void ContentProviderUnion::SetSlot(ContentProviderUnionSlot slot, ContentProvider* provider) {
-    providers[size_t(slot)] = provider;
-}
-
-void ContentProviderUnion::Refresh() {
-    for (auto e : providers)
-        if (e != nullptr)
-            e->Refresh();
-}
-
-bool ContentProviderUnion::HasEntry(u64 title_id, ContentRecordType type) const {
-    for (auto const e : providers)
-        if (e && e->HasEntry(title_id, type))
-            return true;
-    return false;
-}
-
-std::optional<u32> ContentProviderUnion::GetEntryVersion(u64 title_id) const {
-    for (auto const e : providers) {
-        if (e == nullptr)
-            continue;
-        if (auto const res = e->GetEntryVersion(title_id); res != std::nullopt)
-            return res;
-    }
-    return std::nullopt;
-}
-
-VirtualFile ContentProviderUnion::GetEntryUnparsed(u64 title_id, ContentRecordType type) const {
-    for (auto const e : providers) {
-        if (e == nullptr)
-            continue;
-        if (auto const res = e->GetEntryUnparsed(title_id, type); res != nullptr)
-            return res;
-    }
-    return nullptr;
-}
-
-VirtualFile ContentProviderUnion::GetEntryRaw(u64 title_id, ContentRecordType type) const {
-    for (auto const e : providers) {
-        if (e == nullptr)
-            continue;
-        if (auto const res = e->GetEntryRaw(title_id, type); res != nullptr)
-            return res;
-    }
-    return nullptr;
-}
-
-std::unique_ptr<NCA> ContentProviderUnion::GetEntry(u64 title_id, ContentRecordType type) const {
-    for (auto const e : providers) {
-        if (e == nullptr)
-            continue;
-        if (auto res = e->GetEntry(title_id, type); res != nullptr)
-            return res;
-    }
-    return nullptr;
-}
-
-std::vector<ContentProviderEntry> ContentProviderUnion::ListEntriesFilter(std::optional<TitleType> title_type, std::optional<ContentRecordType> record_type, std::optional<u64> title_id) const {
-    std::vector<ContentProviderEntry> out;
-    for (auto const& e : providers) {
-        if (e != nullptr) {
-            auto const vec = e->ListEntriesFilter(title_type, record_type, title_id);
-            std::copy(vec.begin(), vec.end(), std::back_inserter(out));
-        }
-    }
-    std::sort(out.begin(), out.end());
-    out.erase(std::unique(out.begin(), out.end()), out.end());
-    return out;
-}
-
-std::vector<std::pair<ContentProviderUnionSlot, ContentProviderEntry>> ContentProviderUnion::ListEntriesFilterOrigin(std::optional<ContentProviderUnionSlot> origin, std::optional<TitleType> title_type, std::optional<ContentRecordType> record_type, std::optional<u64> title_id) const {
-    std::vector<std::pair<ContentProviderUnionSlot, ContentProviderEntry>> out;
-
-    for (size_t i = 0; i < providers.size(); ++i) {
-        auto const& e = providers[i];
-        if (e == nullptr)
-            continue;
-        if (origin.has_value() && *origin != ContentProviderUnionSlot(i))
-            continue;
-        auto const vec = e->ListEntriesFilter(title_type, record_type, title_id);
-        std::transform(vec.begin(), vec.end(), std::back_inserter(out), [i](const ContentProviderEntry& entry) {
-            return std::make_pair(ContentProviderUnionSlot(i), entry);
-        });
-    }
-
-    std::sort(out.begin(), out.end());
-    out.erase(std::unique(out.begin(), out.end()), out.end());
-    return out;
-}
-
-std::optional<ContentProviderUnionSlot> ContentProviderUnion::GetSlotForEntry(u64 title_id, ContentRecordType type) const {
-    for (size_t i = 0; i < providers.size(); ++i) {
-        auto const& e = providers[i];
-        if (e != nullptr && e->HasEntry(title_id, type))
-            return {ContentProviderUnionSlot(i)};
-    }
-    return std::nullopt;
-}
-
-const ExternalContentProvider* ContentProviderUnion::GetExternalProvider() const {
-    return static_cast<const ExternalContentProvider*>(providers[size_t(ContentProviderUnionSlot::External)]);
-}
-
 ManualContentProvider::~ManualContentProvider() = default;
 
 void ManualContentProvider::AddEntry(TitleType title_type, ContentRecordType content_type, u64 title_id, VirtualFile file) {
@@ -1331,6 +1248,8 @@ bool ManualContentProvider::HasEntry(u64 title_id, ContentRecordType type) const
 }
 
 std::optional<u32> ManualContentProvider::GetEntryVersion(u64 title_id) const {
+    for (const auto& entry : multi_version_entries)
+        if (entry.title_id == title_id) return entry.version;
     return std::nullopt;
 }
 
@@ -1448,6 +1367,7 @@ void ExternalContentProvider::ScanDirectory(const VirtualDir& dir) {
         }
 
         const auto extension = Common::ToLower(filename.substr(dot_pos + 1));
+
         // .xcz is an XCI container, but its updates only work through the NSP/PFS0 path
         // (DecompressNCZ), not ProcessXCI. So route .xcz here on purpose.
         if (extension == "nsp" || extension == "nsz" || extension == "xcz") {
@@ -1468,7 +1388,7 @@ void ExternalContentProvider::ProcessNSP(const VirtualFile& file) {
         return;
     }
 
-    // Reject solid NCZ (.nsz without -B): Eden only supports block-compressed NCZ.
+    // Reject solid NCZ (.nsz without -B): only block-compressed NCZ is supported.
     if (!ContainerIsFullyBlockCompressed(nsp)) {
         LOG_DEBUG(Service_FS, "Skipping solid-compressed container: {}", file->GetName());
         return;

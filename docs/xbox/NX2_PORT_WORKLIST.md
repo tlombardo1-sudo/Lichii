@@ -185,3 +185,14 @@ lives in the D3D12 key. Transform feedback now follows Jadyx: `TransformFeedback
 (disabled buffers contribute nothing), `TransformFeedbackVaryings` with `CapturesGeneric`/`Apply`,
 and `RuntimeInfo::xfb_repeats`. The SPIR-V backend does not emit repeats yet (section 5), so a
 repeated capture is dropped (the first one wins; Lichii's old code let the last win).
+
+### Section 4 addendum: file system
+
+`nca_metadata`, `patch_manager` and `registered_cache` now come from Jadyx (Lichii's copies were
+unmodified Eden code): `CNMT::GetRequiredApplicationVersion/GetRequiredSystemVersion/GetDataPatchId`,
+`FileSys::ReadCheatFiles`, `PatchManager::SortModDirectories`, `RegisteredCache::InstallContentSet`
+and the launch-scoped `ContentProviderUnion::SetApplicationContentOverride`. This also removes
+duplicate `ContentProviderUnion` definitions (Jadyx's `content_provider_union.cpp` was already
+overlaid while Lichii's `registered_cache.cpp` still defined them). Lichii's NCZ support is
+re-applied on top (`ContainerIsFullyBlockCompressed`, `.ncz` fallback in `GetNCAFromNSPForID`,
+`.nsz`/`.xcz` routing). Added `Settings::values.mod_priority`.

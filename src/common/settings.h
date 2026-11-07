@@ -959,6 +959,8 @@ struct Values {
                                     "eden_token", Category::WebService};
 
     // Add-Ons
+    // Mod folder names by priority, most important first (core/file_sys/mod_priority.h).
+    std::map<u64, std::vector<std::string>> mod_priority;
     std::map<u64, std::vector<std::string>> disabled_addons;
 
     // Per-game overrides
