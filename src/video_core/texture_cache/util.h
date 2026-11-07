@@ -44,6 +44,10 @@ struct HostRowLayout {
     u32 level_alignment = 1;
 };
 
+/// Bytes UnswizzleImage writes for this image in the given layout.
+[[nodiscard]] u32 CalculateHostUnswizzledSizeBytes(const ImageInfo& info,
+                                                   const HostRowLayout& host) noexcept;
+
 /// Keeps ASTC 2D arrays and 3D images decoded to RGBA8 even when astc_recompression asks for BC1/BC3.
 void SetAstcArrayRecompression(bool enabled) noexcept;
 
@@ -119,7 +123,7 @@ void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan&
 
 [[nodiscard]] boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(
     Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
-    std::span<const u8> input, std::span<u8> output);
+    std::span<const u8> input, std::span<u8> output, const HostRowLayout& host = {});
 
 /// For a single-layer 2D block-linear image of 1x1-texel blocks: the host sparse blocks
 /// (tile_width x tile_height texels) that the guest byte ranges (offset, size) touch, merged into

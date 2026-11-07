@@ -29,7 +29,8 @@ constexpr u32 SWIZZLE_Y_BITS = 0b011010000;
 /// Unswizzles a block linear texture into linear memory.
 void UnswizzleTexture(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixel,
                       u32 width, u32 height, u32 depth, u32 block_height, u32 block_depth,
-                      u32 stride_alignment = 1, bool native_tiling = false);
+                      u32 stride_alignment = 1, bool native_tiling = false,
+                      u32 linear_pitch = 0);
 
 /// Swizzles linear memory into a block linear texture.
 void SwizzleTexture(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixel, u32 width,

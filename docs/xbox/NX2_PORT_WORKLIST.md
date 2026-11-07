@@ -164,6 +164,7 @@ Stored only (no behavioral effect in Lichii's texture cache yet): `SetRenderTarg
 `SetMipRenderTargets`, `SetReclaimSupersededImages`, `SetRenderTargetInheritance`,
 `SetOpaqueAstcToBc1`, `SetBcGuestPalette` (palette function itself is ported, DecompressBCn does
 not use it). `SetAstcArrayRecompression` and `AstcRecompressionFor` are live. `AstcMask` exists
-but images always report `None` (needs Jadyx's `ASTC::ScanAlpha`). Still missing: `HostRowLayout`
-overloads of `CalculateHostUnswizzledSizeBytes` and `UnswizzleImage`, which D3D12's GPU unswizzle needs.
-The struct is declared.
+but images always report `None` (needs Jadyx's `ASTC::ScanAlpha`). `HostRowLayout` is ported: `UnswizzleImage` takes it (default packed, so existing callers are
+unchanged), `CalculateHostUnswizzledSizeBytes` exists, and `UnswizzleTexture` gained `linear_pitch`.
+Still open: texture_cache.h does not yet ask the runtime for a layout (Jadyx's
+`HostRowLayout` plumbing in its upload path).
