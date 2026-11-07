@@ -157,3 +157,13 @@ Not compiled. `docs/xbox/xbox_internal.md` and the other dated dev logs still me
 - Lichii's Switch 2 layout asks for about 20 GiB of backing commit; the Xbox app limit is 5120 MiB. Switch 2 titles
   will not fit unless guest memory becomes sparse and much smaller than the layout the titles are told.
 - Fastmem is unavailable in the Xbox sandbox, so all guest accesses go through the page table.
+
+### Section 4 addendum: shared toggles added
+
+Stored only (no behavioral effect in Lichii's texture cache yet): `SetRenderTargetEarlyOut`,
+`SetMipRenderTargets`, `SetReclaimSupersededImages`, `SetRenderTargetInheritance`,
+`SetOpaqueAstcToBc1`, `SetBcGuestPalette` (palette function itself is ported, DecompressBCn does
+not use it). `SetAstcArrayRecompression` and `AstcRecompressionFor` are live. `AstcMask` exists
+but images always report `None` (needs Jadyx's `ASTC::ScanAlpha`). Still missing: `HostRowLayout`
+overloads of `CalculateHostUnswizzledSizeBytes` and `UnswizzleImage`, which D3D12's GPU unswizzle needs.
+The struct is declared.

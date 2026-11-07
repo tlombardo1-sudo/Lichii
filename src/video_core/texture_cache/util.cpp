@@ -9,6 +9,7 @@
 // A copy of the code can be obtained from https://github.com/Ryujinx/Ryujinx
 // The sections using code from Ryujinx are marked with a link to the original version
 
+#include <atomic>
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -602,6 +603,39 @@ u32 CalculateUnswizzledSizeBytes(const ImageInfo& info) noexcept {
     }
     const Extent2D tile_size = DefaultBlockSize(info.format);
     return NumBlocksPerLayer(info, tile_size) * info.resources.layers * BytesPerBlock(info.format);
+}
+
+namespace {
+std::atomic<bool> recompress_astc_arrays{true};
+std::atomic<bool> opaque_astc_to_bc1{false};
+} // namespace
+
+void SetAstcArrayRecompression(bool enabled) noexcept {
+    recompress_astc_arrays.store(enabled, std::memory_order_relaxed);
+}
+
+void SetOpaqueAstcToBc1(bool enabled) noexcept {
+    opaque_astc_to_bc1.store(enabled, std::memory_order_relaxed);
+}
+
+Settings::AstcRecompression AstcRecompressionFor(const ImageInfo& info) noexcept {
+    const bool is_array = info.resources.layers > 1 || info.size.depth > 1;
+    if (is_array && !recompress_astc_arrays.load(std::memory_order_relaxed)) {
+        return Settings::AstcRecompression::Uncompressed;
+    }
+    const Settings::AstcRecompression recompression = Settings::GetAstcRecompression();
+    if (recompression == Settings::AstcRecompression::Bc3 && info.astc_opaque) {
+        return Settings::AstcRecompression::Bc1;
+    }
+    return recompression;
+}
+
+AstcMask AstcAlphaMaskFor(const ImageInfo& info) noexcept {
+    if (info.astc_mask == AstcMask::None ||
+        AstcRecompressionFor(info) != Settings::AstcRecompression::Bc3) {
+        return AstcMask::None;
+    }
+    return info.astc_mask;
 }
 
 bool AstcDataLooksOpaque(std::span<const u8> data) noexcept {

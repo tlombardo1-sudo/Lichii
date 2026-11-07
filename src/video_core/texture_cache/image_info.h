@@ -14,6 +14,10 @@ namespace VideoCommon {
 using Tegra::Texture::TICEntry;
 using VideoCore::Surface::PixelFormat;
 
+/// ASTC with alpha whose RGB is all white or all black: only alpha needs keeping. Lichii has no
+/// scan for this yet, so images always report None.
+enum class AstcMask : u8 { None, White, Black };
+
 // Native descriptors address the selected view directly. The legacy NVN
 // layer-base bookkeeping is not an additional array prefix for this ABI.
 inline TICEntry TextureViewHeader(TICEntry entry, bool native) {
@@ -56,6 +60,7 @@ struct ImageInfo {
     bool is_sparse = false;
     // ASTC data whose blocks carry no alpha: re-compressed to BC1 instead of BC3 (half the size).
     bool astc_opaque = false;
+    AstcMask astc_mask = AstcMask::None;
 };
 
 } // namespace VideoCommon

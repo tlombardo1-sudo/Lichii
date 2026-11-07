@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <algorithm>
 #include <array>
 #include <span>
@@ -133,6 +134,53 @@ void DecompressBCn(std::span<const u8> input, std::span<u8> output, BufferImageC
     default:
         LOG_WARNING(HW_GPU, "Unimplemented BCn decompression {}", pixel_format);
     }
+}
+
+namespace {
+std::atomic<bool> bc_guest_palette{false};
+} // namespace
+
+void SetBcGuestPalette(bool enabled) noexcept {
+    bc_guest_palette.store(enabled, std::memory_order_relaxed);
+}
+
+bool GetBcGuestPalette() noexcept {
+    return bc_guest_palette.load(std::memory_order_relaxed);
+}
+
+std::array<std::array<u8, 4>, 4> GuestBc1Palette(const u8* block, bool four_colors) noexcept {
+    const int c0 = block[0] | (block[1] << 8);
+    const int c1 = block[2] | (block[3] << 8);
+    const int r0 = c0 >> 11, g0 = (c0 >> 5) & 63, b0 = c0 & 31;
+    const int r1 = c1 >> 11, g1 = (c1 >> 5) & 63, b1 = c1 & 31;
+    const auto expand5 = [](int v) { return (v << 3) | (v >> 2); };
+    const auto expand6 = [](int v) { return (v << 2) | (v >> 4); };
+    const int g0_8 = expand6(g0), g1_8 = expand6(g1);
+    const auto u8_of = [](int v) { return static_cast<u8>(v); };
+    std::array<std::array<u8, 4>, 4> palette{};
+    palette[0] = {u8_of(expand5(r0)), u8_of(g0_8), u8_of(expand5(b0)), 255};
+    palette[1] = {u8_of(expand5(r1)), u8_of(g1_8), u8_of(expand5(b1)), 255};
+    if (four_colors || c0 > c1) {
+        // Two thirds of a plus one third of b.
+        const auto third5 = [](int a, int b) { return ((2 * a + b) * 22) / 8; };
+        const auto third6 = [](int a, int b) {
+            const int diff = b - a;
+            return (256 * a + diff / 4 + 128 + diff * 80) / 256;
+        };
+        palette[2] = {u8_of(third5(r0, r1)), u8_of(third6(g0_8, g1_8)), u8_of(third5(b0, b1)),
+                      255};
+        palette[3] = {u8_of(third5(r1, r0)), u8_of(third6(g1_8, g0_8)), u8_of(third5(b1, b0)),
+                      255};
+    } else {
+        const auto half5 = [](int a, int b) { return ((a + b) * 33) / 8; };
+        const auto half6 = [](int a, int b) {
+            const int diff = b - a;
+            return (256 * a + diff / 4 + 128 + diff * 128) / 256;
+        };
+        palette[2] = {u8_of(half5(r0, r1)), u8_of(half6(g0_8, g1_8)), u8_of(half5(b0, b1)), 255};
+        palette[3] = {0, 0, 0, 0};
+    }
+    return palette;
 }
 
 } // namespace VideoCommon

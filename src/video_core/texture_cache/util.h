@@ -14,6 +14,7 @@
 
 #include "common/common_types.h"
 #include "common/scratch_buffer.h"
+#include "common/settings.h"
 
 #include "video_core/surface.h"
 #include "video_core/texture_cache/image_base.h"
@@ -35,6 +36,23 @@ struct OverlapResult {
 [[nodiscard]] u32 CalculateGuestSizeInBytes(const ImageInfo& info) noexcept;
 
 [[nodiscard]] u32 CalculateUnswizzledSizeBytes(const ImageInfo& info) noexcept;
+
+/// How a backend wants unswizzled rows laid out in its staging memory (D3D12: 256-byte rows,
+/// 512-byte subresources).
+struct HostRowLayout {
+    u32 row_alignment = 1;
+    u32 level_alignment = 1;
+};
+
+/// Keeps ASTC 2D arrays and 3D images decoded to RGBA8 even when astc_recompression asks for BC1/BC3.
+void SetAstcArrayRecompression(bool enabled) noexcept;
+
+/// Re-encodes opaque ASTC to BC1 instead of BC3 (stored; Lichii already does this via astc_opaque).
+void SetOpaqueAstcToBc1(bool enabled) noexcept;
+
+[[nodiscard]] AstcMask AstcAlphaMaskFor(const ImageInfo& info) noexcept;
+
+[[nodiscard]] Settings::AstcRecompression AstcRecompressionFor(const ImageInfo& info) noexcept;
 
 [[nodiscard]] u32 CalculateConvertedSizeBytes(const ImageInfo& info) noexcept;
 

@@ -55,6 +55,17 @@ struct ChannelState;
 
 namespace VideoCommon {
 
+// Policy toggles set by the UWP front end. Stored only so far: the texture cache does not yet
+// consult them (see docs/xbox/NX2_PORT_WORKLIST.md section 4).
+void SetRenderTargetEarlyOut(bool enabled) noexcept;
+[[nodiscard]] bool RenderTargetEarlyOut() noexcept;
+void SetMipRenderTargets(bool enabled) noexcept;
+[[nodiscard]] bool MipRenderTargets() noexcept;
+void SetReclaimSupersededImages(bool enabled) noexcept;
+[[nodiscard]] bool ReclaimSupersededImages() noexcept;
+void SetRenderTargetInheritance(bool enabled) noexcept;
+[[nodiscard]] bool RenderTargetInheritance() noexcept;
+
 using Tegra::Texture::TICEntry;
 using Tegra::Texture::TSCEntry;
 using VideoCore::Surface::PixelFormat;
