@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <numeric>
 #include <cstdlib>
 #include <limits>
@@ -137,6 +138,10 @@ void TextureCache<P>::RunGarbageCollector() {
     bool evict_old_costly = false;
     u64 ticks_to_destroy = 0;
     size_t num_iterations = 0;
+    size_t downloads_left = SIZE_MAX;
+    u64 time_budget_us = 0;
+    bool backend_policy = false;
+    auto gc_start = std::chrono::steady_clock::time_point{};
     const auto Configure = [&](bool allow_aggressive) {
         high_priority_mode = total_used_memory >= expected_memory;
         aggressive_mode = allow_aggressive && total_used_memory >= critical_memory;
@@ -148,10 +153,28 @@ void TextureCache<P>::RunGarbageCollector() {
         }();
         ticks_to_destroy = (std::max)(ticks_to_destroy, min_age);
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
+        if constexpr (requires { runtime.GetTextureGcPolicy(allow_aggressive); }) {
+            // A backend with its own pressure model (D3D12) sets the whole policy.
+            if (const auto policy = runtime.GetTextureGcPolicy(allow_aggressive)) {
+                backend_policy = true;
+                high_priority_mode = policy->high_priority;
+                aggressive_mode = policy->aggressive;
+                ticks_to_destroy = policy->min_age;
+                num_iterations = policy->iterations;
+                time_budget_us = policy->time_budget_us;
+                if (time_budget_us != 0 && gc_start == std::chrono::steady_clock::time_point{}) {
+                    gc_start = std::chrono::steady_clock::now();
+                }
+                downloads_left = policy->max_downloads;
+            }
+        }
     };
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
-                          &evict_old_costly](ImageId image_id) {
-        if (num_iterations == 0) {
+                          &evict_old_costly, &downloads_left, &time_budget_us, &backend_policy,
+                          &gc_start](ImageId image_id) {
+        if (num_iterations == 0 ||
+            (time_budget_us != 0 && std::chrono::steady_clock::now() - gc_start >=
+                                        std::chrono::microseconds{time_budget_us})) {
             return true;
         }
         --num_iterations;
@@ -164,12 +187,31 @@ void TextureCache<P>::RunGarbageCollector() {
             (!high_priority_mode && must_download)) {
             return false;
         }
+        if (must_download && downloads_left == 0) {
+            return false;
+        }
         if (must_download) {
-            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+            --downloads_left;
             const auto copies = FullDownloadCopies(image.info);
-            image.DownloadMemory(map, copies);
-            runtime.Finish();
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
+            if constexpr (requires(typename P::AsyncBuffer& map) {
+                              runtime.PrepareGcDownload(image, copies, map);
+                              runtime.CompleteGcDownload(image);
+                          }) {
+                // The backend reads the image back without a full GPU drain.
+                typename P::AsyncBuffer map{};
+                if (!runtime.PrepareGcDownload(image, copies, map)) {
+                    return false;
+                }
+                SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span,
+                             swizzle_data_buffer);
+                runtime.CompleteGcDownload(image);
+            } else {
+                auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+                image.DownloadMemory(map, copies);
+                runtime.Finish();
+                SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span,
+                             swizzle_data_buffer);
+            }
             ++gc_download_deletes;
         }
         if (True(image.flags & ImageFlagBits::Tracked)) {
@@ -178,10 +220,11 @@ void TextureCache<P>::RunGarbageCollector() {
         ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
         UnregisterImage(image_id);
         DeleteImage(image_id, image.scale_tick > frame_tick + 5);
-        if (aggressive_mode && total_used_memory < critical_memory) {
+        if (!backend_policy && aggressive_mode && total_used_memory < critical_memory) {
             num_iterations >>= 2;
             aggressive_mode = false;
-        } else if (high_priority_mode && total_used_memory < expected_memory) {
+        } else if (!backend_policy && high_priority_mode &&
+                   total_used_memory < expected_memory) {
             num_iterations >>= 1;
             high_priority_mode = false;
         }
@@ -248,10 +291,37 @@ void TextureCache<P>::RunGarbageCollector() {
         lru_cache.ForEachItemBelow(frame_tick - old_age, Cleanup);
         evict_old_costly = false;
     }
+    CompactSparseHeaps();
     Collect();
-    if (total_used_memory >= critical_memory) {
+    if (backend_policy || total_used_memory >= critical_memory) {
         Configure(true);
-        Collect();
+        if (aggressive_mode) {
+            Collect();
+        }
+    }
+}
+
+template <class P>
+void TextureCache<P>::CompactSparseHeaps() {
+    if constexpr (requires(Image& image) { runtime.RelocateImage(image); }) {
+        // Idle images in mostly free heaps move instead of being evicted, so heaps empty.
+        u64 budget = runtime.HeapCompactionBudget();
+        if (budget == 0) {
+            return;
+        }
+        lru_cache.ForEachItemBelow(frame_tick, [&](ImageId image_id) {
+            Image& image = slot_images[image_id];
+            if (True(image.flags & (ImageFlagBits::IsDecoding | ImageFlagBits::Rescaled))) {
+                return false;
+            }
+            if (!runtime.RelocateImage(image)) {
+                return false;
+            }
+            ReleaseImageViews(image);
+            const u64 bytes = ImageMemoryBytes(image);
+            budget = bytes >= budget ? 0 : budget - bytes;
+            return budget == 0;
+        });
     }
 }
 
@@ -2233,6 +2303,11 @@ void TextureCache<P>::InvalidateScale(Image& image) {
     if (image.scale_tick <= frame_tick) {
         image.scale_tick = frame_tick + 1;
     }
+    ReleaseImageViews(image);
+}
+
+template <class P>
+void TextureCache<P>::ReleaseImageViews(Image& image) {
     const std::span<const ImageViewId> image_view_ids = image.image_view_ids;
     auto& dirty = maxwell3d->dirty.flags;
     dirty[Dirty::RenderTargets] = true;

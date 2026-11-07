@@ -397,6 +397,9 @@ private:
     /// Runs the Garbage Collector.
     void RunGarbageCollector();
 
+    /// Moves idle images out of mostly free sparse heaps (backends with RelocateImage).
+    void CompactSparseHeaps();
+
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);
 
@@ -521,6 +524,9 @@ private:
 
     bool ImageCanRescale(ImageBase& image);
     void InvalidateScale(Image& image);
+
+    /// Drops the image's views from the render targets, descriptor tables and framebuffers.
+    void ReleaseImageViews(Image& image);
     bool ScaleUp(Image& image);
     bool ScaleDown(Image& image);
     u64 GetScaledImageSizeBytes(const ImageBase& image);

@@ -196,3 +196,15 @@ duplicate `ContentProviderUnion` definitions (Jadyx's `content_provider_union.cp
 overlaid while Lichii's `registered_cache.cpp` still defined them). Lichii's NCZ support is
 re-applied on top (`ContainerIsFullyBlockCompressed`, `.ncz` fallback in `GetNCAFromNSPForID`,
 `.nsz`/`.xcz` routing). Added `Settings::values.mod_priority`.
+
+### Section 4 addendum: texture-cache GC hooks
+
+Added to Lichii's own `RunGarbageCollector` (its memory-block ordering and costly-image rules are
+kept), all behind `requires` gates so Vulkan/GL are unchanged: `GetTextureGcPolicy` (backend sets
+aging, iteration count, time budget and download cap; the built-in pressure shrinking is off while
+it does), `PrepareGcDownload`/`CompleteGcDownload` (read-back without a full GPU drain), and
+`CompactSparseHeaps` via `RelocateImage`/`HeapCompactionBudget`. `ReleaseImageViews` was split out
+of `InvalidateScale`. Not ported: the sparse-only eviction pass (`HasSparseHeaps`/`InSparseHeap`),
+`BlitCanReplaceDestination` and the blit-discard upload skip (an optimization: needs a bool
+`BlitImage`, `RestoreBlitDestination` and the perf counters), and `TransferPoolBytes` (it only fed
+the removed checkpoint code). Section 4 is otherwise complete.
