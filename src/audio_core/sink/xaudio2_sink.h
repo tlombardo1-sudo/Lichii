@@ -34,10 +34,6 @@ public:
     void SetSystemVolume(f32 volume) override;
 
     bool IsAvailable() const noexcept;
-    // Coordinator-only, after parking ADSP and service producers. Stops workers and then the
-    // engine, including callbacks; preserves voice queues for a cancelled checkpoint.
-    void BeginCheckpoint();
-    void EndCheckpoint() noexcept;
     HRESULT FailureResult() const noexcept;
     IXAudio2* Engine() const noexcept;
     void LogPerformance(std::string_view stream_name, u64 submitted, u64 completed,
@@ -67,7 +63,6 @@ private:
     std::atomic<bool> failed{};
     EngineCallback engine_callback{failed};
     bool initialization_attempted{};
-    bool checkpoint_active{};
     bool callback_registered{};
     bool com_initialized{};
     unsigned long com_thread_id{};

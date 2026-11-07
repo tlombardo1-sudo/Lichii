@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "core/device_memory.h"
-#include "core/pulse_machine_state.h"
 #include "hle/kernel/board/nintendo/nx/k_system_control.h"
 #include "hle/kernel/k_trace.h"
 
@@ -34,16 +33,5 @@ DeviceMemory::DeviceMemory()
              VirtualReserveSize, GetFastmemRegion()} {}
 
 DeviceMemory::~DeviceMemory() = default;
-
-void DeviceMemory::ReadCheckpointMemory(const Pulse::PhysicalTransfer& transfer, u64 offset,
-                                        std::span<u8> output) const {
-    transfer.Read(std::span<const u8>{buffer.BackingBasePointer(), buffer.BackingSize()}, offset,
-                  output);
-}
-
-void DeviceMemory::WriteCheckpointMemory(const Pulse::PhysicalTransfer& transfer, u64 offset,
-                                         std::span<const u8> input) {
-    transfer.Write(std::span<u8>{buffer.BackingBasePointer(), buffer.BackingSize()}, offset, input);
-}
 
 } // namespace Core

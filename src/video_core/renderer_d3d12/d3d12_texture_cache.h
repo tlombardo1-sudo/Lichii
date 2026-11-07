@@ -96,19 +96,8 @@ public:
         return {D3D12_TEXTURE_DATA_PITCH_ALIGNMENT, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT};
     }
     StagingBufferRef DownloadStagingBuffer(size_t size, bool deferred = false);
-    void ReleaseCheckpointStaging() {
-        TrimCheckpointTransfers(0);
-        staging.ReleaseRetiredDownloads();
-    }
-    /// Frees the transfer buffers a capture's image copies went through once they pool more than
-    /// `keep` bytes; below that they are reused by the next image, which saves recreating them.
-    void TrimCheckpointTransfers(u64 keep = u64{16} << 20);
     [[nodiscard]] u64 TransferPoolBytes() const { return transfer_buffers.PooledBytes(); }
     void FreeDeferredStagingBuffer(StagingBufferRef& ref);
-    [[nodiscard]] bool CanCheckpointImage(
-        const Image& image, std::span<const VideoCommon::BufferImageCopy> copies) const;
-    [[nodiscard]] std::vector<u8> ReadCheckpointImage(
-        Image& image, std::span<const VideoCommon::BufferImageCopy> copies);
     /// Maintenance readback: false keeps the image until its copy fence completes. CPU-demand
     /// downloads retain their synchronous path. The returned map is pinned until CompleteGcDownload.
     bool PrepareGcDownload(Image& image, std::span<const VideoCommon::BufferImageCopy> copies,

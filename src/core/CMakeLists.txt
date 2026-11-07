@@ -52,10 +52,6 @@ add_library(core STATIC
     debugger/nx2_debug_tools.h
     device_memory.cpp
     device_memory.h
-    pulse_checkpoint.cpp
-    pulse_checkpoint.h
-    pulse_machine_state.h
-    pulse_process_state.h
     device_memory_manager.h
     device_memory_manager.inc
     file_sys/bis_factory.cpp
@@ -267,8 +263,6 @@ add_library(core STATIC
     hle/kernel/k_event_info.h
     hle/kernel/k_handle_table.cpp
     hle/kernel/k_handle_table.h
-    hle/kernel/pulse_handle_state.h
-    hle/kernel/pulse_process_layout.h
     hle/kernel/k_hardware_timer.cpp
     hle/kernel/k_hardware_timer.h
     hle/kernel/k_hardware_timer_base.h
@@ -348,9 +342,6 @@ add_library(core STATIC
     hle/kernel/k_thread_local_page.h
     hle/kernel/k_thread_queue.cpp
     hle/kernel/k_thread_queue.h
-    hle/kernel/pulse_wait_state.h
-    hle/kernel/pulse_wait_graph.h
-    hle/kernel/pulse_wait_graph.cpp
     hle/kernel/k_timer_task.h
     hle/kernel/k_trace.h
     hle/kernel/k_transfer_memory.cpp
@@ -419,7 +410,6 @@ add_library(core STATIC
     hle/service/acc/profile_manager.h
     hle/service/am/am.cpp
     hle/service/am/am.h
-    hle/service/am/am_pulse.h
     hle/service/am/am_results.h
     hle/service/am/am_types.h
     hle/service/am/applet.cpp
@@ -738,7 +728,6 @@ add_library(core STATIC
     hle/service/hid/xcd.cpp
     hle/service/hid/xcd.h
     hle/service/hle_ipc.cpp
-    hle/service/pulse_session_graph.h
     hle/service/hle_ipc.h
     hle/service/ipc_helpers.h
     hle/service/kernel_helpers.cpp

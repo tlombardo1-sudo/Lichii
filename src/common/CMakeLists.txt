@@ -44,12 +44,6 @@ add_library(
     guest_zero_census_scan.h
     memory_ceiling.cpp
     memory_ceiling.h
-    pulse_archive.cpp
-    pulse_archive.h
-    pulse_store.cpp
-    pulse_diagnostics.h
-    pulse_store.h
-    pulse_version.h
     concepts.h
     container_hash.h
     demangle.cpp
