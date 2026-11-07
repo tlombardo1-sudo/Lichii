@@ -168,3 +168,10 @@ but images always report `None` (needs Jadyx's `ASTC::ScanAlpha`). `HostRowLayou
 unchanged), `CalculateHostUnswizzledSizeBytes` exists, and `UnswizzleTexture` gained `linear_pitch`.
 Still open: texture_cache.h does not yet ask the runtime for a layout (Jadyx's
 `HostRowLayout` plumbing in its upload path).
+
+### Section 4 addendum: buffer-cache hooks
+
+Ported into shared `buffer_cache.h` as `if constexpr (requires ...)` calls (no-ops for Vulkan/GL):
+`SetInlineIndices`, `KeepVertexBufferReadable`, `UniformNeedsPadding`, `BindGuestUniformBuffer`,
+`UseWriteCombinedUniformCopy` (with `DeviceMemoryManager::ReadBlockUnsafeToWriteCombined`, which
+skips the translation-cache fast path). Immediate-release constants are still open.

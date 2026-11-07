@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/write_combined_copy.h"
 #include <atomic>
 #include <limits>
 #include <memory>
@@ -564,6 +565,30 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
         },
         [&](size_t copy_amount, const u8* const src_ptr) {
             std::memcpy(dest_pointer, src_ptr, copy_amount);
+        },
+        [&](const std::size_t copy_amount) {
+            dest_pointer = static_cast<u8*>(dest_pointer) + copy_amount;
+        });
+}
+
+template <typename Traits>
+void DeviceMemoryManager<Traits>::ReadBlockUnsafeToWriteCombined(DAddr address, void* dest_pointer,
+                                                                 size_t size) {
+    // The destination may be write-combined upload memory: only ever write it, in streaming copies.
+    WalkBlock(
+        address, size,
+        [&](size_t copy_amount, DAddr current_vaddr) {
+            static std::atomic<u32> reported{};
+            if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_ERROR(
+                    HW_Memory,
+                    "Unmapped Device ReadBlock @ {:#016x} (start address = {:#016x}, size = {})",
+                    current_vaddr, address, size);
+            }
+            std::memset(dest_pointer, 0, copy_amount);
+        },
+        [&](size_t copy_amount, const u8* const src_ptr) {
+            Common::CopyToWriteCombined(dest_pointer, src_ptr, copy_amount);
         },
         [&](const std::size_t copy_amount) {
             dest_pointer = static_cast<u8*>(dest_pointer) + copy_amount;

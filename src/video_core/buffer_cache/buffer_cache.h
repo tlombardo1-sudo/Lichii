@@ -938,6 +938,9 @@ void BufferCache<P>::BindHostIndexBuffer() {
             buffer.ImmediateUpload(0, draw_state.inline_index_draw_indexes);
         }
     }
+    if constexpr (requires { runtime.SetInlineIndices(draw_state.inline_index_draw_indexes); }) {
+        runtime.SetInlineIndices(draw_state.inline_index_draw_indexes);
+    }
     if constexpr (HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT) {
         const u32 new_offset = offset + draw_state.index_buffer.first * u32(draw_state.index_buffer.FormatSizeInBytes());
         runtime.BindIndexBuffer(buffer, new_offset, size);
@@ -1046,6 +1049,11 @@ void BufferCache<P>::BindHostVertexBuffers() {
             TouchBuffer(buffer, binding.buffer_id);
             SynchronizeBuffer(buffer, binding.device_addr, binding.size);
             if (!flags[Dirty::VertexBuffer0 + index]) {
+                // A backend with explicit resource states still needs the read barrier when a
+                // shader wrote the buffer since it was bound.
+                if constexpr (requires { runtime.KeepVertexBufferReadable(buffer); }) {
+                    runtime.KeepVertexBufferReadable(buffer);
+                }
                 flush_bindings();
                 continue;
             }
@@ -1177,8 +1185,15 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             return alignment > 1 && (offset % alignment) != 0;
         }
     }();
+    // A backend that binds the buffer with no bounds (D3D12 root CBVs) may need more than size
+    // bytes behind it; streaming pads them, while the cached buffer might end right there.
+    bool needs_padding = false;
+    if constexpr (requires { runtime.UniformNeedsPadding(size); }) {
+        needs_padding = runtime.UniformNeedsPadding(size);
+    }
     const bool use_fast_buffer = needs_alignment_stream
-        || (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size
+        || (has_host_buffer
+            && (size <= channel_state->uniform_buffer_skip_cache_size || needs_padding)
             && !memory_tracker.IsRegionGpuModified(device_addr, size));
     if (use_fast_buffer) {
         if constexpr (IS_OPENGL) {
@@ -1200,6 +1215,11 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         }
         channel_state->fast_bound_uniform_buffers[stage] |= 1u << binding_index;
         channel_state->uniform_buffer_binding_sizes[stage][binding_index] = size;
+        if constexpr (requires { runtime.BindGuestUniformBuffer(stage, index, device_addr, size); }) {
+            if (runtime.BindGuestUniformBuffer(stage, index, device_addr, size)) {
+                return;
+            }
+        }
         // Stream buffer path to avoid stalling on non-Nvidia drivers or Vulkan
         bool streamed = false;
         if constexpr (!IS_OPENGL && VideoCommon::StreamUniformReusable<Runtime>) {
@@ -1213,7 +1233,15 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         }
         if (!streamed) {
             const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
-            device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
+            if constexpr (requires { runtime.UseWriteCombinedUniformCopy(size); }) {
+                if (runtime.UseWriteCombinedUniformCopy(size)) {
+                    device_memory.ReadBlockUnsafeToWriteCombined(device_addr, span.data(), size);
+                } else {
+                    device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
+                }
+            } else {
+                device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
+            }
         }
         return;
     }
