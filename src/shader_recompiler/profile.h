@@ -117,6 +117,31 @@ struct Profile {
     bool SupportsSubgroupStage(Stage stage) const {
         return (supported_subgroup_stages & (1u << static_cast<u32>(stage))) != 0;
     }
+
+    // Added from Jadyx (D3D12 / spirv_to_dxil path).
+    /// Descriptor arrays consume one binding per element (D3D12 via spirv_to_dxil maps element i
+    /// of binding B to register B+i, so the next descriptor must start after the whole array)
+    bool descriptor_arrays_use_count{};
+    /// Flush fp32 denorms in every shader, as Maxwell does, instead of leaving shaders that do
+    /// not ask for it (or ask for both modes) to the driver's default
+    bool force_fp32_denorm_flush{};
+    /// Image views keep the image's format, so raw 32-bit loads have to pack what they return
+    bool repack_raw_image_loads{};
+    /// Loops whose exit also tests the loop safety counter hang the GPU (the Xbox Series D3D12
+    /// driver), so they are emitted without it
+    bool has_broken_loop_safety_counter{};
+    /// Quad operations may skip helper lanes (D3D12 before SM 6.7 leaves it to the driver), so
+    /// fragment quad shuffles travel through fine derivatives, which always include them
+    bool has_helperless_quad_shuffles{};
+    /// Lanes per wave (the maximum the host may use) when fragment shaders keep large guest local
+    /// memory in a storage buffer (local_memory_scratch.h); 0 keeps it in a private array.
+    u32 fragment_local_memory_scratch_lanes{};
+    /// Cube samples replace NaN direction components with 0 and an all-zero direction with +Z,
+    /// so they read a defined texel where the host would return undefined values.
+    bool sanitize_cube_directions{};
+    /// fp32 results of fp16 math lowered with FTZ/FMZ (FpControl::half_ftz) that are half
+    /// denormals become zero, keeping the sign. Only results are flushed, not inputs.
+    bool flush_lowered_fp16_denorms{};
 };
 
 } // namespace Shader

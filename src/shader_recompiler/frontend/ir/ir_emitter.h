@@ -118,6 +118,7 @@ public:
 
     [[nodiscard]] F32 RenderAreaWidth();
     [[nodiscard]] F32 RenderAreaHeight();
+    [[nodiscard]] F32 StageConstant(u32 index);
 
     [[nodiscard]] U32 LaneId();
 
@@ -290,6 +291,8 @@ public:
     [[nodiscard]] U32U64 GlobalAtomicOr(const U64& pointer_offset, const U32U64& value);
     [[nodiscard]] U32U64 GlobalAtomicXor(const U64& pointer_offset, const U32U64& value);
     [[nodiscard]] U32U64 GlobalAtomicExchange(const U64& pointer_offset, const U32U64& value);
+    [[nodiscard]] U32 GlobalAtomicCompareExchange(const U64& pointer_offset, const U32& compare,
+                                                  const U32& value);
 
     [[nodiscard]] F32 GlobalAtomicF32Add(const U64& pointer_offset, const Value& value,
                                          const FpControl control = {});
