@@ -242,3 +242,28 @@ Still open in section 5:
 - The SPIR-V backend does not emit `xfb_repeats`.
 - Whether Mesa's spirv_to_dxil accepts the Lichii-only capabilities (mesh shading, native passthrough)
   must be checked on the device: those stages should be rejected up front on D3D12.
+
+## Section 6 audit: D3D12 renderer against the merged shared code (structural, uncompiled)
+
+- Trait constants: every `P::` constant the shared texture/buffer/query cache templates read
+  (`ENABLE_VALIDATION`, `FRAMEBUFFER_BLITS`, `HAS_*`, `USE_MEMORY_MAPS*`, ...) exists in the D3D12
+  params structs.
+- Runtime members: the ungated ones the D3D12 runtime lacks are all inside TextureCache members
+  that only instantiate when called (`TemporalUpscale`, `ProbeGameDlssOutput`, `UploadLayers`'s
+  `AccelerateImageUploadLayers`) or behind `requires` (budget, pressure, `CurrentTick`, `IsFree`).
+  `BufferCache` members `BindFastUniformBuffer`/`PushFastUniformBuffer`, `BindHostUint8IndexBuffer`,
+  `IsVertexRepacked`, `PrefersSparseSources`, `PushMultiRangeSource`/`ResetMultiRange` and
+  `WaitSubmittedTick` are called without a `requires` gate and are the first places to expect
+  compile errors in `d3d12_buffer_cache.h`: either add them to `BufferCacheRuntime` or wrap the
+  call sites in `if constexpr (requires ...)` as done for the other hooks.
+- `RasterizerInterface`: no pure virtual is missing in `RasterizerD3D12`; the Lichii-only virtuals
+  (GPU-written command lists, DLSS probes, `PrepareRegionWrite`, `TryCacheInvalidation`,
+  `RegisterTransformFeedback`) have defaults.
+- `Settings::values.*` used by the merged trees all exist (the one hit, `pipeline_worker_count`,
+  is Android-only). Every source listed in the video_core, shader_recompiler, core, common,
+  audio_core and jadyx CMake files exists, and project includes resolve apart from generated
+  headers (`*_spv.h`, host shader headers) and third-party code.
+
+First compile on the Store toolchain is expected to turn up: the `BufferCacheRuntime` members
+above, `translate_program.cpp` passthrough lowering, `spirv_emit_context.cpp` leftovers, and
+whatever the Xbox-side `src/jadyx` app calls that was renamed in the nx2 code.
