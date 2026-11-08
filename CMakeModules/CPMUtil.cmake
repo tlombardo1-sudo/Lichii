@@ -1050,9 +1050,30 @@ function(AddCIPackage)
         set(sha512sum_file
             "${CMAKE_CURRENT_BINARY_DIR}/.cpmutil_${ARTIFACT}_sha512sum")
 
-        file(DOWNLOAD "${sha512sum_url}" "${sha512sum_file}"
-            STATUS sha512sum_status)
-        list(GET sha512sum_status 0 sha512sum_error)
+        # GitHub's release downloads fail now and then: retry, and keep a copy in the package
+        # cache to fall back on (the file only changes with ARTIFACT_VERSION).
+        set(sha512sum_cached
+            "${CPM_SOURCE_CACHE}/.sha512sums/${ARTIFACT}.sha512sum")
+        set(sha512sum_error 1)
+        foreach(sha512sum_attempt RANGE 1 5)
+            file(DOWNLOAD "${sha512sum_url}" "${sha512sum_file}"
+                STATUS sha512sum_status TIMEOUT 60)
+            list(GET sha512sum_status 0 sha512sum_error)
+            if(NOT sha512sum_error)
+                file(COPY_FILE "${sha512sum_file}" "${sha512sum_cached}"
+                    ONLY_IF_DIFFERENT)
+                break()
+            endif()
+            file(REMOVE "${sha512sum_file}")
+            if(EXISTS "${sha512sum_cached}")
+                message(STATUS "[CPMUtil] Using the cached sha512sum for ${ARTIFACT_NAME}")
+                file(COPY_FILE "${sha512sum_cached}" "${sha512sum_file}")
+                set(sha512sum_error 0)
+                break()
+            endif()
+            message(STATUS "[CPMUtil] sha512sum download failed (attempt ${sha512sum_attempt} of 5)")
+            execute_process(COMMAND "${CMAKE_COMMAND}" -E sleep 10)
+        endforeach()
 
         if(sha512sum_error)
             message(FATAL_ERROR "[CPMUtil] Failed to download sha512sum "
