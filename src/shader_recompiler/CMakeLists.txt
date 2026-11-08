@@ -30,6 +30,7 @@ add_library(shader_recompiler STATIC
     backend/spirv/emit_spirv_undefined.cpp
     backend/spirv/emit_spirv_warp.cpp
     backend/spirv/spirv_emit_context.cpp
+    backend/spirv/spirv_local_memory_scratch.cpp
     backend/spirv/spirv_emit_context.h
     environment.h
     exception.h
@@ -118,6 +119,7 @@ add_library(shader_recompiler STATIC
     frontend/maxwell/translate/impl/impl.h
     frontend/maxwell/translate/impl/integer_add.cpp
     frontend/maxwell/translate/impl/integer_byte_permute.cpp
+    frontend/maxwell/translate/impl/integer_multiply_add.cpp
     frontend/maxwell/translate/impl/integer_add_three_input.cpp
     frontend/maxwell/translate/impl/integer_compare.cpp
     frontend/maxwell/translate/impl/integer_compare_and_set.cpp
@@ -178,7 +180,14 @@ add_library(shader_recompiler STATIC
     ir_opt/conditional_barrier_pass.cpp
     ir_opt/constant_propagation_pass.cpp
     ir_opt/dead_code_elimination_pass.cpp
+    ir_opt/demote_return_pass.cpp
+    ir_opt/demote_return_pass.h
     ir_opt/dual_vertex_pass.cpp
+    ir_opt/mirror_border_pass.cpp
+    ir_opt/quad_shuffle_pass.cpp
+    ir_opt/vertex_fetch_pass.cpp
+    ir_opt/workgroup_split_pass.cpp
+    ir_opt/workgroup_split_pass.h
     ir_opt/geometry_compaction_pass.cpp
     ir_opt/global_memory_to_storage_buffer_pass.cpp
     ir_opt/identity_removal_pass.cpp
@@ -198,6 +207,9 @@ add_library(shader_recompiler STATIC
     profile.h
     program_header.h
     runtime_info.h
+    local_memory_scratch.h
+    tessellation_emulation.h
+    transform_feedback_storage.h
     shader_info.h
     varying_state.h)
 

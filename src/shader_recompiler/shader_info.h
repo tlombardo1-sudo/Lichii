@@ -236,6 +236,15 @@ struct TextureDescriptor {
 };
 using TextureDescriptors = boost::container::small_vector<TextureDescriptor, 12>;
 
+/// The layout behind a raw 32-bit image load, for hosts that cannot view the image as R32.
+enum class RawImageLoad : u8 {
+    None,
+    A8B8G8R8_UNORM,
+    B8G8R8A8_UNORM,
+    A2B10G10R10_UNORM,
+    A8B8G8R8_UINT,
+};
+
 struct ImageDescriptor {
     TextureType type;
     ImageFormat format;
@@ -246,6 +255,7 @@ struct ImageDescriptor {
     u32 cbuf_offset;
     u32 count;
     u32 size_shift;
+    RawImageLoad raw_load{};
     bool is_byte_addressed{};
     /// Index in Info::handle_programs when the handle is computed at draw time (read from a
     /// storage buffer), ~0 when it is the constant buffer word.
@@ -377,6 +387,22 @@ struct Info {
     /// and storage buffer words (see EvaluateHandleProgram), evaluated for each draw.
     std::vector<std::vector<u32>> handle_programs;
     ImageDescriptors image_descriptors;
+    /// Words of local memory the backend placed in the scratch pool (local_memory_scratch.h), 0
+    /// when it stays in a private array. Set by the SPIR-V backend.
+    u32 local_memory_scratch_words{};
+    /// Transform feedback buffers the shader writes as storage buffers (bit N: buffer N, see
+    /// transform_feedback_storage.h). Set by the SPIR-V backend.
+    u32 xfb_storage_buffers{};
+    // Global memory accesses that could not be mapped to a storage buffer and run through the
+    // slower NVN fallback functions: untracked by the pass, or with no trackable low address.
+    u32 global_memory_fallbacks{};
+    u32 global_memory_unresolved{};
+    /// A generated stage reads values the host sets per draw (Backend::SPIRV::STAGE_CONSTANTS_OFFSET)
+    bool uses_stage_constants{};
+    /// The fragment program discards by the polygon stipple pattern after the stage constants.
+    bool uses_polygon_stipple{};
+    /// The epilogue's logic op fetches the render target: a Texture2D after the stage's images.
+    bool uses_destination_read{};
 };
 
 template <typename Descriptors>

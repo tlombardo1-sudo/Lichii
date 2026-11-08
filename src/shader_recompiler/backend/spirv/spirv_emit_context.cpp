@@ -139,7 +139,11 @@ Id DefineInput(EmitContext& ctx, Id type, bool per_invocation,
     case Stage::TessellationControl:
     case Stage::TessellationEval:
         if (per_invocation) {
-            type = ctx.TypeArray(type, ctx.Const(32u));
+            // D3D12 takes the hull shader's input control point count from this array, and it
+            // must match the draw's patch size or the draw is dropped.
+            const bool sized{ctx.stage == Stage::TessellationControl &&
+                             ctx.runtime_info.patch_vertices != 0};
+            type = ctx.TypeArray(type, ctx.Const(sized ? ctx.runtime_info.patch_vertices : 32u));
         }
         break;
     case Stage::Geometry:
@@ -156,14 +160,42 @@ Id DefineInput(EmitContext& ctx, Id type, bool per_invocation,
 
 Id DefineOutput(EmitContext& ctx, Id type, std::optional<u32> invocations,
                 std::optional<spv::BuiltIn> builtin = std::nullopt,
-                std::optional<Id> initializer = std::nullopt) {
+                std::optional<Id> initializer = std::nullopt, bool preserve_passthrough = true) {
     if (invocations && ctx.stage == Stage::TessellationControl) {
         type = ctx.TypeArray(type, ctx.Const(*invocations));
     }
-    return DefineVariable(ctx, type, builtin, spv::StorageClass::Output, initializer);
+    const Id variable{DefineVariable(ctx, type, builtin, spv::StorageClass::Output, initializer)};
+    if (ctx.stage == Stage::Geometry && !ctx.uses_geometry_passthrough &&
+        ctx.geometry_passthrough_lowered && preserve_passthrough) {
+        ctx.passthrough_outputs.emplace_back(variable, type);
+    }
+    return variable;
 }
 
-void DefineGenericOutput(EmitContext& ctx, size_t index, std::optional<u32> invocations) {
+/// Whether a copy output captures the point size (DefineTransformFeedbackOutputs).
+bool CopiesPointSizeCapture(const EmitContext& ctx) {
+    const RuntimeInfo& runtime_info{ctx.runtime_info};
+    if (!runtime_info.xfb_copy_outputs || runtime_info.xfb_storage) {
+        return false;
+    }
+    static constexpr u32 attribute{static_cast<u32>(IR::Attribute::PointSize)};
+    return ctx.CapturedVarying(attribute) ||
+           std::ranges::any_of(runtime_info.xfb_repeats, [&](const TransformFeedbackRepeat& repeat) {
+               return repeat.attribute == attribute && ctx.Captures(repeat.varying);
+           });
+}
+
+void DecorateCapture(EmitContext& ctx, Id id, const TransformFeedbackVarying& varying) {
+    ctx.Decorate(id, spv::Decoration::XfbBuffer, varying.buffer);
+    ctx.Decorate(id, spv::Decoration::XfbStride, varying.stride);
+    ctx.Decorate(id, spv::Decoration::Offset, varying.offset);
+    if (ctx.stage == Stage::Geometry && varying.stream != 0) {
+        ctx.Decorate(id, spv::Decoration::Stream, varying.stream);
+    }
+}
+
+void DefineGenericOutput(EmitContext& ctx, size_t index, std::optional<u32> invocations,
+                         const VaryingState& passthrough) {
     static constexpr std::string_view swizzle{"xyzw"};
     const size_t base_attr_index{static_cast<size_t>(IR::Attribute::Generic0X) + index * 4};
     u32 element{0};
@@ -171,24 +203,40 @@ void DefineGenericOutput(EmitContext& ctx, size_t index, std::optional<u32> invo
         const u32 remainder{4 - element};
         const TransformFeedbackVarying* xfb_varying{};
         const size_t xfb_varying_index{base_attr_index + element};
-        if (xfb_varying_index < ctx.runtime_info.xfb_count) {
-            xfb_varying = &ctx.runtime_info.xfb_varyings[xfb_varying_index];
-            xfb_varying = xfb_varying->components > 0 ? xfb_varying : nullptr;
+        // Only captures decorated in place split outputs: storage transform feedback reads whole
+        // outputs at the epilogue, and copy outputs capture copies of them, but for the whole
+        // generics PlanInPlaceCaptures leaves in place.
+        const bool in_place{!ctx.runtime_info.xfb_storage &&
+                            (!ctx.runtime_info.xfb_copy_outputs ||
+                             ((ctx.xfb_in_place_generics >> index) & 1) != 0)};
+        if (in_place) {
+            xfb_varying = ctx.CapturedVarying(xfb_varying_index);
         }
-        const u32 num_components{xfb_varying ? xfb_varying->components : remainder};
+        u32 num_components{remainder};
+        if (xfb_varying) {
+            num_components = xfb_varying->components;
+        } else if (in_place) {
+            // Stop before the next captured component, so that it gets an output of its own.
+            for (u32 next = element + 1; next < 4; ++next) {
+                if (ctx.CapturedVarying(base_attr_index + next)) {
+                    num_components = next - element;
+                    break;
+                }
+            }
+        }
 
-        const Id id{DefineOutput(ctx, ctx.F32[num_components], invocations)};
+        bool preserve_passthrough{};
+        for (u32 component = element; component < element + num_components; ++component) {
+            preserve_passthrough |= !passthrough.Generic(index, component);
+        }
+        const Id id{DefineOutput(ctx, ctx.F32[num_components], invocations, {}, {},
+                                 preserve_passthrough)};
         ctx.Decorate(id, spv::Decoration::Location, static_cast<u32>(index));
         if (element > 0) {
             ctx.Decorate(id, spv::Decoration::Component, element);
         }
         if (xfb_varying) {
-            ctx.Decorate(id, spv::Decoration::XfbBuffer, xfb_varying->buffer);
-            ctx.Decorate(id, spv::Decoration::XfbStride, xfb_varying->stride);
-            ctx.Decorate(id, spv::Decoration::Offset, xfb_varying->offset);
-            if (ctx.stage == Stage::Geometry && xfb_varying->stream != 0) {
-                ctx.Decorate(id, spv::Decoration::Stream, xfb_varying->stream);
-            }
+            DecorateCapture(ctx, id, *xfb_varying);
         }
         if (num_components < 4 || element > 0) {
             const std::string_view subswizzle{swizzle.substr(element, num_components)};
@@ -706,7 +754,9 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
       stage{program.stage}, texture_rescaling_index{bindings.texture_scaling_index},
       image_rescaling_index{bindings.image_scaling_index} {
     geometry_passthrough_lowered = program.geometry_passthrough_lowered;
-    uses_geometry_passthrough = program.UsesNativeGeometryPassthrough();
+    // Without the extension the passthrough is emitted as ordinary vertices, as before.
+    uses_geometry_passthrough =
+        program.UsesNativeGeometryPassthrough() && profile.support_geometry_shader_passthrough;
     if (program.is_geometry_passthrough) {
         const bool matching_topology =
             (runtime_info.input_topology == InputTopology::Points &&
@@ -722,9 +772,6 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
             throw NotImplementedException("Native geometry passthrough requires one invocation");
         }
     }
-    if (uses_geometry_passthrough && !profile.support_geometry_shader_passthrough) {
-        throw LogicError("Geometry passthrough requires frontend lowering for this profile");
-    }
     const bool is_unified{profile.unified_descriptor_binding};
     u32& uniform_binding{is_unified ? bindings.unified : bindings.uniform_buffer};
     u32& storage_binding{is_unified ? bindings.unified : bindings.storage_buffer};
@@ -735,6 +782,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineCommonConstants();
     DefineInterfaces(program);
     DefineMesh(program);
+    DefineTransformFeedbackStorage(program);
     DefineLocalMemory(program);
     DefineSharedMemory(program);
     DefineSharedMemoryFunctions(program);
@@ -961,7 +1009,7 @@ void EmitContext::DefineTessellationEmulation() {
                                          spv::StorageClass::Input);
 }
 
-void EmitContext::DefineLocalMemory(const IR::Program& program) {
+void EmitContext::DefineLocalMemory(IR::Program& program) {
     if (program.local_memory_size == 0) {
         return;
     }
@@ -1251,11 +1299,43 @@ void EmitContext::DefineAttributeMemAccess(const Info& info) {
                 ++label_index;
                 continue;
             }
-            const Id pointer{
-                is_array ? OpAccessChain(generic.pointer_type, generic_id, vertex, masked_index)
-                         : OpAccessChain(generic.pointer_type, generic_id, masked_index)};
-            const Id value{OpLoad(generic.component_type, pointer)};
-            const Id result{[this, generic, value]() {
+            const Id value{[&] {
+                if (generic.parts > 1) {
+                    // Only a vertex input is fetched in parts. Dynamic component reads assemble
+                    // the same vector as the ordinary input; constant reads load just one part.
+                    const u32 per_part{generic.part_components};
+                    const Id vec4{TypeVector(generic.component_type, 4)};
+                    std::array<Id, 4> parts{};
+                    std::array<Id, 4> components{};
+                    for (u32 i = 0; i < 4; ++i) {
+                        const u32 part = i / per_part;
+                        if (part >= generic.parts) {
+                            // Past the host format: what the first part has there (its default).
+                            components[i] =
+                                OpCompositeExtract(generic.component_type, parts[0], i);
+                            continue;
+                        }
+                        if (i % per_part == 0) {
+                            parts[part] = OpLoad(
+                                vec4, part == 0 ? generic.id : generic.more_parts[part - 1]);
+                        }
+                        components[i] =
+                            OpCompositeExtract(generic.component_type, parts[part], i % per_part);
+                    }
+                    const Id joined{OpCompositeConstruct(vec4, components[0], components[1],
+                                                         components[2], components[3])};
+                    return OpVectorExtractDynamic(generic.component_type, joined, masked_index);
+                }
+                // Packed SNORM 10:10:10:2 keeps all four fields in the first component.
+                const Id load_index{generic.load_op == InputGenericLoadOp::SNormA2B10G10R10
+                                        ? u32_zero_value
+                                        : masked_index};
+                const Id pointer{
+                    is_array ? OpAccessChain(generic.pointer_type, generic_id, vertex, load_index)
+                             : OpAccessChain(generic.pointer_type, generic_id, load_index)};
+                return OpLoad(generic.component_type, pointer);
+            }()};
+            const Id result{[this, generic, value, masked_index]() {
                 switch (generic.load_op) {
                 case InputGenericLoadOp::SNormA2B10G10R10:
                     return UnpackSNormA2B10G10R10(value, masked_index);
@@ -1269,7 +1349,18 @@ void EmitContext::DefineAttributeMemAccess(const Info& info) {
                     return value;
                 };
             }()};
-            OpReturnValue(result);
+            if (generic.components < 4) {
+                // Components past the guest format's read as 0, 0, 0, 1 (see EmitGetAttribute).
+                const Id one{generic.load_op == InputGenericLoadOp::Bitcast
+                                 ? OpBitcast(F32[1], Const(1U))
+                                 : Const(1.0f)};
+                const Id fallback{OpSelect(F32[1], OpIEqual(U1, masked_index, Const(3U)), one,
+                                           Const(0.0f))};
+                const Id missing{OpUGreaterThanEqual(U1, masked_index, Const(generic.components))};
+                OpReturnValue(OpSelect(F32[1], missing, fallback, result));
+            } else {
+                OpReturnValue(result);
+            }
             ++label_index;
         }
         AddLabel(end_block);
@@ -2025,7 +2116,7 @@ void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_in
         if (profile.supported_spirv >= 0x00010400) {
             interfaces.push_back(id);
         }
-        ++binding;
+        binding += profile.descriptor_arrays_use_count ? desc.count : 1;
         ++scaling_index;
     }
     if (info.uses_atomic_image_u32) {
@@ -2062,32 +2153,9 @@ void EmitContext::DefineImages(const Info& info, u32& binding, u32& scaling_inde
     }
 }
 
-void EmitContext::DefineInputs(const IR::Program& program) {
-    const Info& info{program.info};
-    const VaryingState& loads{info.loads};
-
-    if (info.uses_workgroup_id) {
-        workgroup_id = DefineInput(*this, U32[3], false, spv::BuiltIn::WorkgroupId);
-    }
-    if (info.uses_local_invocation_id) {
-        local_invocation_id = DefineInput(*this, U32[3], false, spv::BuiltIn::LocalInvocationId);
-    }
-    if (info.uses_invocation_id) {
-        invocation_id = DefineInput(*this, U32[1], false, spv::BuiltIn::InvocationId);
-    }
-    if (info.uses_invocation_info &&
-        (stage == Shader::Stage::TessellationControl || stage == Shader::Stage::TessellationEval)) {
-        patch_vertices_in = DefineInput(*this, U32[1], false, spv::BuiltIn::PatchVertices);
-    }
-    if (info.uses_sample_id) {
-        sample_id = DefineInput(*this, U32[1], false, spv::BuiltIn::SampleId);
-        if (stage == Stage::Fragment) {
-            Decorate(sample_id, spv::Decoration::Flat);
-        }
-    }
-    if (info.uses_is_helper_invocation) {
-        is_helper_invocation = DefineInput(*this, U1, false, spv::BuiltIn::HelperInvocation);
-    }
+/// The subgroup built-ins and FSWZADD tables the warp instructions read, which do not depend on
+/// the stage's interface.
+void EmitContext::DefineSubgroupInputs(const Info& info) {
     if (info.uses_subgroup_mask && profile.SupportsSubgroupStage(stage)) {
         subgroup_mask_eq = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupEqMaskKHR);
         subgroup_mask_lt = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupLtMaskKHR);
@@ -2167,7 +2235,15 @@ void EmitContext::DefineInputs(const IR::Program& program) {
     }
     // Quad shuffles through derivatives find their quad lane from the window position.
     if (loads.AnyComponent(IR::Attribute::PositionX) ||
-        info.passthrough.AnyComponent(IR::Attribute::PositionX)) {
+        (stage == Stage::Fragment && runtime_info.lower_noperspective_mask != 0) ||
+        (stage == Stage::Fragment && runtime_info.polygon_stipple) ||
+        (stage == Stage::Fragment && runtime_info.logic_op_enable) ||
+        (stage == Stage::Fragment && runtime_info.alpha_to_coverage_footprint == 2) ||
+        (stage == Stage::Fragment && runtime_info.sample_mask_footprint != 0) ||
+        (stage == Stage::Fragment && runtime_info.depth_bias_in_shader &&
+         !info.stores_frag_depth) ||
+        (stage == Stage::Fragment && info.uses_quad_shuffles &&
+         profile.has_helperless_quad_shuffles)) {
         const bool is_fragment{stage == Stage::Fragment};
         if (!is_fragment && profile.has_broken_spirv_position_input) {
             need_input_position_indirect = true;
@@ -2183,7 +2259,7 @@ void EmitContext::DefineInputs(const IR::Program& program) {
                                                     : spv::BuiltIn::Position};
             input_position = DefineInput(*this, F32[4], true, built_in);
 
-            if (profile.support_geometry_shader_passthrough) {
+            if (uses_geometry_passthrough) {
                 if (info.passthrough.AnyComponent(IR::Attribute::PositionX)) {
                     Decorate(input_position, spv::Decoration::PassthroughNV);
                 }
@@ -2269,7 +2345,7 @@ void EmitContext::DefineInputs(const IR::Program& program) {
             }
         }
 
-        if (info.passthrough.Generic(index) && profile.support_geometry_shader_passthrough) {
+        if (info.passthrough.Generic(index) && uses_geometry_passthrough) {
             Decorate(id, spv::Decoration::PassthroughNV);
         }
         if (stage != Stage::Fragment) {
@@ -2294,7 +2370,9 @@ void EmitContext::DefineInputs(const IR::Program& program) {
             case Interpolation::Smooth:
                 break;
             case Interpolation::NoPerspective:
-                Decorate(id, spv::Decoration::NoPerspective);
+                if ((runtime_info.lower_noperspective_mask & (1U << index)) == 0) {
+                    Decorate(id, spv::Decoration::NoPerspective);
+                }
                 break;
             case Interpolation::Flat:
                 Decorate(id, spv::Decoration::Flat);
@@ -2432,13 +2510,25 @@ void EmitContext::DefineOutputs(const IR::Program& program) {
     const std::optional<u32> invocations{program.invocations};
     if (runtime_info.convert_depth_mode || info.stores.AnyComponent(IR::Attribute::PositionX) ||
         stage == Stage::VertexB) {
-        output_position = DefineOutput(*this, F32[4], invocations, spv::BuiltIn::Position);
+        output_position = DefineOutput(*this, F32[4], invocations, spv::BuiltIn::Position, {},
+                                       !info.passthrough.AllComponents(IR::Attribute::PositionX));
     }
     if (info.stores[IR::Attribute::PointSize] || runtime_info.fixed_state_point_size) {
         if (stage == Stage::Fragment) {
             throw NotImplementedException("Storing PointSize in fragment stage");
         }
-        output_point_size = DefineOutput(*this, F32[1], invocations, spv::BuiltIn::PointSize);
+        if (CopiesPointSizeCapture(*this)) {
+            // The host drops the built-in (D3D12 has no point size) and reads it back as 1, so
+            // the value the copy captures lives in a private variable.
+            output_point_size = AddGlobalVariable(TypePointer(spv::StorageClass::Private, F32[1]),
+                                                  spv::StorageClass::Private);
+            Name(output_point_size, "point_size");
+            if (profile.supported_spirv >= 0x00010400) {
+                interfaces.push_back(output_point_size);
+            }
+        } else {
+            output_point_size = DefineOutput(*this, F32[1], invocations, spv::BuiltIn::PointSize);
+        }
     }
     if (info.stores.ClipDistances()) {
         if (stage == Stage::Fragment) {
@@ -2476,7 +2566,7 @@ void EmitContext::DefineOutputs(const IR::Program& program) {
     xfb_in_place_generics = PlanInPlaceCaptures(*this, info);
     for (size_t index = 0; index < IR::NUM_GENERICS; ++index) {
         if (info.stores.Generic(index)) {
-            DefineGenericOutput(*this, index, invocations);
+            DefineGenericOutput(*this, index, invocations, info.passthrough);
         }
     }
     DefineTransformFeedbackOutputs(*this, info, invocations);
@@ -2523,11 +2613,25 @@ void EmitContext::DefineOutputs(const IR::Program& program) {
                 Name(frag_color[index], fmt::format("frag_color{}", index));
             }
         }
-        if (info.stores_frag_depth) {
+        // The hardware tests the alpha the shader wrote, not the one rounded for the target.
+        if (Sirit::ValidId(frag_color[0]) && (runtime_info.unorm8_output_mask & 1) != 0 &&
+            runtime_info.color_output_types[0] == AttributeType::Float &&
+            ((runtime_info.alpha_test_func &&
+              *runtime_info.alpha_test_func != CompareFunction::Always) ||
+             runtime_info.alpha_to_coverage_footprint != 0)) {
+            frag_alpha_unrounded = AddGlobalVariable(
+                TypePointer(spv::StorageClass::Private, F32[1]), spv::StorageClass::Private);
+            Name(frag_alpha_unrounded, "frag_alpha_unrounded");
+            if (profile.supported_spirv >= 0x00010400) {
+                interfaces.push_back(frag_alpha_unrounded);
+            }
+        }
+        shader_depth_bias = runtime_info.depth_bias_in_shader && !info.stores_frag_depth;
+        if (info.stores_frag_depth || shader_depth_bias) {
             frag_depth = DefineOutput(*this, F32[1], std::nullopt);
             Decorate(frag_depth, spv::Decoration::BuiltIn, spv::BuiltIn::FragDepth);
         }
-        if (info.stores_sample_mask) {
+        if (info.stores_sample_mask || runtime_info.sample_mask_footprint != 0) {
             const Id array_type{TypeArray(U32[1], Const(1U))};
             sample_mask = DefineOutput(*this, array_type, std::nullopt);
             Decorate(sample_mask, spv::Decoration::BuiltIn, spv::BuiltIn::SampleMask);

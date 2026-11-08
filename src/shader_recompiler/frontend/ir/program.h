@@ -27,6 +27,13 @@ struct Program {
     u32 local_memory_size{};
     u32 shared_memory_size{};
     bool is_geometry_passthrough{};
+    // The guest passthrough has already been expanded into ordinary vertex emission (D3D12).
+    bool geometry_passthrough_lowered{};
+
+    [[nodiscard]] bool UsesNativeGeometryPassthrough() const noexcept {
+        return is_geometry_passthrough && !geometry_passthrough_lowered;
+    }
+
     MeshInfo mesh{};
 };
 

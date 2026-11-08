@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <string>
 #include "common/container/unordered_map.h"
 
 #include "common/common_types.h"
@@ -106,6 +107,11 @@ public:
     [[nodiscard]] virtual bool HasHLEMacroState() const = 0;
 
     [[nodiscard]] virtual bool HasNativeInstructions() const { return false; }
+
+    /// Where the shader's code came from, for a log of a shader that failed to build.
+    [[nodiscard]] virtual std::string DescribeCode() const {
+        return "code from the disk cache";
+    }
 
     [[nodiscard]] virtual std::optional<ReplaceConstant> GetReplaceConstBuffer(u32 bank,
                                                                                u32 offset) = 0;
