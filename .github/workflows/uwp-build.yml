@@ -248,8 +248,8 @@ jobs:
           retention-days: 7
 
   # A sideloadable test package, signed with a throw-away self-signed certificate made here. It
-  # installs on a console in Dev Mode after the .cer is uploaded next to it, but cannot update a
-  # package signed by another certificate (uninstall that one first).
+  # installs on a console in Dev Mode after the .cer is uploaded. It is the Canary identity
+  # (Jadyx.Canary, tile "Jadyx Canary"), so it never replaces an installed Jadyx.
   package:
     name: appx (self-signed test package)
     needs: [build, mesa]
@@ -285,7 +285,8 @@ jobs:
           Export-PfxCertificate -Cert $cert -FilePath $pfx `
               -Password (ConvertTo-SecureString $password -AsPlainText -Force) | Out-Null
           $env:JADYX_PFX_PASSWORD = $password
-          $params = @{ Library = $true; PfxPath = $pfx }
+          # Canary: identity Jadyx.Canary, so it installs next to Jadyx with its own app data.
+          $params = @{ Library = $true; Canary = $true; PfxPath = $pfx }
           $dll = Join-Path $env:RUNNER_TEMP "mesa\spirv_to_dxil.dll"
           if (Test-Path $dll) { $params.SpirvToDxil = $dll } else { Write-Warning "No spirv_to_dxil.dll: the package presents through the CPU path" }
           try { & tools\xbox\package-appx.ps1 @params } finally { Remove-Item $pfx -Force }
