@@ -51,22 +51,37 @@ jobs:
         shell: powershell
         run: |
           $zip = Join-Path $env:RUNNER_TEMP "glslang.zip"
-          # GitHub's release CDN returns the odd 504; retry before giving up.
-          for ($attempt = 1; $attempt -le 5; $attempt++) {
+          $url = "https://github.com/KhronosGroup/glslang/releases/download/16.6.0/glslang-16.6.0-windows-x86_64-release.zip"
+          $ok = $false
+          # GitHub's release CDN sometimes returns 504 for minutes; retry, then fall back.
+          for ($attempt = 1; $attempt -le 4 -and -not $ok; $attempt++) {
               try {
-                  Invoke-WebRequest "https://github.com/KhronosGroup/glslang/releases/download/16.6.0/glslang-16.6.0-windows-x86_64-release.zip" -OutFile $zip
-                  break
+                  Invoke-WebRequest $url -OutFile $zip
+                  if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne "82BF434E69B9BB4829DE7E2B4BC2C5E7A7861E53D66CF75E5CC70F5F694A8D9B") {
+                      throw "glslang checksum mismatch"
+                  }
+                  $ok = $true
               } catch {
-                  if ($attempt -eq 5) { throw }
-                  Write-Host "Download failed ($($_.Exception.Message)); retrying in $($attempt * 10)s"
-                  Start-Sleep -Seconds ($attempt * 10)
+                  Write-Host "glslang download failed ($($_.Exception.Message)); attempt $attempt of 4"
+                  if ($attempt -lt 4) { Start-Sleep -Seconds ($attempt * 15) }
               }
           }
-          if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne "82BF434E69B9BB4829DE7E2B4BC2C5E7A7861E53D66CF75E5CC70F5F694A8D9B") {
-              throw "glslang checksum mismatch"
+          New-Item -ItemType Directory -Force C:\glslang\bin | Out-Null
+          if ($ok) {
+              Expand-Archive $zip C:\glslang -Force
+              Copy-Item C:\glslang\bin\glslang.exe C:\glslang\bin\glslangValidator.exe
+          } else {
+              Write-Host "Falling back to the Vulkan SDK's glslangValidator"
+              $validator = $null
+              if ($env:VULKAN_SDK) { $validator = Join-Path $env:VULKAN_SDK "Bin\glslangValidator.exe" }
+              if (-not $validator -or -not (Test-Path $validator)) {
+                  choco install vulkan-sdk -y --no-progress
+                  $sdk = Get-ChildItem C:\VulkanSDK -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
+                  if ($sdk) { $validator = Join-Path $sdk.FullName "Bin\glslangValidator.exe" }
+              }
+              if (-not $validator -or -not (Test-Path $validator)) { throw "No glslangValidator available" }
+              Copy-Item $validator C:\glslang\bin\glslangValidator.exe
           }
-          Expand-Archive $zip C:\glslang -Force
-          Copy-Item C:\glslang\bin\glslang.exe C:\glslang\bin\glslangValidator.exe
           if (-not (Test-Path "C:\Program Files\NASM\nasm.exe")) { choco install nasm -y --no-progress }
           if (-not (Get-Command jom -ErrorAction SilentlyContinue)) { choco install jom -y --no-progress }
           if (-not (Test-Path "C:\Strawberry\perl\bin\perl.exe")) { throw "Strawberry Perl is missing from the runner" }
