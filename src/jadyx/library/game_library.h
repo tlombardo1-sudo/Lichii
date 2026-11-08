@@ -72,7 +72,7 @@ inline LibraryScan ScanGameLibrary(const std::filesystem::path& root,
         auto ext = it->path().extension().string();
         std::transform(ext.begin(), ext.end(), ext.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (ext != ".nsp" && ext != ".xci" && ext != ".nro") continue;
+        if (ext != ".nsp" && ext != ".xci" && ext != ".nro" && ext != ".nsz" && ext != ".xcz") continue;
         result.entries.push_back({it->path().lexically_relative(root),
                                   it->path().stem().wstring()});
     }
