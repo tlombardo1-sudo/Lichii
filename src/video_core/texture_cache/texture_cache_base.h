@@ -175,14 +175,14 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     /// The most device memory the collector lets the cache fill before it collects in earnest,
     /// on every GPU (ApplyThresholdOverrides).
     static constexpr u64 MaxCriticalMemory = 5_GiB;
+    static constexpr size_t GC_EMERGENCY_COUNTS = 2;
+
+    using Runtime = typename P::Runtime;
 
     /// Runtimes without the temporal upscale / game DLSS hooks (the D3D12 one) skip those paths.
     static constexpr bool HAS_TEMPORAL_UPSCALE = requires(Runtime& runtime) {
         runtime.WantsTemporalUpscaleDepth();
     };
-    static constexpr size_t GC_EMERGENCY_COUNTS = 2;
-
-    using Runtime = typename P::Runtime;
     using Image = typename P::Image;
     using ImageAlloc = typename P::ImageAlloc;
     using ImageView = typename P::ImageView;

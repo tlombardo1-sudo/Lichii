@@ -290,7 +290,10 @@ std::optional<IR::Reg> LowerViewportMask(const IR::Program& program) {
     return reg;
 }
 
-void LowerGeometryPassthrough(const IR::Program& program, const HostTranslateInfo& host_info) {
+void LowerGeometryPassthrough(IR::Program& program, const HostTranslateInfo& host_info) {
+    if (program.geometry_passthrough_lowered) {
+        return;
+    }
     std::optional<IR::Reg> viewport_mask_reg;
     if (!host_info.support_viewport_mask) {
         viewport_mask_reg = LowerViewportMask(program);
@@ -307,6 +310,7 @@ void LowerGeometryPassthrough(const IR::Program& program, const HostTranslateInf
             }
         }
     }
+    program.geometry_passthrough_lowered = true;
 }
 
 // The lines of a 32-element group in a mesh program's stage buffer: one per attribute an output
@@ -331,7 +335,6 @@ void AddMeshLines(const ProgramHeader& sph, boost::container::static_vector<u32,
             }
         }
     }
-    program.geometry_passthrough_lowered = true;
 }
 
 void TightenOutputVertices(IR::Program& program) {
