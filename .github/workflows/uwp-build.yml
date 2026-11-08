@@ -108,14 +108,23 @@ jobs:
           path: build-uwp/_deps/openssl-build
           key: openssl-uwp-${{ steps.tools.outputs.image }}-${{ hashFiles('cpmfile.json', 'CMakePresets.json', 'CMakeLists.txt', 'CMakeModules/**') }}
 
+      # The compiler cache only speeds rebuilds; a failed download (GitHub's release CDN 504s at
+      # times) must not fail the build, which then runs without it.
       - uses: mozilla-actions/sccache-action@v0.0.9
+        continue-on-error: true
         with:
           disable_annotations: true
 
       - name: Configure
         shell: pwsh
         run: |
-          cmd /c "tools\xbox\build-env.bat cmake --preset uwp-x64 -DUSE_CCACHE=ON -DCCACHE_BINARY=sccache -DCMAKE_POLICY_DEFAULT_CMP0141=NEW -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded" 2>&1 | Tee-Object configure.log
+          $cache = ""
+          if (Get-Command sccache -ErrorAction SilentlyContinue) {
+              $cache = "-DUSE_CCACHE=ON -DCCACHE_BINARY=sccache -DCMAKE_POLICY_DEFAULT_CMP0141=NEW -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded"
+          } else {
+              Write-Host "sccache is not available: building without the compiler cache"
+          }
+          cmd /c "tools\xbox\build-env.bat cmake --preset uwp-x64 $cache" 2>&1 | Tee-Object configure.log
           exit $LASTEXITCODE
 
       # -k 0 makes Ninja keep going past failures so one run reports every compile error.
