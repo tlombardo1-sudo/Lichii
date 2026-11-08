@@ -125,6 +125,9 @@ public:
     u64 CurrentTick();
     bool IsFree(u64 tick);
     void Wait(u64 tick);
+    /// Waits for the copy at tick; the D3D12 scheduler has no deferred submission, so this waits
+    /// for the list to finish (conservative, always correct).
+    void WaitSubmittedTick(u64 tick);
     void Finish();
     u64 GetDeviceLocalMemory() const;
     u64 GetDeviceMemoryUsage() const;

@@ -266,6 +266,7 @@ void BufferCacheRuntime::Finish() { scheduler.Finish(); }
 u64 BufferCacheRuntime::CurrentTick() { return scheduler.CurrentTick(); }
 bool BufferCacheRuntime::IsFree(u64 tick) { return scheduler.IsFree(tick); }
 void BufferCacheRuntime::Wait(u64 tick) { scheduler.Wait(tick); }
+void BufferCacheRuntime::WaitSubmittedTick(u64 tick) { scheduler.Wait(tick); }
 u64 BufferCacheRuntime::GetDeviceLocalMemory() const {
     const u64 budget = device.CacheMemoryBudget();
     return budget != 0 ? budget : 4ULL * 1024 * 1024 * 1024;
