@@ -213,3 +213,93 @@ jobs:
             build-uwp/bin/jadyx.exe
             build-uwp/bin/jadyx.pdb
             build-uwp/bin/*.dll
+
+  # Mesa's SPIR-V -> DXIL translator for the D3D12 renderer. Cached on its inputs. A failure here
+  # does not stop the package: the renderer then presents through its CPU fallback.
+  mesa:
+    name: spirv_to_dxil
+    runs-on: windows-2025
+    timeout-minutes: 90
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore the built DLL
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: mesa-out
+          key: spirv-to-dxil-${{ hashFiles('tools/xbox/build-spirv-to-dxil.ps1', 'tools/xbox/mesa/**', 'externals/spirv-to-dxil/include/**') }}
+
+      - name: Build spirv_to_dxil.dll
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: powershell
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP "mesa-build"
+          & tools\xbox\build-spirv-to-dxil.ps1 -WorkDir $work
+          New-Item -ItemType Directory -Force mesa-out | Out-Null
+          Copy-Item (Join-Path $work "build-uwp\src\microsoft\spirv_to_dxil\spirv_to_dxil.dll") mesa-out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spirv-to-dxil
+          path: mesa-out/spirv_to_dxil.dll
+          if-no-files-found: error
+          retention-days: 7
+
+  # A sideloadable test package, signed with a throw-away self-signed certificate made here. It
+  # installs on a console in Dev Mode after the .cer is uploaded next to it, but cannot update a
+  # package signed by another certificate (uninstall that one first).
+  package:
+    name: appx (self-signed test package)
+    needs: [build, mesa]
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: jadyx-build
+          path: build-uwp/bin
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: spirv-to-dxil
+          path: ${{ runner.temp }}/mesa
+
+      - name: Pack and sign
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          # The subject has to match Identity/@Publisher in dist/uwp/AppxManifest.xml.
+          $publisher = "CN=JadyxDev"
+          $cert = New-SelfSignedCertificate -Type Custom -Subject $publisher `
+              -KeyUsage DigitalSignature -FriendlyName "Lichii test package" `
+              -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddYears(2) `
+              -TextExtension @("2.5.29.3={text}", "2.5.29.19={text}", "2.5.29.37={text}1.3.6.1.5.5.7.3.3")
+          $password = [Guid]::NewGuid().ToString("N")
+          $pfx = Join-Path $env:RUNNER_TEMP "lichii-test.pfx"
+          Export-PfxCertificate -Cert $cert -FilePath $pfx `
+              -Password (ConvertTo-SecureString $password -AsPlainText -Force) | Out-Null
+          $env:JADYX_PFX_PASSWORD = $password
+          $params = @{ Library = $true; PfxPath = $pfx }
+          $dll = Join-Path $env:RUNNER_TEMP "mesa\spirv_to_dxil.dll"
+          if (Test-Path $dll) { $params.SpirvToDxil = $dll } else { Write-Warning "No spirv_to_dxil.dll: the package presents through the CPU path" }
+          try { & tools\xbox\package-appx.ps1 @params } finally { Remove-Item $pfx -Force }
+          $out = New-Item -ItemType Directory -Force out
+          Copy-Item build-uwp\package\jadyx.appx out\Lichii_test_x64.appx
+          Copy-Item build-uwp\package\jadyx.cer out\Lichii_test.cer
+          if (Test-Path build-uwp\package\Microsoft.VCLibs.x64.14.00.appx) {
+              Copy-Item build-uwp\package\Microsoft.VCLibs.x64.14.00.appx out\
+          }
+          Get-ChildItem out | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lichii-test-package
+          path: out/*
+          if-no-files-found: error
+          retention-days: 14
