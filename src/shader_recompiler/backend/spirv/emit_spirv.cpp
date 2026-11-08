@@ -17,6 +17,7 @@
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/program.h"
+#include "shader_recompiler/tessellation_emulation.h"
 
 namespace Shader::Backend::SPIRV {
 namespace {
@@ -206,7 +207,8 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
             break;
         case IR::AbstractSyntaxNode::Type::Repeat: {
             Id cond{ctx.Def(node.data.repeat.cond)};
-            if (!Settings::values.disable_shader_loop_safety_checks) {
+            if (!Settings::values.disable_shader_loop_safety_checks &&
+                !ctx.profile.has_broken_loop_safety_counter) {
                 const Id pointer_type{ctx.TypePointer(spv::StorageClass::Private, ctx.U32[1])};
                 const Id safety_counter{ctx.AddGlobalVariable(
                     pointer_type, spv::StorageClass::Private, ctx.Const(0x2000u))};
@@ -277,6 +279,21 @@ spv::ExecutionMode ExecutionMode(TessSpacing spacing) {
 void DefineEntryPoint(const IR::Program& program, EmitContext& ctx, Id main) {
     const std::span interfaces(ctx.interfaces.data(), ctx.interfaces.size());
     spv::ExecutionModel execution_model{};
+    switch (ctx.runtime_info.tess_emulation) {
+    case TessEmulation::ControlCompute: {
+        // Whole patches per group, one invocation per output vertex (tessellation_emulation.h).
+        const u32 vertices{ctx.runtime_info.tess_output_vertices};
+        ctx.AddExecutionMode(main, spv::ExecutionMode::LocalSize,
+                             TessellationEmulation::PatchesPerGroup(vertices) * vertices, 1U, 1U);
+        ctx.AddEntryPoint(spv::ExecutionModel::GLCompute, main, "main", interfaces);
+        return;
+    }
+    case TessEmulation::EvalVertex:
+        ctx.AddEntryPoint(spv::ExecutionModel::Vertex, main, "main", interfaces);
+        return;
+    case TessEmulation::None:
+        break;
+    }
     switch (program.stage) {
     case Stage::Compute: {
         const std::array<u32, 3> workgroup_size{program.workgroup_size};
@@ -371,7 +388,7 @@ void DefineEntryPoint(const IR::Program& program, EmitContext& ctx, Id main) {
         } else {
             ctx.AddExecutionMode(main, spv::ExecutionMode::OriginUpperLeft);
         }
-        if (program.info.stores_frag_depth) {
+        if (program.info.stores_frag_depth || ctx.shader_depth_bias) {
             ctx.AddExecutionMode(main, spv::ExecutionMode::DepthReplacing);
         }
         if (ctx.runtime_info.force_early_z) {
@@ -392,7 +409,10 @@ void DefineEntryPoint(const IR::Program& program, EmitContext& ctx, Id main) {
 void SetupDenormControl(const Profile& profile, const IR::Program& program, EmitContext& ctx,
                         Id main_func) {
     const Info& info{program.info};
-    if (info.uses_fp32_denorms_flush && info.uses_fp32_denorms_preserve) {
+    if (profile.force_fp32_denorm_flush && profile.support_fp32_denorm_flush) {
+        ctx.AddCapability(spv::Capability::DenormFlushToZero);
+        ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormFlushToZero, 32U);
+    } else if (info.uses_fp32_denorms_flush && info.uses_fp32_denorms_preserve) {
         LOG_DEBUG(Shader_SPIRV, "Fp32 denorm flush and preserve on the same shader");
     } else if (info.uses_fp32_denorms_flush) {
         if (profile.support_fp32_denorm_flush && !profile.has_broken_fp32_denorm_flush) {
@@ -487,6 +507,11 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
             ctx.AddExtension("SPV_EXT_shader_viewport_index_layer");
             ctx.AddCapability(spv::Capability::ShaderViewportIndexLayerEXT);
         }
+    }
+    if (!profile.support_vertex_instance_id &&
+        (info.loads[IR::Attribute::InstanceId] || info.loads[IR::Attribute::VertexId])) {
+        ctx.AddExtension("SPV_KHR_shader_draw_parameters");
+        ctx.AddCapability(spv::Capability::DrawParameters);
     }
     if ((info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
          info.uses_subgroup_shuffles || info.uses_subgroup_mask) &&

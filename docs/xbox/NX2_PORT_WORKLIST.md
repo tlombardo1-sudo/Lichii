@@ -209,24 +209,33 @@ of `InvalidateScale`. Not ported: the sparse-only eviction pass (`HasSparseHeaps
 `BlitImage`, `RestoreBlitDestination` and the perf counters), and `TransferPoolBytes` (it only fed
 the removed checkpoint code). Section 4 is otherwise complete.
 
-## Section 5 progress: shader path (partially merged, NOT yet consistent)
+## Section 5 progress: shader path (merged by hand, uncompiled)
 
-Done: `Profile`/`RuntimeInfo` data members (+ `TessEmulation`, `BlendConstantFactor`,
-`SignedNormA2B10G10R10`), IR opcodes `StageConstant`, `GlobalAtomicCompareExchange32`,
-`StorageAtomicCompareExchange32` (table size 543), `FpControl::half_ftz`, IR emitter methods,
-CCTL no-ops, and Jadyx's additive frontend/GLSL/GLASM files (global/surface atomics,
-`lower_fp16_to_fp32`, context get/set).
+Merged: `Profile`/`RuntimeInfo`/`Info`/`Environment` fields, IR opcodes and emitter methods,
+`FpControl::half_ftz`, IMAD/IMUL (Jadyx implements them, so the not-implemented stubs are gone),
+CCTL no-ops, global/surface atomics, fp16 lowering flush, `QuadShufflePass` in the pipeline, new
+passes in CMake (`demote_return`, `workgroup_split`, `quad_shuffle`, `vertex_fetch`,
+`mirror_border`, local-memory scratch, `IR::Program::geometry_passthrough_lowered`).
+SPIR-V backend: `spirv_emit_context.{h,cpp}` (xfb in-place capture, split generic inputs, patch
+vertex array sizing, noperspective lowering, frag alpha/depth bias/sample mask, subgroup input
+split, `DefineTransformFeedbackStorage`), `emit_spirv_special.cpp` epilogue (xfb storage, tess
+capture, viewport swizzle, noperspective), `emit_spirv.cpp`, `emit_spirv_context_get_set.cpp`.
+Lichii's mesh/task, NVN storage descriptor, native global bounds and coherent-memory code kept.
 
-SPIR-V backend: merged with `tools/xbox/merge_adds.py` (insertions only, Lichii code kept) in
-`emit_spirv.h`, `emit_spirv_instructions.h`, `emit_spirv_atomic.cpp`, `emit_spirv_image.cpp`,
-`emit_spirv_context_get_set.cpp`, `emit_spirv_floating_point.cpp`, `spirv_emit_context.{h,cpp}`.
-The change hunks of `spirv_emit_context.cpp` (55, run `merge_adds.py -v` against a fresh diff) are
-NOT merged, so that file is half-ported and will not build as is: DefineLocalMemory(IR::Program&),
-DefineGlobalMemoryFunctions(Info), DefineTransformFeedbackStorage, DefineTessellationEmulation,
-DefineSubgroupInputs, split generic inputs (`parts`), in-place xfb capture planning
-(`CapturedVarying`, `xfb_in_place_generics`), geometry passthrough lowering, patch_vertices array
-sizing. `emit_spirv_barriers.cpp` (tess ControlCompute semantics) and `emit_spirv_warp.cpp`
-(helperless quad shuffles; Lichii's partition logic kept) are untouched.
-Not yet looked at: backend/spirv `emit_spirv_special.cpp`, `emit_spirv.cpp`, `spirv_local_memory_scratch`,
-ir_opt passes (collect_shader_info, texture_pass, global_memory_to_storage, ...), frontend structured
-control flow, and the Lichii-only Ampere frontend interplay.
+Kept Lichii's version on purpose (Jadyx's differs by design): `DefineGlobalMemoryFunctions`
+(handles descriptor-less hosts word by word), the int8/16 CAS condition, draw-parameter
+capability, `emit_spirv_warp.cpp` (Lichii partition shuffles), `emit_spirv_undefined.cpp`,
+`emit_spirv_barriers.cpp`, geometry stream handling.
+
+Still open in section 5:
+- `emit_spirv_warp.cpp`: `has_helperless_quad_shuffles` path (D3D12 needs it); barriers: UniformMemory
+  semantics for the tess ControlCompute shader.
+- Passes not merged: `texture_pass` (599 Lichii-only lines), `global_memory_to_storage_buffer_pass`
+  (779), `position_pass`, `collect_shader_info_pass` (5 change hunks), and the
+  `translate_program.cpp` differences: `LowerGeometryPassthrough(program)` setting
+  `geometry_passthrough_lowered`, the passthrough_mask forwarding, `rescale_hack`.
+- Jadyx's passes (`MirrorBorderPass`, `VertexFetchPass`, `DemoteReturn`, `WorkgroupSplit`) are only
+  called by the D3D12 pipeline cache; their call sites arrive with section 6.
+- The SPIR-V backend does not emit `xfb_repeats`.
+- Whether Mesa's spirv_to_dxil accepts the Lichii-only capabilities (mesh shading, native passthrough)
+  must be checked on the device: those stages should be rejected up front on D3D12.
