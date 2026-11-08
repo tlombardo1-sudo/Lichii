@@ -15,6 +15,9 @@ enum class Stage : u32;
 struct Profile {
     u32 supported_spirv{0x00010000};
     bool unified_descriptor_binding{};
+    /// Descriptor arrays consume one binding per element (D3D12 via spirv_to_dxil maps element i
+    /// of binding B to register B+i, so the next descriptor must start after the whole array)
+    bool descriptor_arrays_use_count{};
     bool support_descriptor_aliasing{};
     bool support_int8{};
     bool support_uniform_and_storage_buffer_8bit{};
@@ -31,6 +34,9 @@ struct Profile {
     bool support_fp32_denorm_preserve{};
     bool support_fp16_denorm_flush{};
     bool support_fp32_denorm_flush{};
+    /// Flush fp32 denorms in every shader, as Maxwell does, instead of leaving shaders that do
+    /// not ask for it (or ask for both modes) to the driver's default
+    bool force_fp32_denorm_flush{};
     bool support_fp16_signed_zero_nan_preserve{};
     bool support_fp32_signed_zero_nan_preserve{};
     bool support_fp64_signed_zero_nan_preserve{};
@@ -45,6 +51,8 @@ struct Profile {
     bool support_viewport_index_layer_non_geometry{};
     bool support_viewport_mask{};
     bool support_typeless_image_loads{};
+    /// Image views keep the image's format, so raw 32-bit loads have to pack what they return
+    bool repack_raw_image_loads{};
     bool support_demote_to_helper_invocation{};
     bool support_int64_atomics{};
     bool support_shared_int64_atomics{};
@@ -108,6 +116,12 @@ struct Profile {
 
     u32 gl_max_compute_smem_size{};
 
+    /// Loops whose exit also tests the loop safety counter hang the GPU (the Xbox Series D3D12
+    /// driver), so they are emitted without it
+    bool has_broken_loop_safety_counter{};
+    /// Quad operations may skip helper lanes (D3D12 before SM 6.7 leaves it to the driver), so
+    /// fragment quad shuffles travel through fine derivatives, which always include them
+    bool has_helperless_quad_shuffles{};
     /// Maxwell and earlier nVidia architectures have broken robust support
     bool has_broken_robust{};
 
@@ -119,20 +133,6 @@ struct Profile {
     }
 
     // Added from Jadyx (D3D12 / spirv_to_dxil path).
-    /// Descriptor arrays consume one binding per element (D3D12 via spirv_to_dxil maps element i
-    /// of binding B to register B+i, so the next descriptor must start after the whole array)
-    bool descriptor_arrays_use_count{};
-    /// Flush fp32 denorms in every shader, as Maxwell does, instead of leaving shaders that do
-    /// not ask for it (or ask for both modes) to the driver's default
-    bool force_fp32_denorm_flush{};
-    /// Image views keep the image's format, so raw 32-bit loads have to pack what they return
-    bool repack_raw_image_loads{};
-    /// Loops whose exit also tests the loop safety counter hang the GPU (the Xbox Series D3D12
-    /// driver), so they are emitted without it
-    bool has_broken_loop_safety_counter{};
-    /// Quad operations may skip helper lanes (D3D12 before SM 6.7 leaves it to the driver), so
-    /// fragment quad shuffles travel through fine derivatives, which always include them
-    bool has_helperless_quad_shuffles{};
     /// Lanes per wave (the maximum the host may use) when fragment shaders keep large guest local
     /// memory in a storage buffer (local_memory_scratch.h); 0 keeps it in a private array.
     u32 fragment_local_memory_scratch_lanes{};

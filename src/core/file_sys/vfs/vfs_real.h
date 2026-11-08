@@ -88,6 +88,8 @@ public:
 
     std::string GetName() const override;
     std::size_t GetSize() const override;
+    bool Commit() const;
+    bool CommitForCheckpoint() const override;
     bool Resize(std::size_t new_size) override;
     VirtualDir GetContainingDirectory() const override;
     bool IsWritable() const override;

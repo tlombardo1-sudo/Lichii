@@ -13,6 +13,7 @@
 #include "common/logging.h"
 #include "common/write_combined_copy.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/diagnostics/full_capture.h"
 #include "video_core/perf_counters.h"
 #include "video_core/renderer_d3d12/d3d12_buffer_cache.h"
 #include "video_core/renderer_d3d12/d3d12_descriptor_heap.h"

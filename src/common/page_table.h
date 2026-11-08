@@ -136,6 +136,16 @@ struct PageTable {
         static_assert(sizeof(Data) == sizeof(std::atomic<u64>));
     };
 
+    /// "jit_read_table=0|1|check". Stored only for now: the JIT load table is not ported yet, so
+    /// every mode behaves as Off (see docs/xbox/NX2_PORT_WORKLIST.md).
+    enum class JitReadTable : u8 { Off, On, Check };
+    static void SetJitReadTable(JitReadTable mode) noexcept {
+        JitReadTableStorage().store(mode, std::memory_order_relaxed);
+    }
+    [[nodiscard]] static JitReadTable GetJitReadTable() noexcept {
+        return JitReadTableStorage().load(std::memory_order_relaxed);
+    }
+
     PageTable();
     ~PageTable() noexcept;
 
@@ -161,6 +171,10 @@ struct PageTable {
     /// corresponding attribute element is of type `Memory`.
     SparseLargeVector<PageEntryData> entries;
     static_assert(sizeof(PageEntryData) == 8);
+    static std::atomic<JitReadTable>& JitReadTableStorage() noexcept {
+        static std::atomic<JitReadTable> mode{JitReadTable::Off};
+        return mode;
+    }
 
     u8* fastmem_arena{};
     std::size_t current_address_space_width_in_bits{};

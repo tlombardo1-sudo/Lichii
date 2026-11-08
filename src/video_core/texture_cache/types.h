@@ -130,6 +130,8 @@ struct ImageCopy {
     Offset3D src_offset;
     Offset3D dst_offset;
     Extent3D extent;
+    /// The extent is in compression blocks, not texels (set by sources that already know it).
+    bool extent_in_blocks{};
 };
 
 /// A rectangle of one mip level, in texels.

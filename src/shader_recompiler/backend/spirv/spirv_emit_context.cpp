@@ -1522,7 +1522,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     const Id zero{u32_zero_value};
     // Without descriptor aliasing each constant buffer only has its U32x4 view and each storage
     // buffer its U32 view, so the descriptor is read and the data accessed one word at a time.
-    const bool aliasing{profile.support_descriptor_aliasing};
+    [[maybe_unused]] const bool aliasing{profile.support_descriptor_aliasing};
     const auto load_cbuf_word{[&](const StorageBufferDescriptor& ssbo, u32 word) {
         const Id pointer{OpAccessChain(uniform_types.U32x4, cbufs[ssbo.cbuf_index].U32x4, zero,
                                        Const(word / 4))};

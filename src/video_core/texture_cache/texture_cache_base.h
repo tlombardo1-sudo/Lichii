@@ -59,6 +59,19 @@ namespace VideoCommon {
 // consult them (see docs/xbox/NX2_PORT_WORKLIST.md section 4).
 void SetRenderTargetEarlyOut(bool enabled) noexcept;
 [[nodiscard]] bool RenderTargetEarlyOut() noexcept;
+
+/// What graphics image views and samplers resolved from the descriptor tables depend on beyond
+/// the table entries themselves. Equal stamps mean an entry that still holds the same descriptor
+/// resolves to the same, already prepared, view and sampler.
+struct GraphicsBindingStamp {
+    u64 epoch{};    ///< image changes that preparing a view acts on (uploads, aliases, deletions)
+    u64 frame{};    ///< frame tick, for the LRU touch of the images
+    u64 bindings{}; ///< table addresses and limits
+    u64 tables{};   ///< graphics table entries read with a new descriptor
+    const void* channel{};
+
+    bool operator==(const GraphicsBindingStamp&) const = default;
+};
 void SetMipRenderTargets(bool enabled) noexcept;
 [[nodiscard]] bool MipRenderTargets() noexcept;
 void SetReclaimSupersededImages(bool enabled) noexcept;
@@ -162,6 +175,11 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     /// The most device memory the collector lets the cache fill before it collects in earnest,
     /// on every GPU (ApplyThresholdOverrides).
     static constexpr u64 MaxCriticalMemory = 5_GiB;
+
+    /// Runtimes without the temporal upscale / game DLSS hooks (the D3D12 one) skip those paths.
+    static constexpr bool HAS_TEMPORAL_UPSCALE = requires(Runtime& runtime) {
+        runtime.WantsTemporalUpscaleDepth();
+    };
     static constexpr size_t GC_EMERGENCY_COUNTS = 2;
 
     using Runtime = typename P::Runtime;
@@ -267,6 +285,23 @@ public:
 
     /// Refresh the state for graphics/compute image view and sampler descriptors
     void SynchronizeDescriptors(bool compute);
+
+    /// See GraphicsBindingStamp. Call after SynchronizeDescriptors(false). Lichii's cache does not
+    /// track what a stamp would summarize, so every call returns a stamp that differs from all
+    /// earlier ones: the D3D12 renderer's view and replay caches never hit and always take the
+    /// full, correct path (docs/xbox/NX2_PORT_WORKLIST.md section 4).
+    [[nodiscard]] GraphicsBindingStamp CurrentGraphicsBindingStamp() const noexcept {
+        return {++graphics_stamp_counter, frame_tick, 0, 0, this->channel_state};
+    }
+
+    /// True when graphics TIC (TSC) entry index was read before and still holds that descriptor.
+    /// Always false: see CurrentGraphicsBindingStamp.
+    [[nodiscard]] bool GraphicsImageEntryMatches(u32) const noexcept {
+        return false;
+    }
+    [[nodiscard]] bool GraphicsSamplerEntryMatches(u32) const noexcept {
+        return false;
+    }
 
     /// Updates the Render Targets if they can be rescaled
     /// @retval True if the Render Targets have been rescaled.
@@ -646,6 +681,7 @@ private:
 
     u64 modification_tick = 0;
     u64 frame_tick = 0;
+    mutable u64 graphics_stamp_counter = 0;
 
     Common::ThreadWorker texture_decode_worker{1, "TextureDecoder", {},
                                                Common::ThreadPlacement::Efficiency};

@@ -227,8 +227,35 @@ void CoreTiming::ResetTicks() {
     downcount = MAX_SLICE_LENGTH;
 }
 
+u64 CoreTiming::RawClockTicks() const {
+    return is_multicore ? Common::g_wall_clock.GetCNTPCT()
+                        : Common::g_wall_clock.CPUTickToGuestCNTPCT(cpu_ticks);
+}
+
+void CoreTiming::SetGuestClockPercent(u32 percent) {
+    const u32 slot = guest_clock_slot.load(std::memory_order_relaxed);
+    if (guest_clock_segments[slot].percent == percent) {
+        return;
+    }
+    const u64 raw = RawClockTicks();
+    guest_clock_segments[slot ^ 1] = {raw, ScaleGuestClock(raw), percent};
+    guest_clock_slot.store(slot ^ 1, std::memory_order_release);
+}
+
+u64 CoreTiming::ScaleGuestClock(u64 ticks) const {
+    const GuestClockSegment& segment =
+        guest_clock_segments[guest_clock_slot.load(std::memory_order_acquire)];
+    if (segment.percent == 100) {
+        return segment.guest_base + (ticks - segment.raw_base);
+    }
+    // A reader that took its ticks just before a change may be behind the new segment.
+    return ticks <= segment.raw_base
+               ? segment.guest_base
+               : segment.guest_base + (ticks - segment.raw_base) * segment.percent / 100;
+}
+
 u64 CoreTiming::GetClockTicks() const {
-    u64 fres = is_multicore ? Common::g_wall_clock.GetCNTPCT() : Common::g_wall_clock.CPUTickToGuestCNTPCT(cpu_ticks);
+    u64 fres = ScaleGuestClock(RawClockTicks());
     if (const u32 target = CpuClockTargetMhz(Settings::values.cpu_clock.GetValue());
         target != CPU_CLOCK_BASE_MHZ) {
         fres = fres * target / CPU_CLOCK_BASE_MHZ;

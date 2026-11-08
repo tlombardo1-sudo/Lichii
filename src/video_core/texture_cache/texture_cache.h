@@ -1249,7 +1249,7 @@ bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
 template <class P>
 std::optional<VideoCore::GameDlssProbe> TextureCache<P>::ProbeGameDlssOutput(
     const Tegra::Engines::Fermi2D::Surface& dst, const Tegra::Engines::Fermi2D::Surface& src) {
-    if constexpr (FRAMEBUFFER_BLITS) {
+    if constexpr (FRAMEBUFFER_BLITS || !HAS_TEMPORAL_UPSCALE) {
         return std::nullopt;
     } else {
         const Tegra::Engines::Fermi2D::Config copy{
@@ -1306,7 +1306,7 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
                                       const Tegra::Texture::TICEntry* depth,
                                       std::array<f32, 2> jitter, std::array<f32, 2> motion_scale,
                                       bool use_history) {
-    if constexpr (FRAMEBUFFER_BLITS) {
+    if constexpr (FRAMEBUFFER_BLITS || !HAS_TEMPORAL_UPSCALE) {
         return false;
     } else {
         const Tegra::Engines::Fermi2D::Config copy{

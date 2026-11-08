@@ -9,6 +9,7 @@
 #include <chrono>
 #include <algorithm>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 #include <fmt/ranges.h>
@@ -145,6 +146,24 @@ void Stop();
 void SetGlobalFilter(const Filter& filter);
 void SetColorConsoleBackendEnabled(bool enabled);
 
+/// Warning and above as seen by the bug tracker, before (and regardless of) the global filter.
+struct TapEntry {
+    Class log_class;
+    Level log_level;
+    const char* filename; ///< __FILE__ of the call site, untrimmed: unique per file, comparable.
+    unsigned int line;
+    const char* function;
+    const char* class_name;
+    const char* level_name;
+    std::string_view message;
+};
+/// Phase one, on every entry: true when the call site is new and its message is wanted.
+using TapSeen = bool (*)(Class log_class, Level log_level, const char* filename,
+                         unsigned int line) noexcept;
+/// Phase two, only after TapSeen returned true: receives the formatted message.
+using TapRecord = void (*)(const TapEntry& entry) noexcept;
+/// Installs (or, with nulls, removes) the tap. Costs one atomic load per entry when absent.
+void SetTap(TapSeen seen, TapRecord record) noexcept;
 /// A line kept by the in-memory log ring (the debug server's log tail).
 struct RingLine {
     u64 sequence;

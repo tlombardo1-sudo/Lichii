@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <functional>
 #include <iterator>
@@ -38,6 +39,9 @@ constexpr std::size_t NumQueryTypes = static_cast<size_t>(QueryType::Count);
 } // namespace VideoCore
 
 namespace VideoCommon {
+
+/// Boot config occlusion_force_visible: report samples-passed queries as visible (diagnostics).
+inline std::atomic<bool> force_occlusion_visible{};
 
 using AsyncJobId = Common::SlotId;
 
