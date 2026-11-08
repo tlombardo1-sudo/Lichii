@@ -1,0 +1,172 @@
+# Compiles the Xbox (UWP x64) port on a GitHub-hosted Windows runner, so no local Store toolchain is
+# needed. No signing secrets are required: this only builds, and uploads the full log plus the
+# binaries. Run it from Actions > uwp-build > Run workflow, or by pushing to nx2uwp.
+
+name: uwp-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep_going:
+        description: Keep compiling after the first error (collects every error in one run)
+        type: boolean
+        default: true
+  push:
+    branches:
+      - nx2uwp
+    paths:
+      - "src/**"
+      - "CMakeLists.txt"
+      - "CMakePresets.json"
+      - "CMakeModules/**"
+      - "externals/**"
+      - "tools/xbox/**"
+      - "cpmfile.json"
+      - ".github/workflows/uwp-build.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uwp-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: lichii (UWP x64)
+    runs-on: windows-2025
+    timeout-minutes: 300
+    env:
+      SCCACHE_DIR: ${{ github.workspace }}\.cache\sccache
+      SCCACHE_CACHE_SIZE: 4G
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # build-env.bat picks these up from C:\glslang\bin and C:\Program Files\NASM. With jom on the
+      # PATH, OpenSSL builds on every core instead of single-threaded nmake.
+      - name: Host tools (glslang, NASM, jom)
+        id: tools
+        shell: powershell
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP "glslang.zip"
+          Invoke-WebRequest "https://github.com/KhronosGroup/glslang/releases/download/16.6.0/glslang-16.6.0-windows-x86_64-release.zip" -OutFile $zip
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne "82BF434E69B9BB4829DE7E2B4BC2C5E7A7861E53D66CF75E5CC70F5F694A8D9B") {
+              throw "glslang checksum mismatch"
+          }
+          Expand-Archive $zip C:\glslang -Force
+          Copy-Item C:\glslang\bin\glslang.exe C:\glslang\bin\glslangValidator.exe
+          if (-not (Test-Path "C:\Program Files\NASM\nasm.exe")) { choco install nasm -y --no-progress }
+          if (-not (Get-Command jom -ErrorAction SilentlyContinue)) { choco install jom -y --no-progress }
+          if (-not (Test-Path "C:\Strawberry\perl\bin\perl.exe")) { throw "Strawberry Perl is missing from the runner" }
+          "image=$env:ImageOS-$env:ImageVersion" >> $env:GITHUB_OUTPUT
+
+      - name: Restore CPM sources
+        id: cpm
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/cpm
+          key: cpm-${{ hashFiles('cpmfile.json', '**/cpmfile.json') }}
+
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/sccache
+          key: sccache-uwp-${{ github.run_id }}
+          restore-keys: sccache-uwp-
+
+      - name: Restore OpenSSL build
+        id: openssl
+        uses: actions/cache/restore@v4
+        with:
+          path: build-uwp/_deps/openssl-build
+          key: openssl-uwp-${{ steps.tools.outputs.image }}-${{ hashFiles('cpmfile.json', 'CMakePresets.json', 'CMakeLists.txt', 'CMakeModules/**') }}
+
+      - uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          disable_annotations: true
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmd /c "tools\xbox\build-env.bat cmake --preset uwp-x64 -DUSE_CCACHE=ON -DCCACHE_BINARY=sccache -DCMAKE_POLICY_DEFAULT_CMP0141=NEW -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded" 2>&1 | Tee-Object configure.log
+          exit $LASTEXITCODE
+
+      # -k 0 makes Ninja keep going past failures so one run reports every compile error.
+      - name: Build
+        shell: pwsh
+        run: |
+          $keep = if ("${{ inputs.keep_going }}" -eq "false") { "" } else { "-- -k 0" }
+          cmd /c "tools\xbox\build-env.bat cmake --build --preset uwp-x64 --target jadyx $keep" 2>&1 | Tee-Object build.log
+          exit $LASTEXITCODE
+
+      - name: Summarize errors
+        if: always()
+        shell: pwsh
+        run: |
+          $errors = @()
+          foreach ($f in "configure.log", "build.log") {
+              if (Test-Path $f) {
+                  $errors += Select-String -Path $f -Pattern ': (fatal )?error [A-Z]+\d+|CMake Error|ninja: build stopped|LINK : fatal|FAILED:' | ForEach-Object { $_.Line }
+              }
+          }
+          $errors = $errors | Select-Object -Unique
+          $fence = '```'
+          "### Build errors ($($errors.Count))`n$fence`n$(($errors | Select-Object -First 300) -join "`n")`n$fence" >> $env:GITHUB_STEP_SUMMARY
+          $errors | Set-Content errors.txt
+
+      - name: Compiler cache stats
+        if: always()
+        continue-on-error: true
+        shell: powershell
+        run: |
+          sccache --show-stats
+          sccache --stop-server
+
+      - name: Save CPM sources
+        if: always() && steps.cpm.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/cpm
+          key: ${{ steps.cpm.outputs.cache-primary-key }}
+
+      - name: Save OpenSSL build
+        if: always() && steps.openssl.outputs.cache-hit != 'true' && hashFiles('build-uwp/_deps/openssl-build/libcrypto.lib') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: build-uwp/_deps/openssl-build
+          key: ${{ steps.openssl.outputs.cache-primary-key }}
+
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/sccache
+          key: sccache-uwp-${{ github.run_id }}
+
+      # Logs upload even when the build fails; they are the point of the first runs.
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            configure.log
+            build.log
+            errors.txt
+            build-uwp/CMakeFiles/CMakeConfigureLog.yaml
+            build-uwp/CMakeFiles/CMakeError.log
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: jadyx-build
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            build-uwp/bin/jadyx.exe
+            build-uwp/bin/jadyx.pdb
+            build-uwp/bin/*.dll
