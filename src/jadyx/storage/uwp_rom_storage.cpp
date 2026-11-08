@@ -460,6 +460,7 @@ LibraryScan ScanExternalGameFolders(std::stop_token stop) {
         } catch (const winrt::hresult_error& e) { AddError(result, ErrorText(e)); }
         if (result.limited) break;
     }
+    CollapseLooseDumps(result.entries);
     return result;
 }
 

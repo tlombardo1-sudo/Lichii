@@ -82,6 +82,7 @@ inline LibraryScan ScanGameLibrary(const std::filesystem::path& root,
                                                   : it->path().stem().wstring()});
     }
     if (ec) result.error = ec.message();
+    CollapseLooseDumps(result.entries);
     std::sort(result.entries.begin(), result.entries.end(), [](const auto& a, const auto& b) {
         return a.relative_path < b.relative_path;
     });
