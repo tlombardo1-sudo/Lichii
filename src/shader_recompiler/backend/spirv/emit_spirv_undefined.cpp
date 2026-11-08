@@ -24,6 +24,10 @@ bool UndefIsZero() {
 }
 } // Anonymous namespace
 
+// A guest register or predicate read before any write is zero, not OpUndef. A host compiler may fold
+// an undefined value into anything (drop a branch, keep a stale register), and the driver compilers
+// downstream of DXIL do. The guest never relies on what such a read holds, so zero is a value it
+// accepts, and one no compiler may change.
 Id EmitUndefU1(EmitContext& ctx) {
     return UndefIsZero() ? ctx.false_value : ctx.OpUndef(ctx.U1);
 }

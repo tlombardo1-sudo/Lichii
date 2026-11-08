@@ -208,3 +208,25 @@ of `InvalidateScale`. Not ported: the sparse-only eviction pass (`HasSparseHeaps
 `BlitCanReplaceDestination` and the blit-discard upload skip (an optimization: needs a bool
 `BlitImage`, `RestoreBlitDestination` and the perf counters), and `TransferPoolBytes` (it only fed
 the removed checkpoint code). Section 4 is otherwise complete.
+
+## Section 5 progress: shader path (partially merged, NOT yet consistent)
+
+Done: `Profile`/`RuntimeInfo` data members (+ `TessEmulation`, `BlendConstantFactor`,
+`SignedNormA2B10G10R10`), IR opcodes `StageConstant`, `GlobalAtomicCompareExchange32`,
+`StorageAtomicCompareExchange32` (table size 543), `FpControl::half_ftz`, IR emitter methods,
+CCTL no-ops, and Jadyx's additive frontend/GLSL/GLASM files (global/surface atomics,
+`lower_fp16_to_fp32`, context get/set).
+
+SPIR-V backend: merged with `tools/xbox/merge_adds.py` (insertions only, Lichii code kept) in
+`emit_spirv.h`, `emit_spirv_instructions.h`, `emit_spirv_atomic.cpp`, `emit_spirv_image.cpp`,
+`emit_spirv_context_get_set.cpp`, `emit_spirv_floating_point.cpp`, `spirv_emit_context.{h,cpp}`.
+The change hunks of `spirv_emit_context.cpp` (55, run `merge_adds.py -v` against a fresh diff) are
+NOT merged, so that file is half-ported and will not build as is: DefineLocalMemory(IR::Program&),
+DefineGlobalMemoryFunctions(Info), DefineTransformFeedbackStorage, DefineTessellationEmulation,
+DefineSubgroupInputs, split generic inputs (`parts`), in-place xfb capture planning
+(`CapturedVarying`, `xfb_in_place_generics`), geometry passthrough lowering, patch_vertices array
+sizing. `emit_spirv_barriers.cpp` (tess ControlCompute semantics) and `emit_spirv_warp.cpp`
+(helperless quad shuffles; Lichii's partition logic kept) are untouched.
+Not yet looked at: backend/spirv `emit_spirv_special.cpp`, `emit_spirv.cpp`, `spirv_local_memory_scratch`,
+ir_opt passes (collect_shader_info, texture_pass, global_memory_to_storage, ...), frontend structured
+control flow, and the Lichii-only Ampere frontend interplay.

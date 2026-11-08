@@ -7,6 +7,8 @@
 #pragma once
 
 #include <array>
+#include <utility>
+#include <vector>
 
 #include <sirit/sirit.h>
 #include "common/container/unordered_set.h"
@@ -64,6 +66,7 @@ struct ImageDefinition {
     Id pointer_type;
     u32 count;
     bool is_integer;
+    RawImageLoad raw_load{};
 };
 
 struct UniformDefinitions {
@@ -147,6 +150,7 @@ enum class InputGenericLoadOp {
     Bitcast,
     SToF,
     UToF,
+    SNormA2B10G10R10, ///< sign-extend the field, then normalize (see UnpackSNormA2B10G10R10)
 };
 
 struct InputGenericInfo {
@@ -154,6 +158,14 @@ struct InputGenericInfo {
     Id pointer_type;
     Id component_type;
     InputGenericLoadOp load_op;
+    /// Inputs fetched in parts (RuntimeInfo::generic_input_parts): parts after the first (id),
+    /// each holding part_components components.
+    std::array<Id, 3> more_parts{};
+    u32 parts{1};
+    u32 part_components{4};
+    /// Components the guest format has (RuntimeInfo::generic_input_components); the others read
+    /// as their defaults.
+    u32 components{4};
 };
 
 struct GenericElementInfo {
@@ -162,11 +174,44 @@ struct GenericElementInfo {
     u32 num_components{};
 };
 
+/// An output holding a copy of captured components, for stream output (xfb_copy_outputs).
+struct TransformFeedbackCopy {
+    Id id{};
+    std::array<u32, 4> attributes{}; ///< the attribute each component copies
+    u32 num_components{};
+};
+
+/// Whether a transform feedback copy can carry attribute: the outputs whose values a stage has.
+[[nodiscard]] bool IsCopyableCapture(IR::Attribute attribute);
+
 class EmitContext final : public Sirit::Module {
 public:
     explicit EmitContext(const Profile& profile, const RuntimeInfo& runtime_info,
                          IR::Program& program, Bindings& binding);
     ~EmitContext();
+
+    /// Whether this stage captures varying. Only a geometry shader emits to streams other than 0,
+    /// so other stages capture nothing there.
+    [[nodiscard]] bool Captures(const TransformFeedbackVarying& varying) const {
+        return varying.components != 0 && (stage == Stage::Geometry || varying.stream == 0);
+    }
+
+    /// The transform feedback varying this stage captures for attribute, if any.
+    [[nodiscard]] const TransformFeedbackVarying* CapturedVarying(size_t attribute) const {
+        if (attribute >= runtime_info.xfb_count) {
+            return nullptr;
+        }
+        const TransformFeedbackVarying& varying{runtime_info.xfb_varyings[attribute]};
+        return Captures(varying) ? &varying : nullptr;
+    }
+
+    bool uses_geometry_passthrough{};
+    /// RuntimeInfo::depth_bias_in_shader for a fragment shader that does not write its depth.
+    bool shader_depth_bias{};
+    bool geometry_passthrough_lowered{};
+    // Ordinary GS outputs become undefined after EmitVertex. Lowered passthrough
+    // outputs are per-primitive, so retain them across all emitted vertices.
+    std::vector<std::pair<Id, Id>> passthrough_outputs; // variable, value type
 
     [[nodiscard]] Id Def(const IR::Value& value);
 
@@ -210,6 +255,10 @@ public:
     Id Const(f32 value) {
         return Constant(F32[1], value);
     }
+
+    /// One component of a packed SNORM 10:10:10:2 attribute fetched as uints: sign-extends its
+    /// 10 bits (2 for w, component 3) and normalizes to [-1, 1] as the hardware would.
+    Id UnpackSNormA2B10G10R10(Id value, Id component);
 
     const Profile& profile;
     const RuntimeInfo& runtime_info;
@@ -309,9 +358,63 @@ public:
     u32 image_rescaling_index{};
 
     Id render_area_push_constant{};
+    Id blend_constants_push_constant{};
+    Id stage_constants_push_constant{};
+    Id polygon_stipple_pointer{};
+    /// The render target before this draw (Info::uses_destination_read), and its type.
+    Id destination_read{};
+    Id destination_read_type{};
     u32 render_are_member_index{};
 
     Id local_memory{};
+    /// Pool storage buffer holding local memory instead of `local_memory`, see
+    /// LocalMemoryScratch. Valid only when the shader keeps local memory in the pool.
+    Id local_memory_scratch{};
+    Id local_memory_scratch_element{};
+    u32 local_memory_scratch_words{};
+    /// Pool index of word 0 of this lane, returned by the acquire function at the prologue.
+    Id local_memory_lane_base{};
+    /// Pool words between consecutive words of a lane (slots of the pool times lanes), stored by
+    /// the acquire function and loaded at the prologue.
+    Id local_memory_stride_var{};
+    Id local_memory_stride{};
+    Id local_memory_acquire_func{};
+
+    /// Storage transform feedback (transform_feedback_storage.h): one storage buffer per captured
+    /// buffer, and the constants block.
+    std::array<Id, 4> xfb_storage_buffers{};
+    Id xfb_storage_element{};
+    Id xfb_storage_constants{};
+    Id xfb_storage_constant_element{};
+    Id local_memory_release_func{};
+
+    /// Tessellation emulation (tessellation_emulation.h): the storage buffers and constants, and
+    /// the values the prologue computes. tess_record is the first word of the patch record the
+    /// invocation writes (control) or reads (evaluation); tess_input_vertex the first capture
+    /// slot of the control shader's instance and tess_patch_position the draw position of its
+    /// patch's first vertex. The vertex shader of a capture writes tess_output_buffer.
+    Id tess_input_buffer{};
+    Id tess_output_buffer{};
+    Id tess_points_buffer{};
+    Id tess_indices_buffer{};
+    Id tess_constants{};
+    Id tess_storage_element{};
+    Id tess_constant_element{};
+    Id tess_record{};
+    Id tess_input_vertex{};
+    Id tess_patch_position{};
+    Id tess_invocation{};
+    Id tess_primitive{};
+    Id tess_coord_u{};
+    Id tess_coord_v{};
+
+    [[nodiscard]] bool EmulatesTessellation() const noexcept {
+        return runtime_info.tess_emulation != TessEmulation::None;
+    }
+    /// Word of a tessellation emulation storage buffer.
+    [[nodiscard]] Id TessWord(Id buffer, Id word) {
+        return OpAccessChain(tess_storage_element, buffer, u32_zero_value, word);
+    }
 
     bool uses_explicit_workgroup_layout{};
     Id shared_memory_u8{};
@@ -355,13 +458,25 @@ public:
     Id output_point_size{};
     Id output_position{};
     std::array<std::array<GenericElementInfo, 4>, 32> output_generics{};
+    /// RuntimeInfo::xfb_copy_outputs: every capture, alone in a generic location the shader leaves
+    /// free (DefineTransformFeedbackCopies). Each vertex stores them before any position transform.
+    std::vector<TransformFeedbackCopy> xfb_copies;
+    /// Captures decorated in place: the captured generics the shader never stores, whose defaults
+    /// each vertex writes.
+    u32 xfb_unstored_generics{};
+    /// RuntimeInfo::xfb_copy_outputs: whole generics captured whole that carry their capture
+    /// themselves, when the copies do not fit in the free locations (PlanInPlaceCaptures).
+    u32 xfb_in_place_generics{};
 
     Id output_tess_level_outer{};
     Id output_tess_level_inner{};
     std::array<Id, 30> patches{};
 
     std::array<Id, 8> frag_color{};
+    /// Output 0's alpha before the UNORM8 rounding (unorm8_output_mask), for the alpha tests.
+    Id frag_alpha_unrounded{};
     Id sample_mask{};
+    bool guest_writes_sample_mask{};
     Id frag_depth{};
 
     std::array<Id, 2> software_matrix_functions{};
@@ -413,7 +528,11 @@ private:
     void DefineCommonTypes(const Info& info);
     void DefineCommonConstants();
     void DefineInterfaces(const IR::Program& program);
-    void DefineLocalMemory(const IR::Program& program);
+    void DefineLocalMemory(IR::Program& program);
+    void DefineLocalMemoryScratch(u32 words, bool tracks_lanes);
+    void DefineTransformFeedbackStorage(IR::Program& program);
+    void DefineTessellationEmulation();
+    void DefineSubgroupInputs(const Info& info);
     void DefineSharedMemory(const IR::Program& program);
     void DefineSharedMemoryFunctions(const IR::Program& program);
     void DefineConstantBuffers(const Info& info, u32& binding);
@@ -425,15 +544,20 @@ private:
     void DefineImages(const Info& info, u32& binding, u32& scaling_index);
     void DefineAttributeMemAccess(const Info& info);
     void DefineWriteStorageCasLoopFunction(const Info& info);
-    void DefineGlobalMemoryFunctions(const IR::Program& program);
+    void DefineGlobalMemoryFunctions(const Info& info);
     void DefineRescalingInput(const Info& info);
     void DefineRescalingInputPushConstant();
     void DefineRescalingInputUniformConstant();
     void DefineRenderArea(const Info& info);
+    void DefineBlendConstants();
+    void DefineStageConstants(const Info& info);
 
     void DefineInputs(const IR::Program& program);
     void DefineOutputs(const IR::Program& program);
     void DefineMesh(const IR::Program& program);
 };
+
+/// Frees the local memory pool slot for the lanes leaving here (no-op without a pool).
+void EmitLocalMemoryRelease(EmitContext& ctx);
 
 } // namespace Shader::Backend::SPIRV
