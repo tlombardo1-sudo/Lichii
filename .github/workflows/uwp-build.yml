@@ -124,7 +124,16 @@ jobs:
           } else {
               Write-Host "sccache is not available: building without the compiler cache"
           }
-          cmd /c "tools\xbox\build-env.bat cmake --preset uwp-x64 $cache" 2>&1 | Tee-Object configure.log
+          # Configure downloads dependencies from GitHub releases, which 504 at times; downloaded
+          # packages are kept, so a retry only repeats the part that failed.
+          for ($attempt = 1; $attempt -le 4; $attempt++) {
+              cmd /c "tools\xbox\build-env.bat cmake --preset uwp-x64 $cache" 2>&1 | Tee-Object configure.log -Append:($attempt -gt 1)
+              if ($LASTEXITCODE -eq 0) { break }
+              if ($attempt -lt 4) {
+                  Write-Host "Configure failed (attempt $attempt of 4); retrying in $($attempt * 30)s"
+                  Start-Sleep -Seconds ($attempt * 30)
+              }
+          }
           exit $LASTEXITCODE
 
       # -k 0 makes Ninja keep going past failures so one run reports every compile error.
