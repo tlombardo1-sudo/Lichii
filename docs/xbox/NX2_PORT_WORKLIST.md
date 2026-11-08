@@ -230,8 +230,11 @@ capability, `emit_spirv_warp.cpp` (Lichii partition shuffles), `emit_spirv_undef
 Still open in section 5:
 - `emit_spirv_warp.cpp`: `has_helperless_quad_shuffles` path (D3D12 needs it); barriers: UniformMemory
   semantics for the tess ControlCompute shader.
-- Passes not merged: `texture_pass` (599 Lichii-only lines), `global_memory_to_storage_buffer_pass`
-  (779), `position_pass`, `collect_shader_info_pass` (5 change hunks), and the
+- Passes: `position_pass` and `collect_shader_info_pass` need nothing (Lichii's are supersets).
+  `global_memory_to_storage_buffer_pass` got the compare-exchange mapping, `texture_pass` the
+  raw image load (`RawImageLoad`). Not ported from Jadyx's versions: conditional-phi constant buffer
+  tracking, `dynamic_offset`/array `count` in bindless descriptors, `Color2DRect` implicit-LOD
+  patch, global memory fallback counters. Still open: the
   `translate_program.cpp` differences: `LowerGeometryPassthrough(program)` setting
   `geometry_passthrough_lowered`, the passthrough_mask forwarding, `rescale_hack`.
 - Jadyx's passes (`MirrorBorderPass`, `VertexFetchPass`, `DemoteReturn`, `WorkgroupSplit`) are only

@@ -358,6 +358,21 @@ static inline TexturePixelFormat ReadTexturePixelFormatCached(Environment& env,
     if (cbuf.handle_program != ~0U) return TexturePixelFormat::A8B8G8R8_UNORM;
     return env.ReadTexturePixelFormat(GetTextureHandleCached(env, cbuf));
 }
+static RawImageLoad RawImageLoadOf(TexturePixelFormat format) {
+    switch (format) {
+    case TexturePixelFormat::A8B8G8R8_UNORM:
+        return RawImageLoad::A8B8G8R8_UNORM;
+    case TexturePixelFormat::B8G8R8A8_UNORM:
+        return RawImageLoad::B8G8R8A8_UNORM;
+    case TexturePixelFormat::A2B10G10R10_UNORM:
+        return RawImageLoad::A2B10G10R10_UNORM;
+    case TexturePixelFormat::A8B8G8R8_UINT:
+        return RawImageLoad::A8B8G8R8_UINT;
+    default:
+        return RawImageLoad::None;
+    }
+}
+
 static inline bool IsTexturePixelFormatIntegerCached(Environment& env,
                                                         const ConstBufferAddr& cbuf) {
     if (cbuf.handle_program != ~0U) return false;
@@ -1321,6 +1336,8 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
             }
             const bool is_integer{flags.image_byte_address != 0 ||
                                   is_texture_pixel_format_integer(cbuf)};
+            const bool is_raw_load{inst->GetOpcode() == IR::Opcode::ImageRead &&
+                                   flags.image_format == ImageFormat::R32_UINT};
             if (flags.type == TextureType::Buffer) {
                 index = descriptors.Add(ImageBufferDescriptor{
                     .format = flags.image_format,
@@ -1344,6 +1361,8 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                     .cbuf_offset = cbuf.offset,
                     .count = count,
                     .size_shift = size_shift,
+                    .raw_load = is_raw_load ? RawImageLoadOf(ReadTexturePixelFormatCached(env, cbuf))
+                                            : RawImageLoad::None,
                     .is_byte_addressed = flags.image_byte_address != 0,
                     .handle_program = cbuf.handle_program,
                 });
