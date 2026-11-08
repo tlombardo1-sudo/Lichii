@@ -198,6 +198,13 @@ else()
             $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-error=unused-command-line-argument>
         )
     endif()
+    # CI builds through sccache with embedded debug info (/Z7). sirit hard-codes /Zi, which makes
+    # its parallel compiles share one PDB and fail with C1041 under sccache.
+    if (MSVC AND CMAKE_MSVC_DEBUG_INFORMATION_FORMAT STREQUAL "Embedded")
+        get_target_property(_sirit_options siritobj COMPILE_OPTIONS)
+        list(REMOVE_ITEM _sirit_options /Zi)
+        set_target_properties(siritobj PROPERTIES COMPILE_OPTIONS "${_sirit_options}")
+    endif()
 endif()
 
 # reshadefx
@@ -260,6 +267,17 @@ add_subdirectory(glad)
 # libusb
 if (ENABLE_LIBUSB)
     add_subdirectory(libusb)
+endif()
+
+# libarchive (read side) and liblzma: the Xbox mod manager opens zip, 7z and rar archives.
+if (CMAKE_SYSTEM_NAME STREQUAL "WindowsStore")
+    AddJsonPackage(xz)
+    # liblzma only exports its headers on install; the tree uses them from the source.
+    target_include_directories(liblzma INTERFACE
+        $<BUILD_INTERFACE:${xz_SOURCE_DIR}/src/liblzma/api>)
+
+    AddJsonPackage(NAME libarchive DOWNLOAD_ONLY)
+    add_subdirectory(libarchive)
 endif()
 
 # VMA
