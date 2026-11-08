@@ -279,7 +279,7 @@ jobs:
           $cert = New-SelfSignedCertificate -Type Custom -Subject $publisher `
               -KeyUsage DigitalSignature -FriendlyName "Lichii test package" `
               -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddYears(2) `
-              -TextExtension @("2.5.29.3={text}", "2.5.29.19={text}", "2.5.29.37={text}1.3.6.1.5.5.7.3.3")
+              -TextExtension @("2.5.29.19={text}", "2.5.29.37={text}1.3.6.1.5.5.7.3.3")
           $password = [Guid]::NewGuid().ToString("N")
           $pfx = Join-Path $env:RUNNER_TEMP "lichii-test.pfx"
           Export-PfxCertificate -Cert $cert -FilePath $pfx `
