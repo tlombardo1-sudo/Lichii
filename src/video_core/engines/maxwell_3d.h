@@ -3366,7 +3366,7 @@ private:
         }
         recent_writes[recent_write_index++ % recent_writes.size()] = {method, argument, amount, pending};
     }
-    void DumpRecentWrites(u32 method);
+    void DumpRecentWrites(Core::System& system, u32 method);
     /// Parameters that have been submitted to the macro call so far.
     std::vector<u32> macro_params;
 

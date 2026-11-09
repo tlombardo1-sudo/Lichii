@@ -16,6 +16,7 @@
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/core_timing.h"
+#include "core/device_memory.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -486,7 +487,7 @@ void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument
         return;
     }
     if (executing_macro != 0 && method != executing_macro + 1) {
-        DumpRecentWrites(method);
+        DumpRecentWrites(system, method);
         // Recover: abandon the half-collected macro and process this write normally.
         LOG_ERROR(HW_GPU, "Abandoning macro {:#x} after write to {:#x}", executing_macro, method);
         executing_macro = 0;
@@ -534,13 +535,27 @@ void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument
     ProcessMethodCall(method, argument, method_argument, is_last_call);
 }
 
-void Maxwell3D::DumpRecentWrites(u32 method) {
+void Maxwell3D::DumpRecentWrites(Core::System& system, u32 method) {
     static u32 dumps{};
     if (dumps++ >= 4) {
         return;
     }
     LOG_ERROR(HW_GPU, "Write to {:#x} while macro {:#x} collects parameters ({} so far); last writes:",
               method, executing_macro, macro_params.size());
+    {
+        // Is the engine object itself overwritten? Say where it lives and what its words are.
+        const auto self = reinterpret_cast<uintptr_t>(this);
+        const auto& backing = system.DeviceMemory().buffer;
+        const auto base = reinterpret_cast<uintptr_t>(backing.BackingBasePointer());
+        LOG_ERROR(HW_GPU,
+                  "Maxwell3D at {:#x} (sizeof {:#x}); guest backing {:#x}..{:#x} ({}); regs[0..3]={:#x} {:#x} {:#x} {:#x}; "
+                  "macro_params cap {}",
+                  self, sizeof(*this), base, base + backing.BackingSize(),
+                  (self >= base && self < base + backing.BackingSize()) ? "OBJECT IS INSIDE GUEST BACKING"
+                                                                         : "object outside backing",
+                  regs.reg_array[0], regs.reg_array[1], regs.reg_array[2], regs.reg_array[3],
+                  macro_params.capacity());
+    }
     if (!record_write_history) {
         LOG_ERROR(HW_GPU, "Register write history disabled; EDEN_NX2_3D_HISTORY=1 enables it");
         return;
