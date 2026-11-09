@@ -422,6 +422,17 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
     if (!channel_state->initialized && channel_state->memory_manager) {
         system.GPU().InitChannel(*channel_state, channel_state->program_id);
     }
+    if (!channel_state->initialized) {
+        // No address space is bound to this channel, so its engines were never constructed.
+        // Pushing the list would run the GPU thread on uninitialised engine memory.
+        static u32 reported{};
+        if (reported++ < 8) {
+            LOG_ERROR(Service_NVDRV,
+                      "SubmitGPFIFO on a channel with no address space bound (bind_id={}, entries={}); dropping",
+                      channel_state->bind_id, params.num_entries);
+        }
+        return NvResult::BadParameter;
+    }
 
     const auto bind_id = channel_state->bind_id;
 
