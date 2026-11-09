@@ -455,6 +455,40 @@ void Maxwell3D::CallMacroMethod(Core::System& system, u32 method, std::span<cons
     draw_manager.DrawDeferred(*this);
 }
 
+
+// Diagnostic: the last calls into the 3D engine, kept outside the object, so that a corrupted
+// engine can say which command broke it.
+namespace {
+struct CallTrace {
+    u32 method;
+    u32 amount;
+    u32 first;
+    u32 pending;
+};
+std::array<CallTrace, 16> g_call_trace{};
+std::atomic<u32> g_call_trace_index{};
+std::atomic<bool> g_call_trace_reported{};
+
+void TraceCall(u32 method, u32 amount, u32 first, u32 pending) {
+    g_call_trace[g_call_trace_index.fetch_add(1, std::memory_order_relaxed) % g_call_trace.size()] =
+        {method, amount, first, pending};
+}
+
+void ReportCorruption(const char* where, u32 executing_macro) {
+    if (g_call_trace_reported.exchange(true)) {
+        return;
+    }
+    LOG_ERROR(HW_GPU, "3D engine state corrupt on entry to {} (executing_macro={:#x}); last calls, oldest first:",
+              where, executing_macro);
+    const u32 end = g_call_trace_index.load();
+    for (u32 i = 0; i < g_call_trace.size(); ++i) {
+        const auto& c = g_call_trace[(end + i) % g_call_trace.size()];
+        LOG_ERROR(HW_GPU, "  method {:#x} amount {} first {:#x} pending {}", c.method, c.amount, c.first,
+                  c.pending);
+    }
+}
+} // Anonymous namespace
+
 // EDEN_NX2_3D_METHODS: log the first write to each 3D register (finds methods Eden doesn't model).
 static const bool g_trace_first_method_writes = std::getenv("EDEN_NX2_3D_METHODS") != nullptr;
 
@@ -469,6 +503,10 @@ void Maxwell3D::TraceFirstMethodWrite(u32 method, u32 argument) {
 void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
     // It is an error to write to a register other than the current macro's ARG register before
     // it has finished execution.
+    if (executing_macro > 0x1FFF) [[unlikely]] {
+        ReportCorruption("CallMethod", executing_macro);
+    }
+    TraceCall(method, 1, method_argument, is_last_call);
     // Methods are 13 bits wide in a pushbuffer header; anything above that is a corrupt command
     // stream (e.g. words read from memory the guest has not written yet). Drop it rather than
     // abort the whole app.
@@ -570,6 +608,10 @@ void Maxwell3D::DumpRecentWrites(Core::System& system, u32 method) {
 }
 
 void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) {
+    if (executing_macro > 0x1FFF) [[unlikely]] {
+        ReportCorruption("CallMultiMethod", executing_macro);
+    }
+    TraceCall(method, amount, amount ? base_start[0] : 0, methods_pending);
     RecordWrite(method, amount ? base_start[0] : 0, amount, methods_pending);
     if (method > 0x1FFF) [[unlikely]] {
         static u32 dropped{};
