@@ -2091,6 +2091,16 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
     if (length == 0) {
         return;
     }
+    if (physical_offset >= backing_size || length > backing_size - physical_offset) {
+        // A fill past the end of the backing would land on whatever the host has mapped next
+        // (e.g. its own heap). Clamp it and say so.
+        LOG_CRITICAL(HW_Memory, "ClearBackingRegion out of range: offset={:#x} length={:#x} backing={:#x}",
+                     physical_offset, length, backing_size);
+        if (physical_offset >= backing_size) {
+            return;
+        }
+        length = backing_size - physical_offset;
+    }
     MarkUsed(physical_offset, length);
     if (fill_value != 0) {
         ClearBackingRegionNow(physical_offset, length, fill_value);
