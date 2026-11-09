@@ -468,11 +468,31 @@ void Maxwell3D::TraceFirstMethodWrite(u32 method, u32 argument) {
 void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
     // It is an error to write to a register other than the current macro's ARG register before
     // it has finished execution.
+    // Methods are 13 bits wide in a pushbuffer header; anything above that is a corrupt command
+    // stream (e.g. words read from memory the guest has not written yet). Drop it rather than
+    // abort the whole app.
+    if (method > 0x1FFF) [[unlikely]] {
+        static u32 dropped{};
+        if (dropped++ < 16) {
+            LOG_ERROR(HW_GPU, "Dropping invalid 3D method {:#x} (arg {:#x}); corrupt command stream",
+                      method, method_argument);
+        }
+        if (executing_macro != 0) {
+            executing_macro = 0;
+            macro_params.clear();
+            macro_segments.clear();
+            current_macro_dirty = false;
+        }
+        return;
+    }
     if (executing_macro != 0 && method != executing_macro + 1) {
         DumpRecentWrites(method);
-    }
-    if (executing_macro != 0) {
-        ASSERT(method == executing_macro + 1);
+        // Recover: abandon the half-collected macro and process this write normally.
+        LOG_ERROR(HW_GPU, "Abandoning macro {:#x} after write to {:#x}", executing_macro, method);
+        executing_macro = 0;
+        macro_params.clear();
+        macro_segments.clear();
+        current_macro_dirty = false;
     }
     RecordWrite(method, method_argument, 1, is_last_call ? 1 : 2);
 
@@ -536,6 +556,14 @@ void Maxwell3D::DumpRecentWrites(u32 method) {
 
 void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) {
     RecordWrite(method, amount ? base_start[0] : 0, amount, methods_pending);
+    if (method > 0x1FFF) [[unlikely]] {
+        static u32 dropped{};
+        if (dropped++ < 16) {
+            LOG_ERROR(HW_GPU, "Dropping invalid 3D multi-method {:#x} x{}; corrupt command stream",
+                      method, amount);
+        }
+        return;
+    }
     // Methods after 0xE00 are special, they're actually triggers for some microcode that was
     // uploaded to the GPU during initialization.
     if (method >= MacroRegistersStart) {
