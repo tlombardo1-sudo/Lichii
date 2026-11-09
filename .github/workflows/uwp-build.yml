@@ -286,7 +286,7 @@ jobs:
               -Password (ConvertTo-SecureString $password -AsPlainText -Force) | Out-Null
           $env:JADYX_PFX_PASSWORD = $password
           # Canary: identity Jadyx.Canary, so it installs next to Jadyx with its own app data.
-          $params = @{ Library = $true; Canary = $true; PfxPath = $pfx }
+          $params = @{ Library = $true; Canary = $true; PfxPath = $pfx; BootCfg = @("guest_swap=0") }
           $dll = Join-Path $env:RUNNER_TEMP "mesa\spirv_to_dxil.dll"
           if (Test-Path $dll) { $params.SpirvToDxil = $dll } else { Write-Warning "No spirv_to_dxil.dll: the package presents through the CPU path" }
           try { & tools\xbox\package-appx.ps1 @params } finally { Remove-Item $pfx -Force }
