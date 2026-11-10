@@ -342,4 +342,17 @@ jobs:
             echo "::notice title=frame::$line"
             out="$out$line"$'\n'
           done
+          # Disassembly around the first two frames: shows which call sits at the return address.
+          OBJDUMP="$(dirname "$SYM")/llvm-objdump.exe"
+          base="$("$OBJDUMP" -p "$exe" | grep -i '^ImageBase' | awk '{print $2}')"
+          echo "image base: $base"
+          n=0
+          for o in ${{ inputs.symbolize_offsets }}; do
+            n=$((n+1)); [ $n -gt 2 ] && break
+            o="${o#+}"
+            start=$(printf '0x%x' $(( base + o - 0x70 )))
+            stop=$(printf '0x%x' $(( base + o + 0x10 )))
+            dis="$("$OBJDUMP" -d --no-show-raw-insn -C --start-address=$start --stop-address=$stop "$exe" 2>&1 | tail -n +4 | tr '\n' '|')"
+            echo "::notice title=disasm $o::$dis"
+          done
           { echo '### Symbolized crash stack'; echo '```'; echo "$out"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
