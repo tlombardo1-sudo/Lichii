@@ -84,6 +84,10 @@ struct GPU::Impl {
         to_init.Init(system, program_id);
         to_init.BindRasterizer(renderer->ReadRasterizer());
         renderer->ReadRasterizer()->InitializeChannel(to_init);
+        if (to_init.payload) {
+            const u32 macro = to_init.payload->maxwell_3d.DebugExecutingMacro();
+            LOG_INFO(HW_GPU, "3D engine check [rasterizer channel initialised]: executing_macro={:#x}", macro);
+        }
     }
 
     void InitAddressSpace(Tegra::MemoryManager& memory_manager) {

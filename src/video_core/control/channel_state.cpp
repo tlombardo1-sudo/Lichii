@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "common/assert.h"
+#include "common/logging.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/engines/fermi_2d.h"
@@ -19,6 +20,21 @@
 
 namespace Tegra::Control {
 namespace {
+
+// Diagnostic: report the first phase at which the 3D engine's state is found overwritten.
+void CheckEngine(const ChannelState& channel, const char* phase) {
+    if (!channel.payload) {
+        return;
+    }
+    const u32 macro = channel.payload->maxwell_3d.DebugExecutingMacro();
+    static bool reported{};
+    LOG_INFO(HW_GPU, "3D engine check [{}]: executing_macro={:#x} object={}", phase, macro,
+             static_cast<const void*>(&channel.payload->maxwell_3d));
+    if (macro != 0 && !reported) {
+        reported = true;
+        LOG_ERROR(HW_GPU, "3D engine already corrupt at [{}] (executing_macro={:#x})", phase, macro);
+    }
+}
 
 // Match NVK/Nouveau's initial pushbuffer subchannel layout.
 constexpr u32 Nvk3DSubchannel = 0;
@@ -72,7 +88,9 @@ void ChannelState::Init(Core::System& system, u64 program_id_) {
     ASSERT(memory_manager);
     program_id = program_id_;
     payload.emplace(system, *memory_manager, *this);
+    CheckEngine(*this, "constructed");
     BindNvkDefaultSubchannels(*payload);
+    CheckEngine(*this, "subchannels bound");
     if (g_nx2_ampere) {
         // Switch 2 command streams use Ampere classes with Turing+ (MME64) macros, and its
         // block-linear surfaces the console's GOB swizzle.
@@ -84,6 +102,7 @@ void ChannelState::Init(Core::System& system, u64 program_id_) {
                                                    macros.get());
         payload->kepler_compute.SetNativeDataRam(&payload->maxwell_3d.GetNativeDataRam());
     }
+    CheckEngine(*this, "init done");
     initialized = true;
 }
 
@@ -95,6 +114,7 @@ void ChannelState::BindRasterizer(VideoCore::RasterizerInterface* rasterizer) {
     payload->kepler_memory.BindRasterizer(rasterizer);
     payload->kepler_compute.BindRasterizer(rasterizer);
     payload->maxwell_dma.BindRasterizer(rasterizer);
+    CheckEngine(*this, "rasterizer bound");
     //payload->nv01_timer.BindRasterizer(rasterizer);
 }
 

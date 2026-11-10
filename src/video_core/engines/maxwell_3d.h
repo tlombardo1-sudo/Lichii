@@ -3181,6 +3181,8 @@ public:
     MacroEngine& GetNativeMacroEngine() { return native_macro_context ? native_macro_context->engine : macro_engine; }
     /// This channel's MME data RAM (shared with its compute engine).
     std::array<u32, 0xc00>& GetNativeDataRam() { return native_data_ram; }
+    /// Diagnostic: the macro state words, to detect a corrupted engine object.
+    u32 DebugExecutingMacro() const { return executing_macro; }
     std::span<u32> GetNativeMacroPositions() { return native_macro_context ? std::span<u32>{native_macro_context->positions} : std::span<u32>{macro_positions}; }
 
     /// Root tables: eight 256-byte tables written inline (method 0x504 selects a table, bits 0-2,

@@ -25,6 +25,7 @@
 #include "core/hle/service/nvdrv/nvdrv.h"
 #include "core/memory.h"
 #include "video_core/control/channel_state.h"
+#include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/puller.h"
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
@@ -432,6 +433,14 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
                       channel_state->bind_id, params.num_entries);
         }
         return NvResult::BadParameter;
+    }
+
+    if (channel_state->payload) {
+        static u32 checks{};
+        if (checks++ < 4) {
+            LOG_INFO(Service_NVDRV, "3D engine check [before submit #{}]: executing_macro={:#x}", checks,
+                     channel_state->payload->maxwell_3d.DebugExecutingMacro());
+        }
     }
 
     const auto bind_id = channel_state->bind_id;
