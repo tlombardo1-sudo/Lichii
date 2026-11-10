@@ -444,8 +444,30 @@ std::vector<StorageBrowserEntry> ContentFolderSources() {
     }
     return result;
 }
+// The games folder this build looks for by itself, so it need not be added by hand. The app only
+// receives folders through the picker, so direct access to E:\\ may be refused: that is logged and
+// the folders already saved are used as before.
+static void AddDefaultGameFolder() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        constexpr std::wstring_view default_folder = L"E:\\Games\\Nintendo - Switch";
+        try {
+            auto folder = StorageFolder::GetFolderFromPathAsync(default_folder).get();
+            RememberGameFolder(folder);
+            LOG_INFO(Frontend, "ROM storage: default games folder added: {}",
+                     winrt::to_string(folder.Path()));
+        } catch (const winrt::hresult_error& e) {
+            LOG_WARNING(Frontend, "ROM storage: default games folder not accessible: {}",
+                        winrt::to_string(e.message()));
+        } catch (const std::exception& e) {
+            LOG_WARNING(Frontend, "ROM storage: default games folder not added: {}", e.what());
+        }
+    });
+}
+
 LibraryScan ScanExternalGameFolders(std::stop_token stop) {
     EnsureStorageApartment();
+    AddDefaultGameFolder();
     LibraryScan result;
     unsigned visited = 0, sources = 0;
     auto list = StorageApplicationPermissions::FutureAccessList();
