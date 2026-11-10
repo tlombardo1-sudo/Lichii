@@ -138,6 +138,7 @@ private:
 
     std::atomic<u16> m_num_running_threads{};
 
+    bool m_is_switch2 : 1 = false;
     bool m_is_signaled : 1 = false;
     bool m_is_initialized : 1 = false;
     bool m_is_application : 1 = false;
@@ -267,6 +268,10 @@ public:
 
     bool IsApplication() const {
         return m_is_application;
+    }
+
+    bool IsSwitch2() const {
+        return m_is_switch2;
     }
 
     bool IsDefaultApplicationSystemResource() const {

@@ -1399,6 +1399,13 @@ Result KProcess::LoadFromMetadata(KernelCore& kernel, const FileSys::ProgramMeta
     // Assign remaining properties.
     m_ideal_core_id = metadata.GetMainThreadCore();
 
+    // Switch 2 applications get more memory than a 64-bit heap region holds (nninitStartup sizes
+    // its heap as total memory minus ~6.3 GiB), so count the alias region as well.
+    if (metadata.IsSwitch2()) {
+        m_is_switch2 = true;
+        m_max_process_memory = m_page_table.GetHeapRegionSize() + m_page_table.GetAliasRegionSize();
+    }
+
     // Set up emulation context.
     this->InitializeInterfaces(kernel);
 

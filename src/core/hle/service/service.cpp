@@ -6,16 +6,21 @@
 
 #include <algorithm>
 #include <array>
+#include <mutex>
+#include <set>
+#include <string_view>
 #include <fmt/ranges.h>
 #include "common/assert.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/hle/ipc.h"
+#include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
 #include "video_core/frame_trace.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/service/ipc_helpers.h"
+#include "core/hle/service/nx2_stub_interface.h"
 #include "core/hle/service/service.h"
 #include "core/hle/service/sm/sm.h"
 #include "core/reporter.h"
@@ -60,8 +65,41 @@ void ServiceFrameworkBase::RegisterHandlersBaseTipc(const FunctionInfoBase* func
         handlers_tipc.emplace_hint(handlers_tipc.cend(), functions[i].expected_header, functions[i]);
 }
 
+namespace {
+
+// Callers read the reply words they expect without checking how many were written, so an empty
+// reply hands them the request's leftover words as data. Stub replies carry zeroed words.
+constexpr u32 StubZeroedWords = 32;
+
+void PushStubZeroes(IPC::ResponseBuilder& rb) {
+    for (u32 i = 0; i < StubZeroedWords; ++i) {
+        rb.Push<u32>(0);
+    }
+}
+
+} // namespace
+
 void ServiceFrameworkBase::ReportUnimplementedFunction(HLERequestContext& ctx,
                                                        const FunctionInfoBase* info) {
+    // Switch 2 programs are always auto-stubbed: they still call many commands nobody has
+    // implemented.
+    const auto* const caller = ctx.GetThread().GetOwnerProcess();
+    const bool auto_stub = Settings::values.use_auto_stub ||
+                           std::string_view{service_name}.starts_with(Nx2StubPrefix) ||
+                           (caller != nullptr && caller->IsSwitch2());
+    // Auto-stubbed commands are reported once each (a title may poll one every frame).
+    if (auto_stub) {
+        static std::mutex reported_mutex;
+        static std::set<std::pair<std::string, u32>> reported;
+        std::scoped_lock lk{reported_mutex};
+        if (!reported.emplace(service_name, ctx.GetCommand()).second) {
+            IPC::ResponseBuilder rb{ctx, 2 + StubZeroedWords};
+            rb.Push(ResultSuccess);
+            PushStubZeroes(rb);
+            return;
+        }
+    }
+
     auto cmd_buf = ctx.CommandBuffer();
     std::string function_name = info == nullptr ? "<unknown>" : info->name;
 
@@ -73,10 +111,11 @@ void ServiceFrameworkBase::ReportUnimplementedFunction(HLERequestContext& ctx,
 
     system.GetReporter().SaveUnimplementedFunctionReport(ctx, ctx.GetCommand(), function_name, service_name);
     UNIMPLEMENTED_MSG("Unknown / unimplemented {}", fmt::to_string(buf));
-    if (Settings::values.use_auto_stub) {
-        LOG_WARNING(Service, "Using auto stub fallback!");
-        IPC::ResponseBuilder rb{ctx, 2};
+    if (auto_stub) {
+        LOG_WARNING(Service, "Using auto stub fallback (repeats of this command are not logged)");
+        IPC::ResponseBuilder rb{ctx, 2 + StubZeroedWords};
         rb.Push(ResultSuccess);
+        PushStubZeroes(rb);
     }
 }
 

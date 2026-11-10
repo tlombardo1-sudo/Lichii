@@ -12,6 +12,7 @@
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/svc_results.h"
 #include "core/hle/kernel/svc_version.h"
+#include "core/memory.h"
 
 namespace Kernel::Svc {
 
@@ -40,6 +41,11 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle 
     case InfoType::UsedNonSystemMemorySize:
     case InfoType::IsApplication:
     case InfoType::FreeThreadCount:
+    case InfoType::Nx2RegionAddress:
+    case InfoType::Nx2RegionSize:
+    case InfoType::Nx2VammSize:
+    case InfoType::Nx2RemoteMemorySize:
+    case InfoType::Nx2RemoteMemoryUsed:
     case InfoType::AliasRegionExtraSize: {
         R_UNLESS(info_sub_id == 0, ResultInvalidEnumValue);
 
@@ -66,6 +72,28 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle 
         case InfoType::HeapRegionSize:
             *result = process->GetPageTable().GetHeapRegionSize();
             LOG_DEBUG(Kernel_SVC, "GetInfo HeapRegionSize={:#x}", *result);
+            R_SUCCEED();
+        case InfoType::Nx2RegionAddress:
+        case InfoType::Nx2RegionSize: {
+            // Switch 2 VAMM reserves address space here; back it with the upper half of the alias region.
+            auto& page_table = process->GetPageTable();
+            const u64 half = page_table.GetAliasRegionSize() / 2;
+            *result = info_id_type == InfoType::Nx2RegionAddress
+                          ? GetInteger(page_table.GetAliasRegionStart()) + half
+                          : half;
+            LOG_WARNING(Kernel_SVC, "(STUBBED) Switch 2 InfoType {}, returning {:#x}",
+                        static_cast<u32>(info_id_type), *result);
+            R_SUCCEED();
+        }
+        case InfoType::Nx2RemoteMemorySize:
+        case InfoType::Nx2RemoteMemoryUsed:
+            *result = 0;
+            LOG_WARNING(Kernel_SVC, "(STUBBED) Switch 2 InfoType {} (remote memory), returning 0",
+                        static_cast<u32>(info_id_type));
+            R_SUCCEED();
+        case InfoType::Nx2VammSize:
+            *result = Core::Memory::YUZU_PAGESIZE;
+            LOG_WARNING(Kernel_SVC, "(STUBBED) Switch 2 InfoType 33, returning {:#x}", *result);
             R_SUCCEED();
         case InfoType::AslrRegionAddress:
             *result = GetInteger(process->GetPageTable().GetAliasCodeRegionStart());

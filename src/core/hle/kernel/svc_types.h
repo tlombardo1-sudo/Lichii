@@ -50,6 +50,7 @@ enum class MemoryAttribute : u32 {
     DeviceShared = (1 << 2),
     Uncached = (1 << 3),
     PermissionLocked = (1 << 4),
+    GpuAccessible = (1 << 5), // Switch 2 (svc 0x80)
 };
 DECLARE_ENUM_FLAG_OPERATORS(MemoryAttribute);
 
@@ -157,6 +158,14 @@ enum class InfoType : u32 {
     IsSvcPermitted = 26,
     IoRegionHint = 27,
     AliasRegionExtraSize = 28,
+    // Switch 2 kernels: region the SDK queries between the alias and ASLR regions (likely VAMM).
+    Nx2RegionAddress = 29,
+    Nx2RegionSize = 30,
+    // Switch 2 kernels: remote memory (graphics stack) size / used.
+    Nx2RemoteMemorySize = 31,
+    Nx2RemoteMemoryUsed = 32,
+    // Switch 2 kernels: a page granule.
+    Nx2VammSize = 33,
 
     TransferMemoryHint = 34,
 
