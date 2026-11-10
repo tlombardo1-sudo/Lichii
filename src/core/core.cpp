@@ -117,7 +117,7 @@ namespace {
 bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::size_t program_index) {
     FileSys::ProgramMetadata metadata;
     const auto type = file != nullptr ? Loader::IdentifyFile(file) : Loader::FileType::Unknown;
-    if (type == Loader::FileType::NSP || type == Loader::FileType::NSZ) {
+    if (type == Loader::FileType::NSP) {
         const FileSys::NSP nsp{file, program_id, program_index};
         if (nsp.GetStatus() != Loader::ResultStatus::Success) {
             return false;
