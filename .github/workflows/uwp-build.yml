@@ -1,6 +1,6 @@
 # Compiles the Xbox (UWP x64) port on a GitHub-hosted Windows runner, so no local Store toolchain is
 # needed. No signing secrets are required: this only builds, and uploads the full log plus the
-# binaries. Run it from Actions > uwp-build > Run workflow, or by pushing to nx2uwp.
+# binaries. Run it from Actions > uwp-build > Run workflow, or by pushing to jadyx-nx2.
 
 name: uwp-build
 
@@ -21,7 +21,7 @@ on:
         default: ""
   push:
     branches:
-      - nx2uwp
+      - jadyx-nx2
     paths:
       - "src/**"
       - "CMakeLists.txt"
