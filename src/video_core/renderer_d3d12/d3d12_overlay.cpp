@@ -467,6 +467,10 @@ MenuImage RendererD3D12::CaptureFrame() {
         }
         StagingBufferRef readback = RecordFrameReadback(*frame);
         scheduler.Finish();
+        if (readback.mapped_span.empty()) {
+            LOG_ERROR(Render, "D3D12: game frame readback buffer is not mapped; not captured");
+            return {};
+        }
         MenuImage image{swapchain.Width(), swapchain.Height(), {}};
         const size_t row_bytes = static_cast<size_t>(image.width) * 4;
         image.pixels.resize(row_bytes * image.height);
@@ -502,8 +506,18 @@ void RendererD3D12::DrawGameMenu(CommandStream* cmd, PresentFrame& frame) {
     const u32 height = std::min(game_menu->height, swapchain.Height());
     const u32 row_pitch = Common::AlignUp(width * 4, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
     // The pool's memory is reused frame after frame: the menu allocates nothing of its own.
+    if (game_menu->pixels.size() < static_cast<size_t>(game_menu->width) * game_menu->height * 4) {
+        LOG_ERROR(Render, "D3D12: game menu image has {} bytes for {}x{}; not drawn",
+                  game_menu->pixels.size(), game_menu->width, game_menu->height);
+        return;
+    }
     const StagingBufferRef upload =
         staging_pool.Request(static_cast<size_t>(row_pitch) * height, MemoryUsage::Upload);
+    if (upload.mapped_span.size() < static_cast<size_t>(row_pitch) * height) {
+        LOG_ERROR(Render, "D3D12: game menu upload buffer is not mapped ({} of {} bytes); not drawn",
+                  upload.mapped_span.size(), static_cast<size_t>(row_pitch) * height);
+        return;
+    }
     for (u32 y = 0; y < height; ++y) {
         std::memcpy(upload.mapped_span.data() + static_cast<size_t>(y) * row_pitch,
                     game_menu->pixels.data() + static_cast<size_t>(y) * game_menu->width * 4,
