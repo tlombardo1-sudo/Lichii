@@ -350,8 +350,8 @@ jobs:
           for o in ${{ inputs.symbolize_offsets }}; do
             n=$((n+1)); [ $n -gt 2 ] && break
             o="${o#+}"
-            start=$(printf '0x%x' $(( base + o - 0x70 )))
-            stop=$(printf '0x%x' $(( base + o + 0x10 )))
+            start=$(printf '0x%x' $(( 0x$base + 0x$o - 0x70 )))
+            stop=$(printf '0x%x' $(( 0x$base + 0x$o + 0x10 )))
             dis="$("$OBJDUMP" -d --no-show-raw-insn -C --start-address=$start --stop-address=$stop "$exe" 2>&1 | tail -n +4 | tr '\n' '|')"
             echo "::notice title=disasm $o::$dis"
           done
