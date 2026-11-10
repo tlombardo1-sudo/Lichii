@@ -11,6 +11,14 @@ on:
         description: Keep compiling after the first error (collects every error in one run)
         type: boolean
         default: true
+      symbolize_run_id:
+        description: "Symbolize a crash instead of building: uwp-build run id whose jadyx-build artifact matches"
+        type: string
+        default: ""
+      symbolize_offsets:
+        description: "Crash-stack offsets from jadyx_diag.txt, space separated (e.g. +0xd4d8d1 +0xd4a05b)"
+        type: string
+        default: ""
   push:
     branches:
       - nx2uwp
@@ -26,6 +34,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: uwp-build-${{ github.ref }}
@@ -34,6 +43,7 @@ concurrency:
 jobs:
   build:
     name: lichii (UWP x64)
+    if: ${{ inputs.symbolize_run_id == '' }}
     runs-on: windows-2025
     timeout-minutes: 300
     env:
@@ -217,6 +227,7 @@ jobs:
   # Mesa's SPIR-V -> DXIL translator for the D3D12 renderer. Cached on its inputs. A failure here
   # does not stop the package: the renderer then presents through its CPU fallback.
   mesa:
+    if: ${{ inputs.symbolize_run_id == '' }}
     name: spirv_to_dxil
     runs-on: windows-2025
     timeout-minutes: 90
@@ -304,3 +315,31 @@ jobs:
           path: out/*
           if-no-files-found: error
           retention-days: 14
+
+  symbolize:
+    if: ${{ inputs.symbolize_run_id != '' }}
+    runs-on: windows-2022
+    steps:
+      - name: Download the build
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download "${{ inputs.symbolize_run_id }}" -R "${{ github.repository }}" -n jadyx-build -D build
+      - name: Symbolize
+        shell: bash
+        run: |
+          ls -la build
+          SYM="/c/Program Files/LLVM/bin/llvm-symbolizer.exe"
+          [ -x "$SYM" ] || SYM="$(command -v llvm-symbolizer || true)"
+          echo "symbolizer: $SYM"
+          exe="$(ls build/*.exe | head -1)"
+          out=""
+          for o in ${{ inputs.symbolize_offsets }}; do
+            o="${o#+}"
+            res="$("$SYM" --obj="$exe" --relative-address --inlining --demangle "$o" 2>&1 | head -6 | tr '\n' ' ')"
+            line="$o => $res"
+            echo "$line"
+            echo "::notice title=frame::$line"
+            out="$out$line"$'\n'
+          done
+          { echo '### Symbolized crash stack'; echo '```'; echo "$out"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
