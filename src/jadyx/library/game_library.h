@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "jadyx/library/loose_dump.h"
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -52,6 +53,7 @@ inline LibraryScan ScanGameLibrary(const std::filesystem::path& root,
         // Not an error by itself: games can all live in external folders.
         result.missing_root = true;
         if (ec) result.error = ec.message();
+    CollapseLooseDumps(result.entries);
         return result;
     }
     auto it = std::filesystem::recursive_directory_iterator{
@@ -69,14 +71,18 @@ inline LibraryScan ScanGameLibrary(const std::filesystem::path& root,
             it.disable_recursion_pending();
             continue;
         }
-        if (it.depth() >= 4) it.disable_recursion_pending();
+        if (it.depth() >= 4 ||
+            (std::filesystem::is_directory(status) && IsLooseRomFsFolder(it->path().filename().wstring())))
+            it.disable_recursion_pending();
         if (!std::filesystem::is_regular_file(status)) continue;
         auto ext = it->path().extension().string();
         std::transform(ext.begin(), ext.end(), ext.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (ext != ".nsp" && ext != ".xci" && ext != ".nro") continue;
-        result.entries.push_back({it->path().lexically_relative(root),
-                                  it->path().stem().wstring()});
+        const auto relative = it->path().lexically_relative(root);
+        const bool loose = ext.empty() && IsLooseExeFsMain(relative);
+        if (!loose && ext != ".nsp" && ext != ".xci" && ext != ".nro") continue;
+        result.entries.push_back({relative, loose ? LooseDumpName(relative)
+                                                  : it->path().stem().wstring()});
     }
     if (ec) result.error = ec.message();
     std::sort(result.entries.begin(), result.entries.end(), [](const auto& a, const auto& b) {

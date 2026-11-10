@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "jadyx/library/library_session.h"
 
+#include <filesystem>
 #include "core/core.h"
 #include "core/hle/service/filesystem/filesystem.h"
 
@@ -280,7 +281,10 @@ void LibrarySession::StartValidation(bool on_game) {
             if (old_metadata.joinable()) old_metadata.join();
             winrt::init_apartment(winrt::apartment_type::multi_threaded);
             struct Uninitialize { ~Uninitialize() { winrt::uninit_apartment(); } } guard;
-            if (!HasUsableHeaderKey() && !path.ends_with(".nro"))
+            // Keys are not needed for .nro or loose exefs dumps.
+            const auto file_name = std::filesystem::path{path}.filename().string();
+            const bool keyless = path.ends_with(".nro") || file_name == "main";
+            if (!keyless && !HasUsableHeaderKey())
                 return I18n::ToUtf8(Tr(T::MissingKeys));
             if (IsStoragePath(path)) {
                 if (const auto error = CheckExternalGame(path); !error.empty()) return error;

@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Jadyx Project
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "jadyx/library/loose_dump.h"
 #include "jadyx/storage/uwp_rom_storage.h"
 #include "jadyx/storage/storage_path.h"
 #include "jadyx/i18n/localization.h"
@@ -326,7 +327,7 @@ void ScanFolder(StorageFolder folder, const std::string& token, const std::wstri
             const auto child = relative.empty() ? name : relative + "/" + name;
             if (!ValidStorageRelative(child)) continue;
             if (item.IsOfType(StorageItemTypes::Folder)) {
-                if (depth < 4) {
+                if (depth < 4 && !IsLooseRomFsFolder(winrt::to_hstring(name).c_str())) {
                     try { ScanFolder(item.as<StorageFolder>(), token, source, child, depth + 1, visited, scan, stop); }
                     catch (const winrt::hresult_error& e) { AddError(scan, ErrorText(e)); }
                 }
@@ -334,8 +335,9 @@ void ScanFolder(StorageFolder folder, const std::string& token, const std::wstri
                 const auto p = std::filesystem::path{winrt::to_hstring(child).c_str()};
                 auto ext = p.extension().string();
                 std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                if (ext != ".nsp" && ext != ".xci" && ext != ".nro") continue;
-                LibraryEntry entry{p, p.stem().wstring()};
+                const bool loose = ext.empty() && IsLooseExeFsMain(p);
+                if (!loose && ext != ".nsp" && ext != ".xci" && ext != ".nro") continue;
+                LibraryEntry entry{p, loose ? LooseDumpName(p) : p.stem().wstring()};
                 entry.launch_path = MakeStoragePath(token, child);
                 entry.source_name = source;
                 // Enumerated items carry their dates: no extra call per file.
@@ -458,6 +460,7 @@ LibraryScan ScanExternalGameFolders(std::stop_token stop) {
         } catch (const winrt::hresult_error& e) { AddError(result, ErrorText(e)); }
         if (result.limited) break;
     }
+    CollapseLooseDumps(result.entries);
     return result;
 }
 

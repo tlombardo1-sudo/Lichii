@@ -68,7 +68,10 @@ void ReadLibraryMetadata(const std::filesystem::path& root, std::vector<LibraryE
         }
         // A clean install has no user keys yet. Keep placeholders until the file manager imports
         // them, rather than constructing NCA readers with a zero XTS key.
-        if (!have_keys && entry.relative_path.extension() != L".nro") continue;
+        // Homebrew and loose exefs dumps hold no encrypted NCAs: no keys needed to read them.
+        const auto extension = entry.relative_path.extension();
+        const bool decrypted = extension == L".nro" || extension.empty();
+        if (!have_keys && !decrypted) continue;
         // From here on a failure is final for this session: the background fill must move on.
         entry.title_loaded = true;
         try {
@@ -95,7 +98,7 @@ void ReadLibraryMetadata(const std::filesystem::path& root, std::vector<LibraryE
                 record.icon.clear();
             bool cacheable = true;
             if (loader->ReadProgramId(record.program_id) == Loader::ResultStatus::Success &&
-                entry.relative_path.extension() != L".nro")
+                extension != L".nro" && !decrypted)
             {
                 FileSys::ManualContentProvider selected;
                 const auto resolved = Content::ResolveLaunchContent(*system->GetFilesystem(), entry.launch_path, selected, false, stop);
@@ -107,7 +110,7 @@ void ReadLibraryMetadata(const std::filesystem::path& root, std::vector<LibraryE
                     if (resolved.application) record.display_version = winrt::to_hstring(resolved.display_version).c_str();
                 } else record.display_version.clear();
             }
-            else
+            else if (extension == L".nro" || !decrypted)
                 record.program_id = 0;
             record.content = ContentStamp(catalog, record.program_id);
             LOG_INFO(Frontend, "Library metadata: title '{}', icon {} bytes", title, record.icon.size());
