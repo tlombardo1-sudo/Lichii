@@ -1,0 +1,306 @@
+// SPDX-FileCopyrightText: Copyright 2026 Jadyx Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#pragma once
+
+#include <array>
+#include <atomic>
+#include <deque>
+#include <mutex>
+#include <span>
+#include <unordered_map>
+#include <vector>
+
+#include <boost/container/small_vector.hpp>
+
+#include "video_core/renderer_d3d12/d3d12_device.h"
+
+namespace D3D12 {
+
+class Scheduler;
+
+/// Writes the CBV/SRV/UAV tables of draws and dispatches on the recorder's worker instead of the
+/// GPU thread, for renderers created from now on (boot.cfg "descriptor_defer=1"). Only with async
+/// recording and without GPU diagnostics: the GPU thread still reserves the ring range.
+void SetDescriptorDeferral(bool enabled);
+[[nodiscard]] bool DescriptorDeferralEnabled() noexcept;
+
+/// Persistent descriptors in non-shader-visible ("offline") heaps: the SRVs/UAVs of image views,
+/// RTVs/DSVs of attachments and samplers. Grows in pages; freed slots are reused.
+///
+/// A slot may be freed as soon as its last use has been recorded: CopyDescriptors and
+/// OMSetRenderTargets read descriptors on the CPU timeline, when they are called. The RTVs and
+/// DSVs are read by list calls, which a recording worker makes later: given the scheduler, a freed
+/// slot is reused only once what was recorded before the free has reached the list.
+class CpuDescriptorAllocator {
+public:
+    explicit CpuDescriptorAllocator(ID3D12Device* device, D3D12_DESCRIPTOR_HEAP_TYPE type,
+                                    u32 page_size = 1024,
+                                    const Scheduler* read_by_list_calls = nullptr);
+
+    CpuDescriptorAllocator(const CpuDescriptorAllocator&) = delete;
+    CpuDescriptorAllocator& operator=(const CpuDescriptorAllocator&) = delete;
+
+    [[nodiscard]] D3D12_CPU_DESCRIPTOR_HANDLE Allocate();
+    void Free(D3D12_CPU_DESCRIPTOR_HANDLE handle);
+
+    /// Counts the CBV/SRV/UAV slots ever freed: a new view may take a freed handle, so a table
+    /// copied from handles before a free may no longer hold what they describe.
+    [[nodiscard]] static u64 ViewFrees() noexcept {
+        return view_frees.load(std::memory_order_relaxed);
+    }
+
+private:
+    static inline std::atomic<u64> view_frees{};
+
+    struct PendingFree {
+        u64 record_point;
+        D3D12_CPU_DESCRIPTOR_HANDLE handle;
+    };
+
+    void AddPage();
+    /// Moves the slots whose last use reached the list to free_list (under mutex).
+    void ReclaimRecorded();
+
+    ID3D12Device* device;
+    D3D12_DESCRIPTOR_HEAP_TYPE type;
+    u32 page_size;
+    u32 stride;
+    const Scheduler* scheduler;
+    std::vector<ComPtr<ID3D12DescriptorHeap>> pages;
+    std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> free_list;
+    std::deque<PendingFree> pending_frees; ///< in record point order
+    std::mutex mutex;
+};
+
+struct DescriptorRange {
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu;
+};
+
+/// The one shader-visible CBV/SRV/UAV heap, used as a ring: each draw or dispatch takes a
+/// contiguous range for its descriptor tables and copies the offline descriptors into it.
+/// Ranges are retired by scheduler tick; a full ring flushes and waits for the oldest range.
+class DescriptorRing {
+public:
+    explicit DescriptorRing(ID3D12Device* device, Scheduler& scheduler, u32 capacity);
+
+    DescriptorRing(const DescriptorRing&) = delete;
+    DescriptorRing& operator=(const DescriptorRing&) = delete;
+
+    [[nodiscard]] DescriptorRange Allocate(u32 count);
+    /// Gives back range, the last count slots Allocate handed out, unless the ring allocated
+    /// again since.
+    void Rewind(const DescriptorRange& range, u32 count);
+
+    [[nodiscard]] u64 CurrentTick() const;
+
+    [[nodiscard]] Scheduler& GetScheduler() const {
+        return scheduler;
+    }
+
+    /// Allocates count slots and copies the given offline descriptors into them.
+    [[nodiscard]] D3D12_GPU_DESCRIPTOR_HANDLE Upload(
+        std::span<const D3D12_CPU_DESCRIPTOR_HANDLE> descriptors);
+
+    [[nodiscard]] ID3D12DescriptorHeap* Heap() const {
+        return heap.Get();
+    }
+    [[nodiscard]] u32 Stride() const {
+        return stride;
+    }
+
+private:
+    bool TryAllocate(u32 count, u32& offset);
+    /// Where count slots fit now, without taking them.
+    bool FindSpace(u32 count, u32& offset) const;
+    /// Drops the ranges the GPU is done with; only read_fence asks the fence for new progress.
+    void Retire(bool read_fence);
+
+    ID3D12Device* device;
+    Scheduler& scheduler;
+    ComPtr<ID3D12DescriptorHeap> heap;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu_base;
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu_base;
+    u32 capacity;
+    u32 stride;
+    u32 head{}; ///< next free slot
+    u32 tail{}; ///< oldest slot the GPU may still read
+    std::deque<std::pair<u64, u32>> in_flight; ///< (tick, end offset), oldest first
+    u32 head_before{};       ///< head before the last allocation, for Rewind
+    bool added_in_flight{}; ///< the last allocation started its in_flight entry
+    bool logged_upload{};
+};
+
+/// Most root CBVs a guest root signature has (PipelineLayout::NumRootCbvs).
+constexpr u32 MAX_ROOT_CBVS = 16;
+
+/// Where one constant buffer of a pipeline's binding stream goes.
+struct ConstantBufferSlot {
+    static constexpr u32 TABLE = ~0u;
+    u32 root_slot{TABLE}; ///< root CBV slot, or TABLE
+    u32 reach{};          ///< bytes the shader may read from it
+};
+
+/// The CBV/SRV/UAV table of one draw or dispatch, in root-signature order, in a range of the ring
+/// (see d3d12_root_signature.h for the slot order). Buffer views are created in place; image views
+/// are copied from their offline descriptors. The descriptors are only recorded until Table():
+/// consecutive draws often bind the very same ones, and then a table written earlier in the same
+/// list is reused, like the Vulkan backend reuses an identical descriptor payload.
+///
+/// Acquire() must come before any command of the draw is recorded: allocating from a full ring
+/// flushes the command list.
+class GuestDescriptorQueue {
+public:
+    explicit GuestDescriptorQueue(ID3D12Device* device, DescriptorRing& ring);
+
+    GuestDescriptorQueue(const GuestDescriptorQueue&) = delete;
+    GuestDescriptorQueue& operator=(const GuestDescriptorQueue&) = delete;
+
+    /// Starts a table of count descriptors (none when count is zero). cbv_slots, one per constant
+    /// buffer the draw binds and in that order, sends some of them to root CBVs.
+    void Acquire(u32 count, std::span<const ConstantBufferSlot> cbv_slots = {});
+
+    /// GPU handle of the table; checks (and warns once) that it was filled exactly.
+    [[nodiscard]] D3D12_GPU_DESCRIPTOR_HANDLE Table();
+
+    /// A CBV; address 0 writes a null one. size is rounded up to 256 bytes.
+    void AddConstantBuffer(D3D12_GPU_VIRTUAL_ADDRESS address, u32 size);
+    /// Bytes the next constant buffer must hold when bound with size bytes. A table CBV reads
+    /// zeros past its size; a root CBV has no size, so it must cover all the shader may read.
+    [[nodiscard]] u32 ConstantBufferReach(u32 size) const;
+    /// Addresses of the root CBVs of the draw, by root slot.
+    [[nodiscard]] std::span<const D3D12_GPU_VIRTUAL_ADDRESS> RootConstantBuffers() const {
+        return std::span{root_cbvs}.first(num_root_cbvs);
+    }
+    /// A raw UAV, then a raw SRV of the same range (null ones when resource is null).
+    void AddStorageBuffer(ID3D12Resource* resource, u64 offset, u32 size);
+    /// A typed SRV (texture buffer), preceded by a typed UAV for image buffers. Null views when
+    /// resource is null or the offset is not a whole number of elements.
+    void AddTexelBuffer(ID3D12Resource* resource, u64 offset, u32 size, DXGI_FORMAT format,
+                        u32 element_size, bool with_uav);
+    /// Copies of offline descriptors (texture SRVs, image UAVs). Consecutive copies are written
+    /// with one CopyDescriptors call.
+    void AddCopy(D3D12_CPU_DESCRIPTOR_HANDLE descriptor);
+
+private:
+    /// One recorded descriptor. Views are already validated: Table() only creates them.
+    struct Write {
+        enum class Kind : u32 { ConstantBuffer, StorageBuffer, TexelBuffer, Copy };
+        Kind kind{};
+        u32 size{};
+        u64 handle{}; ///< GPU address, resource or offline descriptor
+        u64 offset{}; ///< texel buffers: first element
+        u32 format{}; ///< texel buffers: DXGI_FORMAT
+        u32 with_uav{};
+
+        bool operator==(const Write&) const = default;
+    };
+    /// Writes one table's descriptors from its first slot on; holds no queue state, so it may
+    /// run on the recorder's worker.
+    struct TableWriter {
+        ID3D12Device* device;
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+        u64 gpu; ///< for traces
+        u32 count;
+        u32 stride;
+        u32 written{};
+        /// Sources of the pending copies, written from copy_destination on.
+        boost::container::small_vector<D3D12_CPU_DESCRIPTOR_HANDLE, 64> pending_copies;
+        D3D12_CPU_DESCRIPTOR_HANDLE copy_destination{};
+
+        void WriteAll(std::span<const Write> writes);
+        D3D12_CPU_DESCRIPTOR_HANDLE Next();
+        void CreateConstantBuffer(const Write& write);
+        void CreateStorageBuffer(const Write& write);
+        void CreateTexelBuffer(const Write& write);
+        void Copy(D3D12_CPU_DESCRIPTOR_HANDLE descriptor);
+        void FlushCopies();
+    };
+    /// A table written earlier in the list being recorded.
+    struct RecentTable {
+        u64 tick{};
+        u64 view_frees{};
+        u32 count{};
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu{};
+        std::vector<Write> writes;
+    };
+    static constexpr size_t NUM_RECENT_TABLES = 8;
+
+    /// The recent table holding exactly the recorded descriptors, if one may still be read.
+    [[nodiscard]] const RecentTable* FindRecent() const;
+    /// Writes the recorded descriptors (on the worker when deferred); returns the slots filled.
+    u32 WriteRecorded();
+
+    ID3D12Device* device;
+    DescriptorRing& ring;
+    u32 stride;
+    bool defer; ///< DescriptorDeferralEnabled() when the renderer was created
+    DescriptorRange range{};
+    u32 count{};
+    u64 acquire_tick{};
+    bool finished{};
+    std::vector<Write> writes;
+    std::array<RecentTable, NUM_RECENT_TABLES> recent_tables{};
+    size_t next_recent{};
+    std::span<const ConstantBufferSlot> cbv_slots;
+    u32 cbv_index{};
+    std::array<D3D12_GPU_VIRTUAL_ADDRESS, MAX_ROOT_CBVS> root_cbvs{};
+    u32 num_root_cbvs{};
+    /// 64 KiB of zeros, the largest constant buffer: what an unbound root CBV points at.
+    ComPtr<ID3D12Resource> zero_buffer;
+    bool logged_mismatch{};
+    bool logged_unaligned{};
+    bool logged_deferred{};
+};
+
+/// The one shader-visible sampler heap. D3D12 caps it at 2048 entries on every tier, too few for
+/// a per-draw ring, so whole sampler tables are deduplicated by content: games reuse the same
+/// combinations constantly. When the heap fills up it is reset after the GPU goes idle.
+class SamplerHeap {
+public:
+    static constexpr u32 CAPACITY = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
+
+    explicit SamplerHeap(ID3D12Device* device, Scheduler& scheduler);
+
+    SamplerHeap(const SamplerHeap&) = delete;
+    SamplerHeap& operator=(const SamplerHeap&) = delete;
+
+    /// Returns a table holding the given offline samplers, in order. keys must identify each
+    /// sampler uniquely for the lifetime of the renderer (they are never reused).
+    [[nodiscard]] D3D12_GPU_DESCRIPTOR_HANDLE GetTable(
+        std::span<const u64> keys, std::span<const D3D12_CPU_DESCRIPTOR_HANDLE> samplers);
+
+    [[nodiscard]] ID3D12DescriptorHeap* Heap() const {
+        return heap.Get();
+    }
+
+private:
+    struct KeyHash {
+        using is_transparent = void;
+        size_t operator()(std::span<const u64> key) const noexcept;
+    };
+    struct KeyEqual {
+        using is_transparent = void;
+        bool operator()(std::span<const u64> lhs, std::span<const u64> rhs) const noexcept;
+    };
+
+    ID3D12Device* device;
+    Scheduler& scheduler;
+    ComPtr<ID3D12DescriptorHeap> heap;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu_base;
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu_base;
+    u32 stride;
+    u32 used{};
+    std::unordered_map<std::vector<u64>, u32, KeyHash, KeyEqual> tables; ///< keys -> first slot
+    /// The table the previous call returned: consecutive draws mostly sample the same way, and
+    /// comparing against it skips hashing the keys.
+    // unordered_map nodes keep their keys stable across rehash. Borrow the immutable key
+    // instead of copying it on every non-consecutive cache hit; clear before tables.clear().
+    std::span<const u64> last_keys;
+    u32 last_first{};
+    bool logged_cache{};
+    bool logged_reuse{};
+};
+
+} // namespace D3D12

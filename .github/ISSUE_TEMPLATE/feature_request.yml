@@ -1,0 +1,22 @@
+name: Feature Request
+description: Suggest something for the Xbox port
+labels: "request"
+body:
+  - type: checkboxes
+    attributes:
+      label: Is there an existing issue for this?
+      options:
+      - label: I have searched the existing issues
+        required: true
+  - type: textarea
+    id: what-feature
+    attributes:
+      label: What feature are you suggesting?
+    validations:
+      required: true
+  - type: textarea
+    id: why-feature
+    attributes:
+      label: Why would this feature be useful?
+    validations:
+      required: true

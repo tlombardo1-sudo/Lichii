@@ -1,0 +1,362 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include <optional>
+
+#include "common/logging.h"
+#include "video_core/frame_pipeline.h"
+#include "video_core/frame_trace.h"
+#include "video_core/perf_counters.h"
+
+#include <boost/container/small_vector.hpp>
+
+#include "core/hle/service/nvdrv/devices/nvdisp_disp0.h"
+#include "core/hle/service/nvnflinger/buffer_item.h"
+#include "core/hle/service/nvnflinger/buffer_item_consumer.h"
+#include "core/hle/service/nvnflinger/hardware_composer.h"
+#include "core/hle/service/nvnflinger/hwc_layer.h"
+#include "core/hle/service/nvnflinger/ui/graphic_buffer.h"
+
+namespace Service::Nvnflinger {
+
+namespace {
+
+s32 NormalizeSwapInterval(f32* out_speed_scale, s32 swap_interval) {
+    if (swap_interval <= 0) {
+        // As an extension, treat nonpositive swap interval as speed multiplier.
+        if (out_speed_scale) {
+            *out_speed_scale = 2.f * static_cast<f32>(1 - swap_interval);
+        }
+
+        swap_interval = 1;
+    }
+
+    if (swap_interval >= 5) {
+        // As an extension, treat high swap interval as precise speed control.
+        if (out_speed_scale) {
+            *out_speed_scale = static_cast<f32>(swap_interval) / 100.f;
+        }
+
+        swap_interval = 1;
+    }
+
+    return swap_interval;
+}
+
+} // namespace
+
+HardwareComposer::HardwareComposer() = default;
+HardwareComposer::~HardwareComposer() = default;
+
+u32 HardwareComposer::ComposeLocked(f32* out_speed_scale, Display& display,
+                                    Nvidia::Devices::nvdisp_disp0& nvdisp) {
+#if BOOST_VERSION >= 108100 || __GNUC__ > 12
+    boost::container::small_vector<HwcLayer, 2> composition_stack;
+    boost::container::small_vector<ConsumerId, 2> composed_consumers;
+#else //TODO: debian stable
+    std::vector<HwcLayer> composition_stack;
+    std::vector<ConsumerId> composed_consumers;
+#endif
+
+    const VideoCore::FrameTrace::ScopedSpan trace_compose{
+        VideoCore::FrameTrace::Event::DisplayComposeLong, m_frame_number};
+    // Set default speed limit to 100%.
+    *out_speed_scale = 1.0f;
+
+    // If no layers are visible, skip the logic. Acquiring and holding buffers here would
+    // consume the producer's queue without ever presenting.
+    bool any_visible = false;
+    for (auto& layer : display.stack.layers) {
+        if (layer->visible) {
+            any_visible = true;
+            break;
+        }
+    }
+    if (!any_visible) {
+        return 1;
+    }
+
+    // Wait for the previous composite, bounding the number of in-flight composites.
+    nvdisp.WaitForComposite();
+
+    // Determine the number of vsync periods to wait before composing again.
+    std::optional<s32> swap_interval{};
+    bool has_acquired_buffer{};
+    // A new frame of the game, not only of the overlay (frame generation leaves the latter out).
+    bool game_acquired{};
+    s64 game_queue_time{};
+
+    // Acquire all necessary framebuffers.
+    for (auto& layer : display.stack.layers) {
+        auto consumer_id = layer->consumer_id;
+
+        bool should_try_acquire = true;
+        if (!layer->is_overlay) {
+            auto fb_it = m_framebuffers.find(consumer_id);
+            if (fb_it != m_framebuffers.end() && fb_it->second.is_acquired) {
+                const u64 frames_since_last_acquire = m_frame_number - fb_it->second.last_acquire_frame;
+                if (frames_since_last_acquire < static_cast<u64>(fb_it->second.pacing_interval)) {
+                    should_try_acquire = false;
+                }
+            }
+        }
+
+        // Try to fetch the framebuffer (either new or stale).
+        const auto result = should_try_acquire
+            ? this->CacheFramebufferLocked(*layer, consumer_id)
+            : (m_framebuffers.find(consumer_id) != m_framebuffers.end() && m_framebuffers[consumer_id].is_acquired
+                ? CacheStatus::CachedBufferReused
+                : CacheStatus::NoBufferAvailable);
+
+        // If we failed, skip this layer.
+        if (result == CacheStatus::NoBufferAvailable) {
+            continue;
+        }
+
+        const auto& buffer = m_framebuffers[consumer_id];
+        const auto& item = buffer.item;
+
+        // If we acquired a new buffer, we need to present.
+        if (result == CacheStatus::BufferAcquired) {
+            has_acquired_buffer = true;
+            if (!layer->is_overlay) {
+                game_acquired = true;
+                game_queue_time = (std::max)(game_queue_time, item.queue_time_ns);
+            }
+        }
+
+        const auto& igbp_buffer = *item.graphic_buffer;
+
+        if (layer->visible) {
+            composition_stack.emplace_back(HwcLayer{
+                .buffer_handle = igbp_buffer.BufferId(),
+                .offset = igbp_buffer.Offset(),
+                .format = igbp_buffer.ExternalFormat(),
+                .width = igbp_buffer.Width(),
+                .height = igbp_buffer.Height(),
+                .stride = igbp_buffer.Stride(),
+                .z_index = layer->z_index,
+                .blending = layer->blending,
+                .transform = static_cast<android::BufferTransformFlags>(item.transform),
+                .crop_rect = item.crop,
+                .acquire_fence = item.fence,
+                .layer_stack_mask = layer->layer_stack_mask,
+                .vsync_index = m_frame_number,
+            });
+            composed_consumers.push_back(consumer_id);
+        }
+
+        // Overlay layers run at their own framerate independently of the game.
+        // Skip them when calculating the swap interval for the main game.
+        if (layer->is_overlay) {
+            continue;
+        }
+
+        // We need to compose again either before this frame is supposed to
+        // be released, or exactly on the vsync period it should be released.
+        const s32 item_swap_interval = NormalizeSwapInterval(out_speed_scale, item.swap_interval);
+
+        // TODO: handle cases where swap intervals are relatively prime. So far,
+        // only swap intervals of 0, 1 and 2 have been observed, but if 3 were
+        // to be introduced, this would cause an issue.
+        if (swap_interval) {
+            swap_interval = (std::min)(*swap_interval, item_swap_interval);
+        } else {
+            swap_interval = item_swap_interval;
+        }
+    }
+
+    // If any new buffers were acquired, we can present.
+    if (has_acquired_buffer && !composition_stack.empty()) {
+        for (HwcLayer& composed : composition_stack) {
+            composed.new_frame = game_acquired;
+            composed.queue_time_ns = game_queue_time;
+        }
+        // Sort back-to-front: lower z first, higher z last so top-most draws last (on top).
+        std::stable_sort(composition_stack.begin(), composition_stack.end(),
+                         [&](const HwcLayer& l, const HwcLayer& r) { return l.z_index < r.z_index; });
+
+        // Composite. The buffers it reads go back to the guest with its fence.
+        const android::Fence release_fence = nvdisp.Composite(composition_stack);
+        for (const ConsumerId consumer_id : composed_consumers) {
+            m_framebuffers[consumer_id].release_fence = release_fence;
+        }
+    }
+
+    if (game_acquired) {
+        TrackFrameChainLocked(swap_interval);
+    } else {
+        TrackFrameChainLocked(std::nullopt);
+    }
+
+    // Advance by 1 frame (60 FPS compositing)
+    m_frame_number += 1;
+
+    // Release framebuffers once the frame has been handed to the compositor. This happens
+    // within the same vsync period as the acquire (release_frame_number is checked against
+    // the advanced counter), so the producer gets its buffers back immediately instead of
+    // losing a queue slot for a whole frame. The composite's release fence travels with the
+    // buffer, so the guest cannot overwrite it before the composite has read it.
+    this->ReleaseFramebuffersLocked(display);
+
+    return 1;
+}
+
+void HardwareComposer::ReleaseFramebuffersLocked(Display& display) {
+    for (auto& [layer_id, framebuffer] : m_framebuffers) {
+        if (!framebuffer.is_acquired) {
+            continue;
+        }
+
+        const auto layer = display.stack.FindLayer(layer_id);
+        if (!layer) {
+            continue;
+        }
+
+        if (!layer->is_overlay && framebuffer.release_frame_number > m_frame_number) {
+            VideoCore::FrameTrace::Mark(VideoCore::FrameTrace::Event::FrameLeaseHold,
+                framebuffer.item.frame_number,
+                (static_cast<u64>(static_cast<u32>(layer_id)) << 32) |
+                static_cast<u32>(framebuffer.release_frame_number - m_frame_number));
+            continue;
+        }
+
+        VideoCore::FrameTrace::Mark(VideoCore::FrameTrace::Event::FrameLeaseRelease,
+            framebuffer.item.frame_number,
+            (static_cast<u64>(static_cast<u32>(layer_id)) << 32) |
+            static_cast<u32>(m_frame_number - framebuffer.last_acquire_frame));
+        layer->buffer_item_consumer->ReleaseBuffer(framebuffer.item, framebuffer.release_fence);
+        framebuffer.is_acquired = false;
+    }
+}
+
+void HardwareComposer::TrackFrameChainLocked(std::optional<s32> game_swap_interval) {
+    using VideoCore::Perf::Counter;
+    static constexpr std::array<Counter, HISTORY_COUNTERS> COUNTERS{
+        Counter::VsyncsLost,          Counter::VsyncComposeWaitUs, Counter::CompositesLate,
+        Counter::PresentFreeWaitUs,   Counter::PresentRenderWaitUs, Counter::PresentCopyWaitUs,
+        Counter::PipelineStallUs,     Counter::GuestDequeueWaitUs, Counter::VsyncComposeWaitsCut,
+    };
+    std::array<u64, HISTORY_COUNTERS> now;
+    for (size_t i = 0; i < HISTORY_COUNTERS; ++i) {
+        now[i] = VideoCore::Perf::ReadCounter(COUNTERS[i]);
+    }
+    // The oldest entry: the counters HISTORY_VSYNCS vsyncs ago (zeros early on).
+    auto& slot = m_history[m_frame_number % HISTORY_VSYNCS];
+    if (game_swap_interval && m_game_swap_interval != 0 &&
+        *game_swap_interval != m_game_swap_interval) {
+        VideoCore::Perf::Add(Counter::GuestSwapIntervalChanges, 1);
+        const auto delta = [&](size_t i) { return now[i] - slot[i]; };
+        const auto ms = [&](size_t i) { return static_cast<double>(delta(i)) / 1000.0; };
+        LOG_INFO(Service_Nvnflinger,
+                 "frame chain: the game's swap interval went {} -> {} at vsync {}; the last {} "
+                 "vsyncs: {} lost, waited {:.1f} ms for the GPU thread ({} waits cut), {} late "
+                 "composites, present frame waits free {:.1f} / render {:.1f} / copy {:.1f} ms, "
+                 "pipeline stalls {:.1f} ms, game waited {:.1f} ms for a framebuffer",
+                 m_game_swap_interval, *game_swap_interval, m_frame_number, HISTORY_VSYNCS,
+                 delta(0), ms(1), delta(8), delta(2), ms(3), ms(4), ms(5), ms(6), ms(7));
+    }
+    if (game_swap_interval) {
+        m_game_swap_interval = *game_swap_interval;
+    }
+    slot = now;
+}
+
+void HardwareComposer::RemoveLayerLocked(Display& display, ConsumerId consumer_id) {
+    // Check if we are tracking a slot with this consumer_id.
+    const auto it = m_framebuffers.find(consumer_id);
+    if (it == m_framebuffers.end()) {
+        return;
+    }
+
+    // Try to release the buffer item.
+    const auto layer = display.stack.FindLayer(consumer_id);
+    if (layer && it->second.is_acquired) {
+        layer->buffer_item_consumer->ReleaseBuffer(it->second.item, it->second.release_fence);
+    }
+
+    // Erase the slot.
+    m_framebuffers.erase(it);
+}
+
+bool HardwareComposer::TryAcquireFramebufferLocked(Layer& layer, Framebuffer& framebuffer) {
+    // Attempt the update.
+    const auto status = layer.buffer_item_consumer->AcquireBuffer(&framebuffer.item, {}, false);
+    if (status != android::Status::NoError) {
+        return false;
+    }
+
+    // We succeeded, so set the new release frame info.
+    const s32 swap_interval = layer.is_overlay
+        ? 1
+        : GamePacingIntervalLocked(NormalizeSwapInterval(nullptr, framebuffer.item.swap_interval));
+    framebuffer.pacing_interval = swap_interval;
+    framebuffer.release_frame_number = m_frame_number + swap_interval;
+    framebuffer.last_acquire_frame = m_frame_number;
+    framebuffer.is_acquired = true;
+    framebuffer.release_fence = android::Fence::NoFence();
+    VideoCore::FrameTrace::Mark(VideoCore::FrameTrace::Event::FrameLeaseAcquire,
+        framebuffer.item.frame_number,
+        (static_cast<u64>(static_cast<u32>(layer.consumer_id)) << 32) |
+        static_cast<u32>(swap_interval));
+
+    return true;
+}
+
+s32 HardwareComposer::GamePacingIntervalLocked(s32 requested) {
+    using VideoCore::FramePipeline::Mode;
+    static constexpr u64 HOLD_VSYNCS = 120;
+    const Mode mode = VideoCore::FramePipeline::SwapIntervalHold();
+    if (mode == Mode::Off) {
+        return requested;
+    }
+    if (requested == 2) {
+        m_last_interval_2_frame = m_frame_number;
+    }
+    if (requested != 3 || !m_last_interval_2_frame ||
+        m_frame_number - *m_last_interval_2_frame > HOLD_VSYNCS) {
+        return requested;
+    }
+    VideoCore::Perf::Add(VideoCore::Perf::Counter::GuestSwapIntervalsHeld, 1);
+    return mode == Mode::On ? 2 : requested;
+}
+
+HardwareComposer::CacheStatus HardwareComposer::CacheFramebufferLocked(Layer& layer,
+                                                                       ConsumerId consumer_id) {
+    // Check if this framebuffer is already present.
+    const auto it = m_framebuffers.find(consumer_id);
+    if (it != m_framebuffers.end()) {
+        // If it's currently still acquired, we are done.
+        if (it->second.is_acquired) {
+            return CacheStatus::CachedBufferReused;
+        }
+
+        // Try to acquire a new item.
+        if (this->TryAcquireFramebufferLocked(layer, it->second)) {
+            // We got a new item.
+            return CacheStatus::BufferAcquired;
+        } else {
+            // We didn't acquire a new item, but we can reuse the slot.
+            return CacheStatus::CachedBufferReused;
+        }
+    }
+
+    // Framebuffer is not present, so try to create it.
+    Framebuffer framebuffer{};
+
+    if (this->TryAcquireFramebufferLocked(layer, framebuffer)) {
+        // Move the buffer item into a new slot.
+        m_framebuffers.emplace(consumer_id, std::move(framebuffer));
+
+        // We succeeded.
+        return CacheStatus::BufferAcquired;
+    }
+
+    // We couldn't acquire the buffer item, so don't create a slot.
+    return CacheStatus::NoBufferAvailable;
+}
+
+} // namespace Service::Nvnflinger

@@ -1,0 +1,332 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include <optional>
+
+#include "common/settings.h"
+#include "core/core.h"
+#include "video_core/dma_pusher.h"
+#include "video_core/engines/const_buffer_run.h"
+#include "video_core/engines/maxwell_3d.h"
+#include "video_core/gpu.h"
+#include "video_core/gpu_written_pages.h"
+#include "video_core/guest_memory.h"
+#include "video_core/memory_manager.h"
+#include "video_core/perf_counters.h"
+#include "video_core/rasterizer_interface.h"
+
+namespace Tegra {
+
+constexpr u32 MacroRegistersStart = 0xE00;
+constexpr u32 ComputeInline = 0x6D;
+
+DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Control::ChannelState& channel_state_)
+    : system{system_}
+    , memory_manager{memory_manager_}
+    , channel_state{channel_state_}
+    , signal_sync{false}
+    , synced{false}
+{}
+
+DmaPusher::~DmaPusher() = default;
+
+void DmaPusher::DispatchCalls() {
+    dma_pushbuffer_subindex = 0;
+    dma_state.is_last_call = true;
+    while (system.IsPoweredOn()) {
+        if (!Step()) {
+            break;
+        }
+    }
+    system.GPU().FlushCommands();
+    system.GPU().OnCommandListEnd();
+}
+
+bool DmaPusher::Step() {
+    if (!ib_enable || dma_pushbuffer.empty()) {
+        return false;
+    }
+
+    CommandList& command_list = dma_pushbuffer.front();
+
+    const size_t prefetch_size = command_list.prefetch_command_list.size();
+    const size_t command_list_size = command_list.command_lists.size();
+
+    if (prefetch_size == 0 && command_list_size == 0) {
+        dma_pushbuffer.pop();
+        dma_pushbuffer_subindex = 0;
+        return true;
+    }
+
+    if (prefetch_size > 0) {
+        ProcessCommands(command_list.prefetch_command_list);
+        dma_pushbuffer.pop();
+        return true;
+    }
+
+    auto& current_command = command_list.command_lists[dma_pushbuffer_subindex];
+    const CommandListHeader& header = current_command;
+    dma_state.dma_get = header.addr;
+
+    if (signal_sync && !synced) {
+        std::unique_lock lk(sync_mutex);
+        sync_cv.wait(lk, [this]() { return synced; });
+        signal_sync = false;
+        synced = false;
+    }
+
+    if (header.size > 0) {
+        // dma_flush_filter=1: memory no cache ever held GPU writes for has nothing to flush, so
+        // the safe read and the dirty check can skip the cache locks for it.
+        const bool filter = VideoCommon::GpuWrittenPages::Enabled();
+        std::optional<bool> gpu_written_result;
+        const auto gpu_written = [&] {
+            if (!gpu_written_result) {
+                gpu_written_result = !filter || memory_manager.MayHoldGpuWrites(
+                                                    dma_state.dma_get, header.size * sizeof(u32));
+            }
+            return *gpu_written_result;
+        };
+        // A segment that holds nothing but arguments of a macro call already open carries no
+        // command headers: the parser can read it as it is. The macro learns through
+        // current_dirty that the GPU wrote its arguments and either hands them to the GPU (the
+        // indirect draws) or refreshes the words it reads on the CPU, so the flush, a full GPU
+        // wait per page, waits only when a macro really reads GPU-written words.
+        bool macro_arguments_only = false;
+        if (subchannels[dma_state.subchannel] && dma_state.method_count) {
+            const auto engine = subchannel_type[dma_state.subchannel];
+            const bool kepler_payload = engine == Engines::EngineTypes::KeplerCompute && dma_state.method == ComputeInline && dma_state.non_incrementing;
+            const bool macro_payload = engine == Engines::EngineTypes::Maxwell3D && dma_state.method >= MacroRegistersStart;
+            if (kepler_payload || macro_payload) {
+                const size_t words = std::min<size_t>(dma_state.method_count, header.size);
+                subchannels[dma_state.subchannel]->current_dirty = gpu_written() && memory_manager.IsMemoryDirty(dma_state.dma_get, words * sizeof(u32));
+            }
+            macro_arguments_only = macro_payload && dma_state.non_incrementing &&
+                                   dma_state.method_count >= header.size;
+        }
+        bool use_safe = Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe();
+        if (use_safe && (filter || macro_arguments_only)) {
+            use_safe = !macro_arguments_only && gpu_written();
+            VideoCore::Perf::AddDetailed(use_safe ? VideoCore::Perf::Counter::DmaHeaderFlushes
+                                                     : VideoCore::Perf::Counter::DmaHeaderFlushesSkipped,
+                                         1);
+        }
+        if (use_safe) {
+            Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
+            ProcessCommands(headers);
+        } else {
+            Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
+            ProcessCommands(headers);
+        }
+    }
+
+    if (++dma_pushbuffer_subindex >= command_list_size) {
+        dma_pushbuffer.pop();
+        dma_pushbuffer_subindex = 0;
+    } else {
+        signal_sync = command_list.command_lists[dma_pushbuffer_subindex].sync && Settings::values.sync_memory_operations.GetValue();
+    }
+
+    if (signal_sync) {
+        rasterizer->SignalFence([this]() {
+            std::scoped_lock lk(sync_mutex);
+            synced = true;
+            sync_cv.notify_all();
+        });
+    }
+
+    return true;
+}
+
+void DmaPusher::ProcessCommands(std::span<const CommandHeader> commands) {
+    for (size_t index = 0; index < commands.size();) {
+        // Data word of methods command
+        if (dma_state.method_count && dma_state.non_incrementing) {
+            auto const& command_header = commands[index]; //must ref (MUltiMethod re)
+            dma_state.dma_word_offset = u32(index * sizeof(u32));
+            const u32 max_write = u32(std::min<std::size_t>(index + dma_state.method_count, commands.size()) - index);
+            CallMultiMethod(&command_header.argument, max_write);
+            dma_state.method_count -= max_write;
+            dma_state.is_last_call = true;
+            index += max_write;
+        } else if (dma_state.method_count) {
+            if (const u32 words = CallConstBufferRun(commands.subspan(index), index); words != 0) {
+                index += words;
+                continue;
+            }
+            auto const command_header = commands[index]; //can copy
+            dma_state.dma_word_offset = u32(index * sizeof(u32));
+            dma_state.is_last_call = dma_state.method_count <= 1;
+            CallMethod(command_header.argument);
+            dma_state.method += !dma_state.non_incrementing ? 1 : 0;
+            dma_state.non_incrementing |= dma_increment_once;
+            dma_state.method_count--;
+            index++;
+        } else {
+            auto const command_header = commands[index]; //can copy
+            // No command active - this is the first word of a new one
+            switch (command_header.mode) {
+            case SubmissionMode::Increasing:
+                SetState(command_header);
+                dma_state.non_incrementing = false;
+                dma_increment_once = false;
+                break;
+            case SubmissionMode::NonIncreasing:
+                SetState(command_header);
+                dma_state.non_incrementing = true;
+                dma_increment_once = false;
+                break;
+            case SubmissionMode::Inline:
+                dma_state.method = command_header.method;
+                dma_state.subchannel = command_header.subchannel;
+                dma_state.dma_word_offset = u64(-s64(dma_state.dma_get)); // negate to set address as 0
+                CallMethod(command_header.arg_count);
+                dma_state.non_incrementing = true;
+                dma_increment_once = false;
+                break;
+            case SubmissionMode::IncreaseOnce:
+                SetState(command_header);
+                dma_state.non_incrementing = false;
+                dma_increment_once = true;
+                break;
+            default:
+                break;
+            }
+            index++;
+        }
+    }
+}
+
+namespace {
+struct EngineCounters {
+    VideoCore::Perf::Counter ns;
+    VideoCore::Perf::Counter calls;
+};
+
+/// Profile counters of a non-macro engine call; only looked up while the profile is on.
+EngineCounters CountersFor(Engines::EngineTypes engine) {
+    using VideoCore::Perf::Counter;
+    switch (engine) {
+    case Engines::EngineTypes::Maxwell3D:
+        return {Counter::DmaMaxwellNs, Counter::DmaMaxwellCalls};
+    case Engines::EngineTypes::KeplerCompute:
+        return {Counter::DmaComputeNs, Counter::DmaComputeCalls};
+    case Engines::EngineTypes::Fermi2D:
+    case Engines::EngineTypes::MaxwellDMA:
+        return {Counter::DmaCopyNs, Counter::DmaCopyCalls};
+    default:
+        return {Counter::DmaOtherNs, Counter::DmaOtherCalls};
+    }
+}
+} // namespace
+
+void DmaPusher::SetState(const CommandHeader& command_header) {
+    dma_state.method = command_header.method;
+    dma_state.subchannel = command_header.subchannel;
+    dma_state.method_count = command_header.method_count;
+}
+
+void DmaPusher::CallMethod(u32 argument) {
+    if (dma_state.method < non_puller_methods) {
+        VideoCore::Perf::ScopedNsTimer timer{VideoCore::Perf::Counter::DmaPullerNs};
+        VideoCore::Perf::AddDetailed(VideoCore::Perf::Counter::DmaPullerCalls, 1);
+        puller.CallPullerMethod(*this, Engines::Puller::MethodCall{
+            dma_state.method,
+            argument,
+            dma_state.subchannel,
+            dma_state.method_count,
+        });
+    } else {
+        auto subchannel = subchannels[dma_state.subchannel];
+        if (!subchannel->execution_mask[dma_state.method]) {
+            subchannel->method_sink.emplace_back(dma_state.method, argument);
+        } else {
+            const auto engine = subchannel_type[dma_state.subchannel];
+            const bool macro = engine == Engines::EngineTypes::Maxwell3D &&
+                               dma_state.method >= MacroRegistersStart;
+            // Macros time themselves (RecordMacroProfile); other engines only while profiling.
+            if (macro || !VideoCore::Perf::DetailedGpuProfileEnabled()) [[likely]] {
+                subchannel->ConsumeSink(system);
+                subchannel->current_dma_segment = dma_state.dma_get + dma_state.dma_word_offset;
+                subchannel->CallMethod(system, dma_state.method, argument, dma_state.is_last_call);
+                return;
+            }
+            const EngineCounters counters = CountersFor(engine);
+            VideoCore::Perf::ScopedNsTimer timer{counters.ns};
+            VideoCore::Perf::Add(counters.calls, 1);
+            subchannel->ConsumeSink(system);
+            subchannel->current_dma_segment = dma_state.dma_get + dma_state.dma_word_offset;
+            subchannel->CallMethod(system, dma_state.method, argument, dma_state.is_last_call);
+        }
+    }
+}
+
+u32 DmaPusher::CallConstBufferRun(std::span<const CommandHeader> pending, size_t index) {
+    if (subchannel_type[dma_state.subchannel] != Engines::EngineTypes::Maxwell3D) {
+        return 0;
+    }
+    // Only the incrementing branch calls this, so dma_increment_once marks the first word of an
+    // IncreaseOnce packet.
+    constexpr u32 first_cb_data =
+        u32(offsetof(Engines::Maxwell3D::Regs, const_buffer.buffer) / sizeof(u32));
+    const u32 words = Engines::ConstBufferRunLength(first_cb_data, dma_state.method,
+                                                    dma_state.method_count, pending.size(),
+                                                    dma_increment_once);
+    auto* const maxwell = static_cast<Engines::Maxwell3D*>(subchannels[dma_state.subchannel]);
+    if (words == 0 || !maxwell || !maxwell->CanStoreConstBufferRun()) {
+        return 0;
+    }
+    VideoCore::Perf::ScopedNsTimer timer{VideoCore::Perf::Counter::DmaMaxwellNs};
+    VideoCore::Perf::AddDetailed(VideoCore::Perf::Counter::DmaMaxwellCalls, 1);
+    VideoCore::Perf::AddDetailed(VideoCore::Perf::Counter::ConstBufferRuns, 1);
+    VideoCore::Perf::AddDetailed(VideoCore::Perf::Counter::ConstBufferRunWords, words);
+    dma_state.dma_word_offset = u32(index * sizeof(u32));
+    maxwell->ConsumeSink(system);
+    maxwell->current_dma_segment = dma_state.dma_get + dma_state.dma_word_offset;
+    maxwell->StoreConstBufferRun(dma_state.method, &pending[0].argument, words,
+                                 dma_increment_once);
+    if (dma_increment_once) {
+        dma_state.method++;
+        dma_state.non_incrementing = true;
+    } else {
+        dma_state.method += words;
+    }
+    dma_state.method_count -= words;
+    dma_state.is_last_call = dma_state.method_count == 0;
+    return words;
+}
+
+void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
+    if (dma_state.method < non_puller_methods) {
+        VideoCore::Perf::ScopedNsTimer timer{VideoCore::Perf::Counter::DmaPullerNs};
+        VideoCore::Perf::AddDetailed(VideoCore::Perf::Counter::DmaPullerCalls, 1);
+        puller.CallMultiMethod(*this, dma_state.method, dma_state.subchannel, base_start, num_methods, dma_state.method_count);
+    } else {
+        auto subchannel = subchannels[dma_state.subchannel];
+        const auto engine = subchannel_type[dma_state.subchannel];
+        const bool macro = engine == Engines::EngineTypes::Maxwell3D &&
+                           dma_state.method >= MacroRegistersStart;
+        if (macro || !VideoCore::Perf::DetailedGpuProfileEnabled()) [[likely]] {
+            subchannel->ConsumeSink(system);
+            subchannel->current_dma_segment = dma_state.dma_get + dma_state.dma_word_offset;
+            subchannel->CallMultiMethod(system, dma_state.method, base_start, num_methods,
+                                        dma_state.method_count);
+            return;
+        }
+        const EngineCounters counters = CountersFor(engine);
+        VideoCore::Perf::ScopedNsTimer timer{counters.ns};
+        VideoCore::Perf::Add(counters.calls, 1);
+        subchannel->ConsumeSink(system);
+        subchannel->current_dma_segment = dma_state.dma_get + dma_state.dma_word_offset;
+        subchannel->CallMultiMethod(system, dma_state.method, base_start, num_methods, dma_state.method_count);
+    }
+}
+
+void DmaPusher::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) {
+    rasterizer = rasterizer_;
+}
+
+} // namespace Tegra

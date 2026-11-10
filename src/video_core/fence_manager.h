@@ -1,0 +1,375 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include <algorithm>
+#include <condition_variable>
+#include <cstring>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <thread>
+#include <queue>
+
+#include "common/common_types.h"
+#include "common/settings.h"
+#include "common/thread.h"
+#include "video_core/delayed_destruction_ring.h"
+#include "video_core/gpu.h"
+#include "video_core/host1x/host1x.h"
+#include "video_core/host1x/syncpoint_manager.h"
+#include "video_core/rasterizer_download_area.h"
+#include "video_core/rasterizer_interface.h"
+
+#include "video_core/frame_trace.h"
+#include "video_core/perf_counters.h"
+
+namespace VideoCommon {
+
+/// With the default fence behavior, signal the host side of a syncpoint as soon as the GPU thread
+/// reaches it while nothing queued before it waits on the host GPU (no download, no operation).
+/// Off, a GPU accuracy of High signals every syncpoint once the host GPU ran the work before it.
+inline std::atomic<bool> early_syncpoints{true};
+
+inline void SetEarlySyncpoints(bool enabled) {
+    early_syncpoints.store(enabled, std::memory_order_relaxed);
+}
+
+class FenceBase {
+public:
+    explicit FenceBase(bool is_stubbed_) : is_stubbed{is_stubbed_} {}
+
+    bool IsStubbed() const {
+        return is_stubbed;
+    }
+
+protected:
+    bool is_stubbed;
+};
+
+template <typename Traits>
+class FenceManager {
+    using TFence = typename Traits::FenceType;
+    using TTextureCache = typename Traits::TextureCacheType;
+    using TBufferCache = typename Traits::BufferCacheType;
+    using TQueryCache = typename Traits::QueryCacheType;
+    static constexpr bool can_async_check = Traits::HAS_ASYNC_CHECK;
+
+public:
+    /// Notify the fence manager about a new frame
+    void TickFrame() {
+        std::unique_lock lock(ring_guard);
+        delayed_destruction_ring.Tick();
+    }
+
+    // Unlike other fences, this one doesn't
+    void SignalOrdering() {
+        if constexpr (!can_async_check) {
+            TryReleasePendingFences<false>();
+        }
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.AccumulateFlushes();
+    }
+
+    void SignalReference() {
+        std::function<void()> do_nothing([] {});
+        SignalFence(std::move(do_nothing));
+    }
+
+    void SyncOperation(std::function<void()>&& func) {
+        uncommitted_operations.emplace_back(std::move(func));
+    }
+
+    void SignalFence(std::function<void()>&& func) {
+        SignalFence(std::move(func), false);
+    }
+
+    void SignalSyncPoint(u32 value) {
+        syncpoint_manager.IncrementGuest(value);
+        std::function<void()> func([this, value] { syncpoint_manager.IncrementHost(value); });
+        SignalFence(std::move(func), true);
+    }
+
+    void WaitPendingFences([[maybe_unused]] bool force) {
+        if constexpr (!can_async_check) {
+            TryReleasePendingFences<true>();
+        } else {
+            if (!force) {
+                return;
+            }
+            std::mutex wait_mutex;
+            std::condition_variable wait_cv;
+            std::atomic<bool> wait_finished{};
+            std::function<void()> func([&] {
+                std::scoped_lock lk(wait_mutex);
+                wait_finished.store(true, std::memory_order_relaxed);
+                wait_cv.notify_all();
+            });
+            SignalFence(std::move(func));
+            std::unique_lock lk(wait_mutex);
+            wait_cv.wait(
+                lk, [&wait_finished] { return wait_finished.load(std::memory_order_relaxed); });
+        }
+    }
+
+protected:
+    explicit FenceManager(VideoCore::RasterizerInterface& rasterizer_, Tegra::GPU& gpu_,
+                          TTextureCache& texture_cache_, TBufferCache& buffer_cache_,
+                          TQueryCache& query_cache_)
+        : rasterizer{rasterizer_}, gpu{gpu_}, syncpoint_manager{gpu.Host1x().GetSyncpointManager()},
+          texture_cache{texture_cache_}, buffer_cache{buffer_cache_}, query_cache{query_cache_} {
+        if constexpr (can_async_check) {
+            fence_thread =
+                std::jthread([this](std::stop_token token) { ReleaseThreadFunc(token); });
+        }
+    }
+
+    virtual ~FenceManager() {
+        if constexpr (can_async_check) {
+            fence_thread.request_stop();
+            cv.notify_all();
+            fence_thread.join();
+        }
+    }
+
+    /// Creates a Fence Interface, does not create a backend fence if 'is_stubbed' is
+    /// true
+    virtual TFence CreateFence(bool is_stubbed) = 0;
+    /// Queues a fence into the backend if the fence isn't stubbed.
+    virtual void QueueFence(TFence& fence) = 0;
+    /// Notifies that the backend fence has been signaled/reached in host GPU.
+    virtual bool IsFenceSignaled(TFence& fence) const = 0;
+    /// Waits until a fence has been signalled by the host GPU.
+    virtual void WaitFence(TFence& fence) = 0;
+
+    VideoCore::RasterizerInterface& rasterizer;
+    Tegra::GPU& gpu;
+    Tegra::Host1x::SyncpointManager& syncpoint_manager;
+    TTextureCache& texture_cache;
+    TBufferCache& buffer_cache;
+    TQueryCache& query_cache;
+
+private:
+    void SignalFence(std::function<void()>&& func, bool is_syncpoint) {
+        // CPU reads cached as checked before this fence check again: the guest may now read what
+        // the work before it wrote.
+        VideoCore::AdvanceDownloadAreaEpoch();
+        bool delay_fence = Settings::IsGPUFenceBehaviorDefault() ? Settings::IsGPULevelHigh() : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
+        const FlushSources flush_sources = PendingFlushSources();
+        const bool should_flush = flush_sources.Any();
+        if constexpr (!can_async_check) {
+            TryReleasePendingFences<false>();
+        }
+        CommitAsyncFlushes();
+        TFence new_fence = CreateFence(!should_flush);
+        if constexpr (can_async_check) {
+            guard.lock();
+        }
+        // The guest learns from a syncpoint that the work before it is visible: what the GPU wrote
+        // is downloaded and the operations queued with fences have run. When no fence still has
+        // either to do, waiting for the host GPU to run the work shows the guest nothing more.
+        if (delay_fence && is_syncpoint && Settings::IsGPUFenceBehaviorDefault() &&
+            early_syncpoints.load(std::memory_order_relaxed)) {
+            using VideoCore::Perf::Counter;
+            const Counter reason =
+                flush_sources.buffer                  ? Counter::SyncpointsAfterBufferDownloads
+                : flush_sources.texture               ? Counter::SyncpointsAfterTextureDownloads
+                : flush_sources.query                 ? Counter::SyncpointsAfterQueryFlushes
+                : !uncommitted_operations.empty()     ? Counter::SyncpointsAfterOperations
+                : guest_visible_fences.load(std::memory_order_acquire) != 0
+                    ? Counter::SyncpointsAfterQueuedFences
+                    : Counter::SyncpointsEarly;
+            delay_fence = reason != Counter::SyncpointsEarly;
+            VideoCore::Perf::Add(reason, 1);
+        }
+        // A counter's result reaches guest memory when the fence releases, so what tells the guest
+        // to read it waits for that under any fence setting.
+        if (flush_sources.query) {
+            delay_fence = true;
+        }
+        if (delay_fence) {
+            uncommitted_operations.emplace_back(std::move(func));
+        }
+        if (IsGuestVisible(new_fence, uncommitted_operations)) {
+            guest_visible_fences.fetch_add(1, std::memory_order_relaxed);
+        }
+        pending_operations.emplace_back(std::move(uncommitted_operations));
+        VideoCore::FrameTrace::Mark(VideoCore::FrameTrace::Event::FenceQueued,
+            reinterpret_cast<uintptr_t>(new_fence.get()), pending_operations.back().size());
+        QueueFence(new_fence);
+        if (!delay_fence) {
+            func();
+        }
+        fences.push(std::move(new_fence));
+        if (should_flush) {
+            rasterizer.FlushCommands();
+        }
+        if constexpr (can_async_check) {
+            guard.unlock();
+            cv.notify_all();
+        }
+        rasterizer.InvalidateGPUCache();
+    }
+
+    /// Whether the guest can see what the fence waits for: downloads or operations.
+    static bool IsGuestVisible(const TFence& fence,
+                               const std::deque<std::function<void()>>& operations) {
+        return !fence->IsStubbed() || !operations.empty();
+    }
+
+    template <bool force_wait>
+    void TryReleasePendingFences() {
+        while (!fences.empty()) {
+            TFence& current_fence = fences.front();
+            if (ShouldWait() && !IsFenceSignaled(current_fence)) {
+                if constexpr (force_wait) {
+                    WaitFence(current_fence);
+                } else {
+                    return;
+                }
+            }
+            PopAsyncFlushes();
+            auto operations = std::move(pending_operations.front());
+            pending_operations.pop_front();
+            for (auto& operation : operations) {
+                operation();
+            }
+            if (IsGuestVisible(current_fence, operations)) {
+                guest_visible_fences.fetch_sub(1, std::memory_order_release);
+            }
+            {
+                std::unique_lock lock(ring_guard);
+                delayed_destruction_ring.Push(std::move(current_fence));
+            }
+            fences.pop();
+        }
+    }
+
+    void ReleaseThreadFunc(std::stop_token stop_token) {
+        Common::SetCurrentThreadName("GPUFencingThread");
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+        Common::SetCurrentThreadToPerformanceCores();
+
+        TFence current_fence;
+        std::deque<std::function<void()>> current_operations;
+        while (!stop_token.stop_requested()) {
+            {
+                std::unique_lock lock(guard);
+                cv.wait(lock, [&] { return stop_token.stop_requested() || !fences.empty(); });
+                if (stop_token.stop_requested()) [[unlikely]] {
+                    return;
+                }
+                current_fence = std::move(fences.front());
+                current_operations = std::move(pending_operations.front());
+                fences.pop();
+                pending_operations.pop_front();
+            }
+            const u64 trace_fence = reinterpret_cast<uintptr_t>(current_fence.get());
+            VideoCore::FrameTrace::Mark(VideoCore::FrameTrace::Event::FenceDequeued,
+                                       trace_fence, current_fence->IsStubbed());
+            {
+                const VideoCore::FrameTrace::ScopedSpan span{
+                    VideoCore::FrameTrace::Event::FenceWaitLong, trace_fence};
+                if (!current_fence->IsStubbed()) {
+                    WaitFence(current_fence);
+                }
+            }
+            {
+                const VideoCore::FrameTrace::ScopedSpan span{
+                    VideoCore::FrameTrace::Event::FenceFlushLong, trace_fence};
+                PopAsyncFlushes(trace_fence);
+            }
+            VideoCore::FrameTrace::Mark(VideoCore::FrameTrace::Event::FenceCallbacksBegin,
+                                       trace_fence, current_operations.size());
+            {
+                const VideoCore::FrameTrace::ScopedSpan span{
+                    VideoCore::FrameTrace::Event::FenceCallbacksLong, trace_fence};
+                for (auto& operation : current_operations) {
+                    operation();
+                }
+            }
+            if (IsGuestVisible(current_fence, current_operations)) {
+                guest_visible_fences.fetch_sub(1, std::memory_order_release);
+            }
+            VideoCore::FrameTrace::Mark(VideoCore::FrameTrace::Event::FenceDone, trace_fence);
+            {
+                std::unique_lock lock(ring_guard);
+                delayed_destruction_ring.Push(std::move(current_fence));
+            }
+        }
+    }
+
+    bool ShouldWait() const {
+        std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+        return texture_cache.ShouldWaitAsyncFlushes() || buffer_cache.ShouldWaitAsyncFlushes() ||
+               query_cache.ShouldWaitAsyncFlushes();
+    }
+
+    /// The caches with downloads not committed to a fence yet.
+    struct FlushSources {
+        bool texture;
+        bool buffer;
+        bool query;
+
+        bool Any() const {
+            return texture || buffer || query;
+        }
+    };
+
+    FlushSources PendingFlushSources() const {
+        std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+        return {texture_cache.HasUncommittedFlushes(), buffer_cache.HasUncommittedFlushes(),
+                query_cache.HasUncommittedFlushes()};
+    }
+
+    void PopAsyncFlushes(u64 trace_fence = 0) {
+        {
+            VideoCore::FrameTrace::ScopedSpan lock_span{
+                VideoCore::FrameTrace::Event::FenceFlushLockLong, trace_fence, trace_fence != 0};
+            std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+            lock_span.Finish();
+            {
+                const VideoCore::FrameTrace::ScopedSpan span{
+                    VideoCore::FrameTrace::Event::FenceTextureFlushLong, trace_fence, trace_fence != 0};
+                texture_cache.PopAsyncFlushes();
+            }
+            {
+                const VideoCore::FrameTrace::ScopedSpan span{
+                    VideoCore::FrameTrace::Event::FenceBufferFlushLong, trace_fence, trace_fence != 0};
+                buffer_cache.PopAsyncFlushes();
+            }
+        }
+        const VideoCore::FrameTrace::ScopedSpan span{
+            VideoCore::FrameTrace::Event::FenceQueryFlushLong, trace_fence, trace_fence != 0};
+        query_cache.PopAsyncFlushes();
+    }
+
+    void CommitAsyncFlushes() {
+        {
+            std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+            texture_cache.CommitAsyncFlushes();
+            buffer_cache.CommitAsyncFlushes();
+        }
+        query_cache.CommitAsyncFlushes();
+    }
+
+    std::queue<TFence> fences;
+    std::deque<std::function<void()>> uncommitted_operations;
+    std::deque<std::deque<std::function<void()>>> pending_operations;
+    /// Queued fences with downloads or operations the guest sees, not released yet.
+    std::atomic<size_t> guest_visible_fences{};
+
+    std::mutex guard;
+    std::mutex ring_guard;
+    std::condition_variable cv;
+
+    std::jthread fence_thread;
+
+    DelayedDestructionRing<TFence, 8> delayed_destruction_ring;
+};
+
+} // namespace VideoCommon

@@ -1,0 +1,57 @@
+// SPDX-FileCopyrightText: Copyright 2026 Jadyx Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+#pragma once
+
+// The mods page as drawn: header with what is on, what conflicts and what has updates, the three
+// tabs, the tab's list or grid, a line under it that explains the selection in plain words (which
+// mod wins which files, whether it fits the installed version, what downloads), and the sheets
+// over it. The host draws the button prompts under it, at ModsLayout::Footer, from ModsPrompts.
+
+#include <string_view>
+#include <vector>
+
+#include "jadyx/i18n/localization.h"
+#include "jadyx/mods/mod_session.h"
+#include "jadyx/mods/mods_page.h"
+
+namespace Jadyx {
+
+class UiPainter;
+
+namespace Mods {
+
+struct ModsView {
+    const ModSession& session;
+    const ModsPage& page;
+    std::wstring_view game;   ///< The game's name, under the title.
+    std::wstring_view notice; ///< What the last action did, if it needs saying.
+    bool content_focused{true};
+    bool tabs_focused{};
+    std::wstring_view previous_tab{L"LT"}, next_tab{L"RT"};
+    std::wstring_view confirm{L"A"}; ///< The button that opens the focused card.
+    unsigned confirm_color{0xf5f5f7};
+    float scroll{-1};      ///< The first list row shown, eased; below 0, page.first.
+    float grid_scroll{-1}; ///< The first row of cards shown, eased; below 0, page.card_first's row.
+    float grid_bottom{656}; ///< Where the grid's view ends in the panel; lower as the header folds.
+};
+
+/// Draws the page in the ModsLayout panel, offset by (x, y).
+void DrawModsPanel(UiPainter& paint, const ModsView& view, float x = 0, float y = 0);
+
+void DrawModsStatus(UiPainter& paint, const ModsView& view, float x = 0, float y = 0);
+
+I18n::Text ErrorText(ModError error);
+
+/// The buttons that do something on the page as it is now.
+struct ModsPrompt {
+    enum class Button : std::uint8_t { A, B, X, Y, Bumpers, Menu };
+    Button button;
+    I18n::Text label;
+};
+std::vector<ModsPrompt> ModsPrompts(const ModSession& session, const ModsPage& page);
+
+/// What the page needs of the session for one press (ModsCounts).
+ModsCounts CountsFor(const ModSession& session, const ModsPage& page, std::wstring_view game_name);
+
+} // namespace Mods
+} // namespace Jadyx

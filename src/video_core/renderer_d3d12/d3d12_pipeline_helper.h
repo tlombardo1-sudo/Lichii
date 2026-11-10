@@ -1,0 +1,326 @@
+// SPDX-FileCopyrightText: Copyright 2026 Jadyx Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#pragma once
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <optional>
+#include <span>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include <boost/container/small_vector.hpp>
+
+#include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/shader_info.h"
+#include "video_core/memory_manager.h"
+#include "video_core/renderer_d3d12/d3d12_descriptor_heap.h"
+#include "video_core/renderer_d3d12/d3d12_draw_sampler_cache.h"
+#include "video_core/renderer_d3d12/d3d12_maxwell_to_d3d12.h"
+#include "video_core/renderer_d3d12/d3d12_render_corrections.h"
+#include "video_core/renderer_d3d12/d3d12_root_signature.h"
+#include "video_core/renderer_d3d12/d3d12_scheduler.h"
+#include "video_core/renderer_d3d12/d3d12_texture_cache.h"
+#include "video_core/surface.h"
+#include "video_core/textures/texture.h"
+
+// What the graphics and compute pipelines share when they bind guest resources (the D3D12
+// counterpart of renderer_vulkan/pipeline_helper.h).
+
+namespace D3D12 {
+
+/// The fragment shader computes the logic op: D3D12's needs a feature the console lacks. Render
+/// target 0 only, single sampled, and in a format whose bits the shader knows.
+template <typename State>
+[[nodiscard]] bool EmulatesLogicOp(const State& state) {
+    return state.dynamic_state.logic_op_enable != 0 &&
+           MaxwellToD3D12::SampleCount(state.msaa_mode) == 1 &&
+           LogicOpChannelBits(state.color_formats[0])[0] != 0;
+}
+
+using ImageViewList = boost::container::small_vector<VideoCommon::ImageViewInOut, 64>;
+using SamplerIdList = boost::container::small_vector<VideoCommon::SamplerId, 64>;
+/// Views whose images get transitioned once every copy of the draw has been recorded, and whether
+/// each one is a storage image.
+using ImageTransitionList =
+    boost::container::small_vector<std::pair<VideoCommon::ImageViewId, bool>, 32>;
+
+/// Calls func(view_id, is_storage) for each transition in the order they must be recorded: reads
+/// through a reinterpreted copy first, since refreshing the copy reads the image; then storage
+/// images; then the other reads. An image this draw or dispatch both stores and samples (a depth
+/// pyramid writes each level from the one below) then stays a UAV through its reads
+/// (Image::Transition), and the previous work's writes into it reach this one through a UAV
+/// barrier. With reads first, the dependency was only a transition to a read state and back
+/// within one ResourceBarrier call, which nets out to UAV to UAV: the Series flickered until a
+/// UAV barrier followed every dispatch.
+template <typename Func>
+void ForEachImageTransition(const ImageTransitionList& transitions, TextureCache& texture_cache,
+                            Func&& func) {
+    const auto pass = [&](int rank) {
+        for (const auto& [view_id, is_storage] : transitions) {
+            const int view_rank =
+                is_storage ? 1 : texture_cache.GetImageView(view_id).ReadsReinterpretedCopy() ? 0 : 2;
+            if (view_rank == rank) {
+                func(view_id, is_storage);
+            }
+        }
+    };
+    pass(0);
+    pass(1);
+    pass(2);
+}
+
+/// Explicit format of a typed image buffer.
+[[nodiscard]] inline std::optional<VideoCore::Surface::PixelFormat> PixelFormatFromImageFormat(
+    Shader::ImageFormat format) {
+    using VideoCore::Surface::PixelFormat;
+    switch (format) {
+    case Shader::ImageFormat::Typeless:
+        return std::nullopt;
+    case Shader::ImageFormat::R8_UINT:
+        return PixelFormat::R8_UINT;
+    case Shader::ImageFormat::R8_SINT:
+        return PixelFormat::R8_SINT;
+    case Shader::ImageFormat::R16_UINT:
+        return PixelFormat::R16_UINT;
+    case Shader::ImageFormat::R16_SINT:
+        return PixelFormat::R16_SINT;
+    case Shader::ImageFormat::R32_UINT:
+        return PixelFormat::R32_UINT;
+    case Shader::ImageFormat::R32G32_UINT:
+        return PixelFormat::R32G32_UINT;
+    case Shader::ImageFormat::R32G32B32A32_UINT:
+        return PixelFormat::R32G32B32A32_UINT;
+    }
+    return std::nullopt;
+}
+
+/// Reads the texture handle of element index of desc from guest constant buffers.
+/// cbuf_address(i) returns the GPU address of constant buffer i.
+template <typename Descriptor, typename CbufAddress>
+[[nodiscard]] auto ReadTextureHandle(Tegra::MemoryManager& gpu_memory, const Descriptor& desc,
+                                     u32 index, bool via_header_index,
+                                     CbufAddress&& cbuf_address) {
+    const u32 index_offset = index << desc.size_shift;
+    const u32 offset = desc.cbuf_offset + index_offset;
+    const GPUVAddr addr = cbuf_address(desc.cbuf_index) + offset;
+    if constexpr (std::is_same_v<Descriptor, Shader::TextureDescriptor> ||
+                  std::is_same_v<Descriptor, Shader::TextureBufferDescriptor>) {
+        if (desc.has_secondary) {
+            const u32 second_offset = desc.secondary_cbuf_offset + index_offset;
+            const GPUVAddr separate_addr = cbuf_address(desc.secondary_cbuf_index) + second_offset;
+            const u32 lhs_raw = gpu_memory.Read<u32>(addr) << desc.shift_left;
+            const u32 rhs_raw = gpu_memory.Read<u32>(separate_addr) << desc.secondary_shift_left;
+            return Tegra::Texture::TexturePair(lhs_raw | rhs_raw, via_header_index);
+        }
+    }
+    return Tegra::Texture::TexturePair(gpu_memory.Read<u32>(addr), via_header_index);
+}
+
+/// Appends the image views (and the samplers of the textures) a stage reads, in the order the
+/// descriptor table expects: texel buffers, image buffers, textures, images.
+/// Info is a Shader::Info or the StageBindings a graphics pipeline keeps of one.
+template <typename Info, typename ReadHandle>
+void GatherStageViews(const Info& info, TextureCache& texture_cache, bool is_compute,
+                      ReadHandle&& read_handle, ImageViewList& views, SamplerIdList& samplers,
+                      DrawSamplerCache<VideoCommon::SamplerId>& sampler_cache) {
+    const auto add_image = [&](const auto& desc, bool blacklist) {
+        for (u32 index = 0; index < desc.count; ++index) {
+            const auto handle = read_handle(desc, index);
+            views.push_back({.index = handle.first, .blacklist = blacklist, .id = {}});
+        }
+    };
+    for (const auto& desc : info.texture_buffer_descriptors) {
+        add_image(desc, false);
+    }
+    for (const auto& desc : info.image_buffer_descriptors) {
+        add_image(desc, false);
+    }
+    for (const auto& desc : info.texture_descriptors) {
+        for (u32 index = 0; index < desc.count; ++index) {
+            const auto handle = read_handle(desc, index);
+            views.push_back({handle.first});
+            samplers.push_back(sampler_cache.Get(handle.second, [&](u32 index) {
+                return texture_cache.GetSamplerId(index, is_compute);
+            }));
+        }
+    }
+    for (const auto& desc : info.image_descriptors) {
+        add_image(desc, desc.is_written);
+    }
+}
+
+/// One handle a stage read and what it resolved to, in GatherStageViews order (stage_view_cache=1).
+struct StageViewEntry {
+    u32 tic{};
+    u32 tsc{}; ///< textures only
+    VideoCommon::ImageViewId view{};
+    VideoCommon::SamplerId sampler{}; ///< textures only
+};
+
+/// Stages that write storage images scale them down while resolving them: never reused.
+template <typename Info>
+[[nodiscard]] bool StageViewsCacheable(const Info& info) {
+    return std::ranges::none_of(info.image_descriptors,
+                                [](const auto& desc) { return desc.is_written; });
+}
+
+/// Appends the views and samplers of a stage from entries, the last draw's, when the stage reads
+/// the same handles and the descriptor tables still hold the entries they were resolved from.
+/// The caller checks the texture cache's binding stamp. False, appending nothing, otherwise.
+template <typename Info, typename ReadHandle>
+[[nodiscard]] bool ReuseStageViews(const Info& info, const TextureCache& texture_cache,
+                                   ReadHandle&& read_handle,
+                                   std::span<const StageViewEntry> entries, ImageViewList& views,
+                                   SamplerIdList& samplers) {
+    const size_t first_view = views.size();
+    const size_t first_sampler = samplers.size();
+    size_t next = 0;
+    bool same = true;
+    const auto add = [&](const auto& desc, bool is_texture) {
+        for (u32 index = 0; same && index < desc.count; ++index) {
+            const auto handle = read_handle(desc, index);
+            const StageViewEntry* const entry = next < entries.size() ? &entries[next++] : nullptr;
+            same = entry && entry->tic == handle.first &&
+                   (!is_texture || entry->tsc == handle.second) &&
+                   texture_cache.GraphicsImageEntryMatches(handle.first) &&
+                   (!is_texture || texture_cache.GraphicsSamplerEntryMatches(handle.second));
+            if (!same) {
+                return;
+            }
+            views.push_back({.index = handle.first, .blacklist = false, .id = entry->view});
+            if (is_texture) {
+                samplers.push_back(entry->sampler);
+            }
+        }
+    };
+    for (const auto& desc : info.texture_buffer_descriptors) add(desc, false);
+    for (const auto& desc : info.image_buffer_descriptors) add(desc, false);
+    for (const auto& desc : info.texture_descriptors) add(desc, true);
+    for (const auto& desc : info.image_descriptors) add(desc, false);
+    if (same && next == entries.size()) {
+        return true;
+    }
+    views.resize(first_view);
+    samplers.resize(first_sampler);
+    return false;
+}
+
+/// Records what a stage resolved: its views from first_view and samplers from first_sampler,
+/// with the TSC handles in tsc (one per texture, in order).
+template <typename Info>
+void StoreStageViews(const Info& info, std::span<const VideoCommon::ImageViewInOut> views,
+                     std::span<const VideoCommon::SamplerId> samplers, std::span<const u32> tsc,
+                     std::vector<StageViewEntry>& entries) {
+    entries.clear();
+    size_t texture = 0;
+    const auto add = [&](const auto& desc, bool is_texture) {
+        for (u32 index = 0; index < desc.count; ++index) {
+            const VideoCommon::ImageViewInOut& view = views[entries.size()];
+            StageViewEntry& entry = entries.emplace_back();
+            entry.tic = view.index;
+            entry.view = view.id;
+            if (is_texture) {
+                entry.tsc = tsc[texture];
+                entry.sampler = samplers[texture];
+                ++texture;
+            }
+        }
+    };
+    for (const auto& desc : info.texture_buffer_descriptors) add(desc, false);
+    for (const auto& desc : info.image_buffer_descriptors) add(desc, false);
+    for (const auto& desc : info.texture_descriptors) add(desc, true);
+    for (const auto& desc : info.image_descriptors) add(desc, false);
+}
+
+/// Binds the texel and image buffers of a stage through the buffer cache. bind(index, view,
+/// format, is_written, is_image) forwards to Bind{Graphics,Compute}TextureBuffer. views_it
+/// advances past them.
+template <typename Info, typename Bind>
+void BindStageTextureBuffers(const Info& info, TextureCache& texture_cache,
+                             const VideoCommon::ImageViewInOut*& views_it, Bind&& bind) {
+    size_t index = 0;
+    const auto add_buffer = [&](const auto& desc) {
+        constexpr bool is_image =
+            std::is_same_v<std::remove_cvref_t<decltype(desc)>, Shader::ImageBufferDescriptor>;
+        for (u32 i = 0; i < desc.count; ++i) {
+            bool is_written = false;
+            ImageView& image_view = texture_cache.GetImageView((views_it++)->id);
+            VideoCore::Surface::PixelFormat format = image_view.format;
+            if constexpr (is_image) {
+                is_written = desc.is_written;
+                if (const auto explicit_format = PixelFormatFromImageFormat(desc.format)) {
+                    format = *explicit_format;
+                }
+            }
+            bind(index, image_view, format, is_written, is_image);
+            ++index;
+        }
+    };
+    for (const auto& desc : info.texture_buffer_descriptors) {
+        add_buffer(desc);
+    }
+    for (const auto& desc : info.image_buffer_descriptors) {
+        add_buffer(desc);
+    }
+}
+
+/// Writes the UAV and SRV of every storage image of a stage to the descriptor table.
+template <typename Info>
+void PushStorageImages(const Info& info, TextureCache& texture_cache,
+                              GuestDescriptorQueue& queue,
+                              const VideoCommon::ImageViewInOut*& views_it,
+                              ImageTransitionList& transitions) {
+    for (const auto& desc : info.image_descriptors) {
+        const VideoCommon::ImageViewId view_id = views_it->id;
+        views_it += desc.count;
+        ImageView& image_view = texture_cache.GetImageView(view_id);
+        if (desc.is_written) {
+            texture_cache.MarkModification(image_view.image_id);
+        }
+        queue.AddCopy(image_view.StorageView(desc.type, desc.format));
+        queue.AddCopy(image_view.Handle(desc.type));
+        transitions.emplace_back(view_id, true);
+    }
+}
+
+/// The samplers of one draw or dispatch, uploaded (or reused) as one sampler table.
+class SamplerTableBuilder {
+public:
+    void Add(const Sampler& sampler) {
+        handles.push_back(sampler.Handle());
+        keys.push_back(sampler.Key());
+    }
+
+    [[nodiscard]] D3D12_GPU_DESCRIPTOR_HANDLE Table(SamplerHeap& heap) const {
+        if (handles.empty()) {
+            return {};
+        }
+        return heap.GetTable(std::span<const u64>(keys.data(), keys.size()),
+                             std::span<const D3D12_CPU_DESCRIPTOR_HANDLE>(handles.data(),
+                                                                          handles.size()));
+    }
+
+private:
+    boost::container::small_vector<D3D12_CPU_DESCRIPTOR_HANDLE, 32> handles;
+    boost::container::small_vector<u64, 32> keys;
+};
+
+static_assert(Shader::Backend::SPIRV::BLEND_CONSTANTS_OFFSET == PUSH_CONSTANT_WORDS * sizeof(u32));
+static_assert(Shader::Backend::SPIRV::STAGE_CONSTANTS_OFFSET ==
+              (PUSH_CONSTANT_WORDS + BLEND_CONSTANT_WORDS) * sizeof(u32));
+static_assert(Shader::Backend::SPIRV::STAGE_CONSTANT_WORDS == STAGE_CONSTANT_WORDS);
+static_assert(Shader::Backend::SPIRV::POLYGON_STIPPLE_WORDS == POLYGON_STIPPLE_WORDS);
+
+/// Push constants with no resolution scaling (all rescaling bits clear, down factor 1).
+inline void ResetPushConstants(std::array<u32, PUSH_CONSTANT_WORDS>& words) {
+    words.fill(0);
+    constexpr u32 down_factor_word =
+        Shader::Backend::SPIRV::RESCALING_LAYOUT_DOWN_FACTOR_OFFSET / sizeof(u32);
+    words[down_factor_word] = std::bit_cast<u32>(1.0f);
+}
+
+} // namespace D3D12

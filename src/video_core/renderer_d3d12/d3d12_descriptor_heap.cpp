@@ -1,0 +1,694 @@
+// SPDX-FileCopyrightText: Copyright 2026 Jadyx Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include <algorithm>
+#include <atomic>
+#include <limits>
+#include <stdexcept>
+
+#include <fmt/format.h>
+
+#include "common/bug_tracker.h"
+#include "common/cityhash.h"
+#include "common/logging.h"
+#include "video_core/perf_counters.h"
+#include "video_core/renderer_d3d12/d3d12_log.h"
+#include "video_core/renderer_d3d12/d3d12_descriptor_heap.h"
+#include "video_core/renderer_d3d12/d3d12_resource_utils.h"
+#include "video_core/renderer_d3d12/d3d12_scheduler.h"
+
+namespace D3D12 {
+
+namespace {
+
+std::atomic<bool> descriptor_deferral{};
+
+ComPtr<ID3D12DescriptorHeap> CreateHeap(ID3D12Device* device, D3D12_DESCRIPTOR_HEAP_TYPE type,
+                                        u32 count, bool shader_visible) {
+    if (count == 0) {
+        throw std::invalid_argument("D3D12: descriptor heap size must not be zero");
+    }
+    if (shader_visible && type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+        type != D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) {
+        throw std::invalid_argument("D3D12: RTV/DSV heaps cannot be shader visible");
+    }
+    if (shader_visible && type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER &&
+        count > D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE) {
+        throw std::invalid_argument("D3D12: shader-visible sampler heap exceeds 2048 slots");
+    }
+    if (shader_visible && type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+        count > D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_1) {
+        throw std::invalid_argument(
+            "D3D12: shader-visible CBV/SRV/UAV heap exceeds one million slots");
+    }
+    const D3D12_DESCRIPTOR_HEAP_DESC desc{
+        .Type = type,
+        .NumDescriptors = count,
+        .Flags = shader_visible ? D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE
+                                : D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+        .NodeMask = 0,
+    };
+    ComPtr<ID3D12DescriptorHeap> heap;
+    ThrowIfFailed(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap)),
+                  "CreateDescriptorHeap");
+    return heap;
+}
+
+} // Anonymous namespace
+
+void SetDescriptorDeferral(bool enabled) {
+    descriptor_deferral.store(enabled, std::memory_order_relaxed);
+}
+
+bool DescriptorDeferralEnabled() noexcept {
+    return descriptor_deferral.load(std::memory_order_relaxed);
+}
+
+// --- CpuDescriptorAllocator -------------------------------------------------------------------
+
+CpuDescriptorAllocator::CpuDescriptorAllocator(ID3D12Device* device_,
+                                               D3D12_DESCRIPTOR_HEAP_TYPE type_, u32 page_size_,
+                                               const Scheduler* read_by_list_calls)
+    : device{device_}, type{type_}, page_size{page_size_},
+      stride{device_->GetDescriptorHandleIncrementSize(type_)}, scheduler{read_by_list_calls} {
+    if (page_size == 0) {
+        throw std::invalid_argument("D3D12: offline descriptor page size must not be zero");
+    }
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE CpuDescriptorAllocator::Allocate() {
+    std::scoped_lock lock{mutex};
+    ReclaimRecorded();
+    if (free_list.empty()) {
+        AddPage();
+    }
+    const D3D12_CPU_DESCRIPTOR_HANDLE handle = free_list.back();
+    free_list.pop_back();
+    return handle;
+}
+
+void CpuDescriptorAllocator::Free(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    if (handle.ptr == 0) {
+        return;
+    }
+    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+        view_frees.fetch_add(1, std::memory_order_relaxed);
+    }
+    std::scoped_lock lock{mutex};
+    if (scheduler) {
+        // A call recorded before the free may still have to read the descriptor.
+        const u64 point = scheduler->RecordPoint();
+        if (!scheduler->IsRecorded(point)) {
+            pending_frees.push_back({point, handle});
+            return;
+        }
+    }
+    free_list.push_back(handle);
+}
+
+void CpuDescriptorAllocator::ReclaimRecorded() {
+    while (!pending_frees.empty() && scheduler->IsRecorded(pending_frees.front().record_point)) {
+        free_list.push_back(pending_frees.front().handle);
+        pending_frees.pop_front();
+    }
+}
+
+void CpuDescriptorAllocator::AddPage() {
+    ComPtr<ID3D12DescriptorHeap> page = CreateHeap(device, type, page_size, false);
+    const D3D12_CPU_DESCRIPTOR_HANDLE base = page->GetCPUDescriptorHandleForHeapStart();
+    // Pushed in reverse so slots are handed out in ascending order.
+    for (u32 i = page_size; i-- > 0;) {
+        free_list.push_back({base.ptr + static_cast<SIZE_T>(i) * stride});
+    }
+    pages.push_back(std::move(page));
+    LOG_INFO(Render, "D3D12: offline descriptor page created (type {}, {} slots)",
+             static_cast<u32>(type), page_size);
+}
+
+// --- DescriptorRing ---------------------------------------------------------------------------
+
+DescriptorRing::DescriptorRing(ID3D12Device* device_, Scheduler& scheduler_, u32 capacity_)
+    : device{device_}, scheduler{scheduler_},
+      heap{CreateHeap(device_, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, capacity_, true)},
+      cpu_base{heap->GetCPUDescriptorHandleForHeapStart()},
+      gpu_base{heap->GetGPUDescriptorHandleForHeapStart()}, capacity{capacity_},
+      stride{device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)} {
+    LOG_INFO(Render, "D3D12: shader-visible descriptor ring ready ({} slots)", capacity);
+}
+
+DescriptorRange DescriptorRing::Allocate(u32 count) {
+    if (count == 0 || count > capacity) {
+        throw std::runtime_error(fmt::format("D3D12: bad descriptor ring request ({})", count));
+    }
+    u32 offset{};
+    while (!TryAllocate(count, offset)) {
+        // Full: wait for the oldest range (flushing it first if it is still being recorded).
+        LOG_DEBUG(Render, "D3D12: descriptor ring full, waiting for tick {}",
+                  in_flight.front().first);
+        scheduler.Wait(in_flight.front().first);
+    }
+    const u64 tick = scheduler.CurrentTick();
+    added_in_flight = in_flight.empty() || in_flight.back().first != tick;
+    if (added_in_flight) {
+        in_flight.emplace_back(tick, head);
+    } else {
+        in_flight.back().second = head;
+    }
+    return {
+        .cpu = {cpu_base.ptr + static_cast<SIZE_T>(offset) * stride},
+        .gpu = {gpu_base.ptr + static_cast<u64>(offset) * stride},
+    };
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE DescriptorRing::Upload(
+    std::span<const D3D12_CPU_DESCRIPTOR_HANDLE> descriptors) {
+    if (descriptors.size() > std::numeric_limits<u32>::max()) {
+        throw std::length_error("D3D12: descriptor upload is too large");
+    }
+    const DescriptorRange range = Allocate(static_cast<u32>(descriptors.size()));
+    // One destination range, single-descriptor source ranges (null sizes).
+    const UINT num = static_cast<UINT>(descriptors.size());
+    device->CopyDescriptors(1, &range.cpu, &num, num, descriptors.data(), nullptr,
+                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    CheckRemovedAfterDescriptor(device, [&] {
+        return fmt::format("copying {} view descriptors to the shader-visible heap",
+                           descriptors.size());
+    });
+    if (!logged_upload) {
+        LOG_INFO(Render, "D3D12: descriptor ring upload active ({} descriptors, tick {})",
+                 descriptors.size(), scheduler.CurrentTick());
+        logged_upload = true;
+    }
+    return range.gpu;
+}
+
+void DescriptorRing::Rewind(const DescriptorRange& range, u32 count) {
+    const u32 offset = static_cast<u32>((range.gpu.ptr - gpu_base.ptr) / stride);
+    if (in_flight.empty() || head != offset + count || in_flight.back().second != head) {
+        return; // allocated again since: the slots are retired with their range
+    }
+    head = head_before;
+    if (added_in_flight) {
+        in_flight.pop_back();
+    } else {
+        in_flight.back().second = head;
+    }
+}
+
+u64 DescriptorRing::CurrentTick() const {
+    return scheduler.CurrentTick();
+}
+
+bool DescriptorRing::TryAllocate(u32 count, u32& offset) {
+    // Ranges the last known GPU tick already covers are retired first; the fence is only read
+    // when they do not make room, instead of once per draw.
+    Retire(false);
+    if (FindSpace(count, offset)) {
+        head_before = head;
+        head = offset + count;
+        return true;
+    }
+    Retire(true);
+    if (FindSpace(count, offset)) {
+        head_before = head;
+        head = offset + count;
+        return true;
+    }
+    return false;
+}
+
+bool DescriptorRing::FindSpace(u32 count, u32& offset) const {
+    // A drained ring keeps its head (tail caught up with it) instead of restarting at 0: a draw may
+    // still be writing the table it took when a mid-draw Finish retired every range, and its slots
+    // sit right behind the head, so only a whole lap of the ring could reach them again.
+    const bool empty = in_flight.empty();
+    if (empty || head > tail) {
+        // Free space is [head, capacity) and then [0, tail).
+        if (capacity - head >= count) {
+            offset = head;
+        } else if (empty || count < tail) {
+            offset = 0; // wrap; the skipped end is reclaimed with the range before it
+        } else {
+            return false;
+        }
+        return true;
+    }
+    if (head < tail && tail - head > count) {
+        offset = head;
+        return true;
+    }
+    return false; // head == tail with ranges in flight: completely full
+}
+
+void DescriptorRing::Retire(bool read_fence) {
+    while (!in_flight.empty()) {
+        const u64 tick = in_flight.front().first;
+        if (!scheduler.IsKnownFree(tick) && !(read_fence && scheduler.IsFree(tick))) {
+            break;
+        }
+        tail = in_flight.front().second;
+        in_flight.pop_front();
+    }
+}
+
+// --- GuestDescriptorQueue ---------------------------------------------------------------------
+
+namespace {
+
+/// The largest CBV D3D12 allows (4096 16-byte constants).
+constexpr u32 MAX_CONSTANT_BUFFER_BYTES = D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16;
+
+/// Table mismatches found on the recorder's worker, reported once.
+std::atomic<bool> logged_deferred_mismatch{};
+
+} // Anonymous namespace
+
+GuestDescriptorQueue::GuestDescriptorQueue(ID3D12Device* device_, DescriptorRing& ring_)
+    : device{device_}, ring{ring_}, stride{ring_.Stride()},
+      defer{DescriptorDeferralEnabled()},
+      zero_buffer{CreateCommittedBuffer(device_, MAX_CONSTANT_BUFFER_BYTES,
+                                        D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
+                                        D3D12_RESOURCE_FLAG_NONE, "Create zero constant buffer")} {}
+
+void GuestDescriptorQueue::Acquire(u32 count_, std::span<const ConstantBufferSlot> cbv_slots_) {
+    count = count_;
+    finished = false;
+    writes.clear();
+    cbv_slots = cbv_slots_;
+    cbv_index = 0;
+    num_root_cbvs = 0;
+    for (const ConstantBufferSlot& slot : cbv_slots) {
+        if (slot.root_slot != ConstantBufferSlot::TABLE) {
+            num_root_cbvs = std::max(num_root_cbvs, slot.root_slot + 1);
+        }
+    }
+    // Slots no constant buffer reaches (the cache binds fewer than declared) read zeros.
+    root_cbvs.fill(zero_buffer->GetGPUVirtualAddress());
+    // Reserved now even if a recent table ends up reused: a full ring flushes the list, which
+    // must not happen once the draw has started recording. One spare slot past the table absorbs
+    // writes beyond what the root signature declares.
+    range = count != 0 ? ring.Allocate(count + 1) : DescriptorRange{};
+    acquire_tick = ring.CurrentTick();
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE GuestDescriptorQueue::Table() {
+    if (finished || count == 0) {
+        return range.gpu;
+    }
+    finished = true;
+    VideoCore::Perf::AddDetailed(VideoCore::Perf::Counter::DescriptorTables, 1);
+    if (const RecentTable* const recent = FindRecent()) {
+        VideoCore::Perf::AddDetailed(VideoCore::Perf::Counter::DescriptorTableReuses, 1);
+        ring.Rewind(range, count + 1);
+        range = {.cpu = {}, .gpu = recent->gpu};
+        return range.gpu;
+    }
+    const u32 written = WriteRecorded();
+    if (written != count && !logged_mismatch) {
+        LOG_ERROR(Render, "D3D12: descriptor table filled with {} of {} descriptors", written,
+                  count);
+        logged_mismatch = true;
+    }
+    // A table whose list was flushed while it was being filled is retired with the older list.
+    if (ring.CurrentTick() == acquire_tick) {
+        RecentTable& recent = recent_tables[next_recent];
+        next_recent = (next_recent + 1) % NUM_RECENT_TABLES;
+        recent.tick = acquire_tick;
+        recent.view_frees = CpuDescriptorAllocator::ViewFrees();
+        recent.count = count;
+        recent.gpu = range.gpu;
+        recent.writes.assign(writes.begin(), writes.end());
+    }
+    return range.gpu;
+}
+
+const GuestDescriptorQueue::RecentTable* GuestDescriptorQueue::FindRecent() const {
+    if (GpuDiagnosticsEnabled()) {
+        return nullptr; // the traces describe every table that is written
+    }
+    // Retired only once their list completes, which is not before this draw's list.
+    const u64 tick = ring.CurrentTick();
+    if (tick != acquire_tick) {
+        return nullptr;
+    }
+    const u64 view_frees = CpuDescriptorAllocator::ViewFrees();
+    for (const RecentTable& recent : recent_tables) {
+        if (recent.tick == tick && recent.count == count && recent.view_frees == view_frees &&
+            recent.writes == writes) {
+            return &recent;
+        }
+    }
+    return nullptr;
+}
+
+u32 GuestDescriptorQueue::WriteRecorded() {
+    CommandStream* const stream =
+        defer && !GpuDiagnosticsEnabled() ? ring.GetScheduler().CommandList() : nullptr;
+    if (!stream || !stream->IsThreaded()) {
+        TableWriter writer{.device = device, .cpu = range.cpu, .gpu = range.gpu.ptr,
+                           .count = count, .stride = stride};
+        writer.WriteAll(writes);
+        return writer.written;
+    }
+    // The worker creates the views and copies; the ring range is already reserved, the list
+    // reads the table only once it executes on the GPU, and freed offline descriptors are reused
+    // only once what was recorded before reached the list (renderer_d3d12.cpp). Only the slot
+    // count is checked here.
+    u32 slots = 0;
+    for (const Write& write : writes) {
+        switch (write.kind) {
+        case Write::Kind::StorageBuffer:
+            slots += 2;
+            break;
+        case Write::Kind::TexelBuffer:
+            slots += 1 + write.with_uav;
+            break;
+        default:
+            slots += 1;
+            break;
+        }
+    }
+    if (!logged_deferred) {
+        LOG_INFO(Render, "D3D12: descriptor tables written on the recording thread");
+        logged_deferred = true;
+    }
+    stream->Record(std::span<const Write>{writes},
+                   [device = device, cpu = range.cpu, gpu = range.gpu.ptr, count = count,
+                    stride = stride, num = writes.size(),
+                    slots](ID3D12GraphicsCommandList*, const Write* data) {
+                       TableWriter writer{.device = device, .cpu = cpu, .gpu = gpu,
+                                          .count = count, .stride = stride};
+                       writer.WriteAll({data, num});
+                       if (writer.written != slots &&
+                           !logged_deferred_mismatch.exchange(true, std::memory_order_relaxed)) {
+                           LOG_ERROR(Render, "D3D12: deferred descriptor table wrote {} of {} slots",
+                                     writer.written, slots);
+                       }
+                   });
+    return slots;
+}
+
+void GuestDescriptorQueue::TableWriter::WriteAll(std::span<const Write> writes) {
+    for (const Write& write : writes) {
+        switch (write.kind) {
+        case Write::Kind::ConstantBuffer:
+            FlushCopies();
+            CreateConstantBuffer(write);
+            break;
+        case Write::Kind::StorageBuffer:
+            FlushCopies();
+            CreateStorageBuffer(write);
+            break;
+        case Write::Kind::TexelBuffer:
+            FlushCopies();
+            CreateTexelBuffer(write);
+            break;
+        case Write::Kind::Copy:
+            Copy({static_cast<SIZE_T>(write.handle)});
+            break;
+        }
+    }
+    FlushCopies();
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE GuestDescriptorQueue::TableWriter::Next() {
+    if (written >= count) {
+        // More bindings than the root signature declares: the spare slot. Reported by Table().
+        ++written;
+        return {cpu.ptr + static_cast<SIZE_T>(count) * stride};
+    }
+    return {cpu.ptr + static_cast<SIZE_T>(written++) * stride};
+}
+
+u32 GuestDescriptorQueue::ConstantBufferReach(u32 size) const {
+    if (cbv_index >= cbv_slots.size() ||
+        cbv_slots[cbv_index].root_slot == ConstantBufferSlot::TABLE) {
+        return size;
+    }
+    return std::min(std::max(size, cbv_slots[cbv_index].reach), MAX_CONSTANT_BUFFER_BYTES);
+}
+
+void GuestDescriptorQueue::AddConstantBuffer(D3D12_GPU_VIRTUAL_ADDRESS address, u32 size) {
+    const u32 index = cbv_index++;
+    if (index < cbv_slots.size() && cbv_slots[index].root_slot != ConstantBufferSlot::TABLE) {
+        VideoCore::Perf::AddDetailed(VideoCore::Perf::Counter::CbvRoot, 1);
+        const u32 slot = cbv_slots[index].root_slot;
+        root_cbvs[slot] = address != 0 ? address : zero_buffer->GetGPUVirtualAddress();
+        if (GpuDiagnosticsEnabled()) {
+            TraceGpuDetail(fmt::format("root CBV slot={} address={:x} size={}", slot,
+                                       root_cbvs[slot], size));
+        }
+        return;
+    }
+    if (count == 0) {
+        return;
+    }
+    writes.push_back({
+        .kind = Write::Kind::ConstantBuffer,
+        .size = address != 0 ? (size + 255u) & ~255u : 0u,
+        .handle = address,
+    });
+}
+
+void GuestDescriptorQueue::AddStorageBuffer(ID3D12Resource* resource, u64 offset, u32 size) {
+    if (count == 0) {
+        return;
+    }
+    // Raw views address 32-bit words from a 16-byte aligned offset.
+    if (resource && offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT != 0) {
+        BUG_TRACK(UnsupportedState, "storage buffer at an offset not aligned to 16 bytes ({}) bound "
+                                    "as null",
+                  offset);
+        WarnOnceLog(logged_unaligned, "storage buffer at unaligned offset {} bound as null",
+                    offset);
+        resource = nullptr;
+    }
+    writes.push_back({
+        .kind = Write::Kind::StorageBuffer,
+        .size = resource ? size : 0,
+        .handle = reinterpret_cast<u64>(resource),
+        .offset = resource ? offset : 0,
+    });
+}
+
+void GuestDescriptorQueue::AddTexelBuffer(ID3D12Resource* resource, u64 offset, u32 size,
+                                          DXGI_FORMAT format, u32 element_size, bool with_uav) {
+    if (count == 0) {
+        return;
+    }
+    if (format == DXGI_FORMAT_UNKNOWN || element_size == 0) {
+        format = DXGI_FORMAT_R32_UINT;
+        element_size = 4;
+        resource = nullptr;
+    }
+    if (resource && offset % element_size != 0) {
+        BUG_TRACK(UnsupportedState, "texel buffer at an offset not aligned to its element ({} % {}) "
+                                    "bound as null",
+                  offset, element_size);
+        WarnOnceLog(logged_unaligned, "texel buffer at unaligned offset {} bound as null", offset);
+        resource = nullptr;
+    }
+    writes.push_back({
+        .kind = Write::Kind::TexelBuffer,
+        .size = resource ? size / element_size : 0,
+        .handle = reinterpret_cast<u64>(resource),
+        .offset = resource ? offset / element_size : 0,
+        .format = static_cast<u32>(format),
+        .with_uav = with_uav ? 1u : 0u,
+    });
+}
+
+void GuestDescriptorQueue::AddCopy(D3D12_CPU_DESCRIPTOR_HANDLE descriptor) {
+    if (count == 0) {
+        return;
+    }
+    writes.push_back({.kind = Write::Kind::Copy, .handle = static_cast<u64>(descriptor.ptr)});
+}
+
+void GuestDescriptorQueue::TableWriter::CreateConstantBuffer(const Write& write) {
+    VideoCore::Perf::ScopedNsTimer timer{VideoCore::Perf::Counter::CbvCreateNs};
+    VideoCore::Perf::AddDetailed(VideoCore::Perf::Counter::CbvCreates, 1);
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC desc{
+        .BufferLocation = write.handle,
+        .SizeInBytes = write.size,
+    };
+    device->CreateConstantBufferView(&desc, Next());
+    if (GpuDiagnosticsEnabled()) {
+        TraceGpuDetail(fmt::format("CBV table={:x} slot={} address={:x} size={}",
+            gpu, written - 1, write.handle, desc.SizeInBytes));
+    }
+    CheckRemovedAfterDescriptor(device, [&] {
+        return fmt::format("CBV at 0x{:x} of {} bytes", desc.BufferLocation, desc.SizeInBytes);
+    });
+}
+
+void GuestDescriptorQueue::TableWriter::CreateStorageBuffer(const Write& write) {
+    ID3D12Resource* const resource = reinterpret_cast<ID3D12Resource*>(write.handle);
+    if (GpuDiagnosticsEnabled()) {
+        TraceGpuDetail(fmt::format("storage buffer table={:x} slot={} resource={} offset={} size={}",
+            gpu, written, static_cast<void*>(resource), write.offset, write.size));
+    }
+    const u32 words = (write.size + 3) / 4;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{
+        .Format = DXGI_FORMAT_R32_TYPELESS,
+        .ViewDimension = D3D12_UAV_DIMENSION_BUFFER,
+        .Buffer = {.FirstElement = write.offset / 4,
+                   .NumElements = words,
+                   .StructureByteStride = 0,
+                   .CounterOffsetInBytes = 0,
+                   .Flags = D3D12_BUFFER_UAV_FLAG_RAW},
+    };
+    device->CreateUnorderedAccessView(resource, nullptr, &uav, Next());
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{
+        .Format = DXGI_FORMAT_R32_TYPELESS,
+        .ViewDimension = D3D12_SRV_DIMENSION_BUFFER,
+        .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        .Buffer = {.FirstElement = write.offset / 4,
+                   .NumElements = words,
+                   .StructureByteStride = 0,
+                   .Flags = D3D12_BUFFER_SRV_FLAG_RAW},
+    };
+    device->CreateShaderResourceView(resource, &srv, Next());
+    CheckRemovedAfterDescriptor(device, [&] {
+        return fmt::format("storage buffer views (offset {} size {} null {})", write.offset,
+                           write.size, resource == nullptr);
+    });
+}
+
+void GuestDescriptorQueue::TableWriter::CreateTexelBuffer(const Write& write) {
+    ID3D12Resource* const resource = reinterpret_cast<ID3D12Resource*>(write.handle);
+    const DXGI_FORMAT format = static_cast<DXGI_FORMAT>(write.format);
+    if (GpuDiagnosticsEnabled()) {
+        TraceGpuDetail(fmt::format("texel buffer table={:x} slot={} resource={} first={} elements={} format={} uav={}",
+            gpu, written, static_cast<void*>(resource), write.offset, write.size,
+            write.format, write.with_uav));
+    }
+    if (write.with_uav != 0) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav{
+            .Format = format,
+            .ViewDimension = D3D12_UAV_DIMENSION_BUFFER,
+            .Buffer = {.FirstElement = write.offset, .NumElements = write.size},
+        };
+        device->CreateUnorderedAccessView(resource, nullptr, &uav, Next());
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{
+        .Format = format,
+        .ViewDimension = D3D12_SRV_DIMENSION_BUFFER,
+        .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        .Buffer = {.FirstElement = write.offset, .NumElements = write.size},
+    };
+    device->CreateShaderResourceView(resource, &srv, Next());
+    CheckRemovedAfterDescriptor(device, [&] {
+        return fmt::format("texel buffer views (format {} first {} elements {} uav {} null {})",
+                           write.format, write.offset, write.size, write.with_uav,
+                           resource == nullptr);
+    });
+}
+
+void GuestDescriptorQueue::TableWriter::Copy(D3D12_CPU_DESCRIPTOR_HANDLE descriptor) {
+    if (GpuDiagnosticsEnabled()) {
+        TraceGpuDetail(fmt::format("descriptor copy table={:x} slot={} source={:x}",
+            gpu, written, descriptor.ptr));
+    }
+    VideoCore::Perf::AddDetailed(VideoCore::Perf::Counter::ViewCopies, 1);
+    if (written >= count) {
+        // The spare slot (see Next) is not contiguous with the run: copy it now.
+        FlushCopies();
+        device->CopyDescriptorsSimple(1, Next(), descriptor,
+                                      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        return;
+    }
+    const D3D12_CPU_DESCRIPTOR_HANDLE slot = Next();
+    if (pending_copies.empty()) {
+        copy_destination = slot;
+    }
+    pending_copies.push_back(descriptor);
+}
+
+void GuestDescriptorQueue::TableWriter::FlushCopies() {
+    if (pending_copies.empty()) {
+        return;
+    }
+    VideoCore::Perf::ScopedNsTimer timer{VideoCore::Perf::Counter::ViewCopyNs};
+    const UINT num = static_cast<UINT>(pending_copies.size());
+    device->CopyDescriptors(1, &copy_destination, &num, num, pending_copies.data(), nullptr,
+                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    CheckRemovedAfterDescriptor(device, [&] {
+        return fmt::format("copying {} texture descriptors for a draw", num);
+    });
+    pending_copies.clear();
+}
+
+// --- SamplerHeap ------------------------------------------------------------------------------
+
+size_t SamplerHeap::KeyHash::operator()(std::span<const u64> key) const noexcept {
+    return static_cast<size_t>(Common::CityHash64(reinterpret_cast<const char*>(key.data()),
+                                                  key.size() * sizeof(u64)));
+}
+
+bool SamplerHeap::KeyEqual::operator()(std::span<const u64> lhs,
+                                      std::span<const u64> rhs) const noexcept {
+    return std::equal(lhs.begin(), lhs.end(), rhs.begin(), rhs.end());
+}
+
+SamplerHeap::SamplerHeap(ID3D12Device* device_, Scheduler& scheduler_)
+    : device{device_}, scheduler{scheduler_},
+      heap{CreateHeap(device_, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, CAPACITY, true)},
+      cpu_base{heap->GetCPUDescriptorHandleForHeapStart()},
+      gpu_base{heap->GetGPUDescriptorHandleForHeapStart()},
+      stride{device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)} {
+    LOG_INFO(Render, "D3D12: shader-visible sampler heap ready ({} slots)", CAPACITY);
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE SamplerHeap::GetTable(
+    std::span<const u64> keys, std::span<const D3D12_CPU_DESCRIPTOR_HANDLE> samplers) {
+    if (samplers.size() > std::numeric_limits<u32>::max()) {
+        throw std::length_error("D3D12: sampler table is too large");
+    }
+    const u32 count = static_cast<u32>(samplers.size());
+    if (count == 0 || count > CAPACITY || keys.size() != samplers.size()) {
+        throw std::runtime_error(fmt::format("D3D12: bad sampler table request ({})", count));
+    }
+    if (std::ranges::equal(keys, last_keys)) {
+        return {gpu_base.ptr + static_cast<u64>(last_first) * stride};
+    }
+    // Heterogeneous lookup avoids allocating/copying a vector on every draw. Only a new
+    // table owns a key; hits compare the caller's span against that stored vector.
+    if (const auto it = tables.find(keys); it != tables.end()) {
+        if (!logged_reuse) {
+            LOG_INFO(Render, "D3D12: sampler table deduplication active ({} samplers)", count);
+            logged_reuse = true;
+        }
+        last_keys = it->first;
+        last_first = it->second;
+        return {gpu_base.ptr + static_cast<u64>(it->second) * stride};
+    }
+    if (used + count > CAPACITY) {
+        // Tables already recorded may still be read by the GPU: only reuse the heap once idle.
+        LOG_INFO(Render, "D3D12: sampler heap full ({} tables), resetting", tables.size());
+        scheduler.Finish();
+        last_keys = {};
+        tables.clear();
+        used = 0;
+    }
+    const u32 first = used;
+    // One destination range, single-descriptor source ranges (null sizes), as DescriptorRing.
+    const D3D12_CPU_DESCRIPTOR_HANDLE dst{cpu_base.ptr + static_cast<SIZE_T>(first) * stride};
+    device->CopyDescriptors(1, &dst, &count, count, samplers.data(), nullptr,
+                            D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    CheckRemovedAfter(device, [&] {
+        return fmt::format("copying {} sampler descriptors", samplers.size());
+    });
+    used += count;
+    const auto entry = tables.emplace(std::vector<u64>(keys.begin(), keys.end()), first).first;
+    last_keys = entry->first;
+    last_first = first;
+    if (!logged_cache) {
+        LOG_INFO(Render, "D3D12: sampler table cached ({} samplers, {} of {} slots used)", count,
+                 used, CAPACITY);
+        logged_cache = true;
+    }
+    return {gpu_base.ptr + static_cast<u64>(first) * stride};
+}
+
+} // namespace D3D12

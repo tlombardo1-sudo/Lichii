@@ -1,0 +1,47 @@
+// SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#pragma once
+
+#include "core/hle/service/cmif_types.h"
+#include "core/hle/service/service.h"
+
+namespace Core {
+class System;
+}
+
+namespace Service::FileSystem {
+class FileSystemController;
+}
+
+namespace Service::BCAT {
+class BcatBackend;
+class IBcatService;
+class IDeliveryCacheStorageService;
+
+class IServiceCreator final : public ServiceFramework<IServiceCreator> {
+public:
+    explicit IServiceCreator(Core::System& system_, const char* name_);
+    ~IServiceCreator() override;
+
+    // Pulse: the backend keeps nothing; the interfaces it handed out are rebuilt over it.
+    std::string_view PulseKind() const override {
+        return "bcat:IServiceCreator";
+    }
+    SessionRequestHandlerPtr PulseRestore(std::string_view kind,
+                                          Pulse::HandlerRestore& restore) override;
+
+private:
+    Result CreateBcatService(ClientProcessId process_id, OutInterface<IBcatService> out_interface);
+
+    Result CreateDeliveryCacheStorageService(
+        ClientProcessId process_id, OutInterface<IDeliveryCacheStorageService> out_interface);
+
+    Result CreateDeliveryCacheStorageServiceWithApplicationId(
+        u64 application_id, OutInterface<IDeliveryCacheStorageService> out_interface);
+
+    std::unique_ptr<BcatBackend> backend;
+    Service::FileSystem::FileSystemController& fsc;
+};
+
+} // namespace Service::BCAT

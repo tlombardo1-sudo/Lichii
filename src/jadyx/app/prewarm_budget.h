@@ -1,0 +1,90 @@
+// SPDX-FileCopyrightText: Copyright 2026 Jadyx Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+#pragma once
+#include <array>
+#include <cstdint>
+#include <limits>
+
+namespace Jadyx {
+/// How much code the JIT prewarm may compile per core, learned per game from its last sessions.
+/// The prewarm ends before the game grows, so it cannot judge its own cost by the headroom at the
+/// time: a game whose profile has filled up (Game C: 115 MiB on three cores, 1 GiB of commit)
+/// only runs out minutes later. A session that comes close to the limit lowers the next one's
+/// budget a step; a clean session with plenty to spare raises it back. Pure, no clocks or I/O.
+class PrewarmBudget {
+public:
+    static constexpr std::uint64_t MiB = 1024 * 1024;
+    /// Per core, from the default down. The plan warms gameplay and shared blocks first, so the
+    /// lower steps keep the blocks that matter most. A large game needs 150-190 MiB a core to
+    /// reach its world: at 64 the rest, compiled during the load, made it stall for seconds, and
+    /// at 160 its main core still compiled 70k blocks there. 192 is three quarters of the cache,
+    /// the most the warm takes (Owner::Warm). Warmed blocks are ones a session compiled, so most
+    /// of that commit comes either way, and a step down to 64 made it compile 1.2M blocks in its
+    /// load: the steps go down gently.
+    static constexpr std::array<std::uint32_t, 4> STEPS_MIB{192, 128, 64, 32};
+    /// A session whose headroom stayed below this lowers the next one's budget...
+    static constexpr std::uint64_t LOW_HEADROOM = 256 * MiB;
+    /// ...for this many observations in a row (one a second). Permafrost answers a dip below its
+    /// emergency mark (256 MiB) within a second or two; a single sample there lowered a large
+    /// game to 32 MiB although Permafrost had already recovered the memory.
+    static constexpr std::uint32_t LOW_OBSERVATIONS = 5;
+    /// A clean session whose headroom never fell below this raises it back a step... Permafrost
+    /// holds the headroom near its low mark (1024 MiB) during play, so a large game never stayed
+    /// above that and its budget, once lowered to 32 MiB, never came back: it warmed a fifth of
+    /// its 500k-block profile and compiled the rest while entering its world.
+    static constexpr std::uint64_t HIGH_HEADROOM = 512 * MiB;
+    /// ...if it lasted long enough to have seen the game's heavier parts.
+    static constexpr std::uint32_t RAISE_SECONDS = 180;
+
+    /// `step` as stored (0 is the default budget); out of range values clamp.
+    constexpr explicit PrewarmBudget(std::int32_t step_ = 0) noexcept
+        : step{step_ < 0 ? 0U
+                         : static_cast<std::uint32_t>(step_) >= STEPS_MIB.size()
+                               ? static_cast<std::uint32_t>(STEPS_MIB.size() - 1)
+                               : static_cast<std::uint32_t>(step_)} {}
+
+    [[nodiscard]] constexpr std::uint32_t Step() const noexcept { return step; }
+    [[nodiscard]] constexpr std::uint32_t MiBPerCore() const noexcept { return STEPS_MIB[step]; }
+    [[nodiscard]] constexpr std::uint64_t BytesPerCore() const noexcept {
+        return std::uint64_t{STEPS_MIB[step]} * MiB;
+    }
+
+    /// The headroom during play. True when the next session's budget just went down a step
+    /// (once per session): store Step() now, the session may end in a crash or a kill.
+    constexpr bool Observe(std::uint64_t headroom) noexcept {
+        if (headroom < min_headroom) {
+            min_headroom = headroom;
+        }
+        if (headroom >= LOW_HEADROOM) {
+            low_run = 0;
+            return false;
+        }
+        if (lowered || ++low_run < LOW_OBSERVATIONS) {
+            return false;
+        }
+        lowered = true;
+        if (step + 1 >= STEPS_MIB.size()) {
+            return false;
+        }
+        ++step;
+        return true;
+    }
+
+    /// The session ended cleanly after `seconds` of play. True when the budget went up a step.
+    constexpr bool Finish(std::uint32_t seconds) noexcept {
+        if (lowered || step == 0 || seconds < RAISE_SECONDS || min_headroom < HIGH_HEADROOM) {
+            return false;
+        }
+        --step;
+        return true;
+    }
+
+    [[nodiscard]] constexpr std::uint64_t MinHeadroom() const noexcept { return min_headroom; }
+
+private:
+    std::uint32_t step;
+    std::uint64_t min_headroom{std::numeric_limits<std::uint64_t>::max()};
+    std::uint32_t low_run{};
+    bool lowered{};
+};
+} // namespace Jadyx
