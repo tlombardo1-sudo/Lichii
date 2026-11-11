@@ -63,7 +63,7 @@ ICommonStateGetter::ICommonStateGetter(Core::System& system_, std::shared_ptr<Ap
         {90, nullptr, "SetPerformanceConfigurationChangedNotification"},
         {91, nullptr, "GetCurrentPerformanceConfiguration"},
         {100, D<&ICommonStateGetter::SetHandlingHomeButtonShortPressedEnabled>, "SetHandlingHomeButtonShortPressedEnabled"},
-        {110, nullptr, "OpenMyGpuErrorHandler"},
+        {110, &ICommonStateGetter::StubReplyInterface, "OpenMyGpuErrorHandler"},
         {120, D<&ICommonStateGetter::GetAppletLaunchedHistory>, "GetAppletLaunchedHistory"}, //13.0.0+
         {130, D<&ICommonStateGetter::EnableStartupLogoDisappearedMessage>, "EnableStartupLogoDisappearedMessage"}, //21.0.0+
         {200, D<&ICommonStateGetter::GetOperationModeSystemInfo>, "GetOperationModeSystemInfo"},

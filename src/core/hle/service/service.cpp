@@ -20,6 +20,8 @@
 #include "video_core/frame_trace.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/service/ipc_helpers.h"
+#include "core/hle/service/kernel_helpers.h"
+#include "core/hle/kernel/k_event.h"
 #include "core/hle/service/nx2_stub_interface.h"
 #include "core/hle/service/service.h"
 #include "core/hle/service/sm/sm.h"
@@ -78,6 +80,56 @@ void PushStubZeroes(IPC::ResponseBuilder& rb) {
 }
 
 } // namespace
+
+bool ServiceFrameworkBase::StubAllowed(HLERequestContext& ctx) {
+    const auto* const caller = ctx.GetThread().GetOwnerProcess();
+    if (Settings::values.use_auto_stub || std::string_view{service_name}.starts_with(Nx2StubPrefix) ||
+        (caller != nullptr && caller->IsSwitch2())) {
+        // Logged once per command: these are still unimplemented.
+        static std::mutex mutex;
+        static std::set<std::pair<std::string, u32>> logged;
+        std::scoped_lock lk{mutex};
+        if (logged.emplace(service_name, ctx.GetCommand()).second) {
+            LOG_WARNING(Service, "(STUBBED) {}::{} (placeholder reply)", service_name,
+                        ctx.GetCommand());
+        }
+        return true;
+    }
+    const auto& table = ctx.IsTipc() ? handlers_tipc : handlers;
+    const auto it = table.find(ctx.GetCommand());
+    ReportUnimplementedFunction(ctx, it == table.end() ? nullptr : &it->second);
+    return false;
+}
+
+void ServiceFrameworkBase::StubReplyZeroed(HLERequestContext& ctx) {
+    if (!StubAllowed(ctx)) {
+        return;
+    }
+    IPC::ResponseBuilder rb{ctx, 2 + StubZeroedWords};
+    rb.Push(ResultSuccess);
+    PushStubZeroes(rb);
+}
+
+void ServiceFrameworkBase::StubReplyEvent(HLERequestContext& ctx) {
+    if (!StubAllowed(ctx)) {
+        return;
+    }
+    if (!stub_event) {
+        stub_context = std::make_unique<KernelHelpers::ServiceContext>(system, service_name);
+        stub_event = stub_context->CreateEvent(fmt::format("{}:StubEvent", service_name));
+    }
+    IPC::ResponseBuilder rb{ctx, 2 + StubZeroedWords, 1, 0};
+    rb.Push(ResultSuccess);
+    PushStubZeroes(rb);
+    rb.PushCopyObjects(ctx, stub_event->GetReadableEvent());
+}
+
+void ServiceFrameworkBase::StubReplyInterface(HLERequestContext& ctx) {
+    if (!StubAllowed(ctx)) {
+        return;
+    }
+    ReturnNx2StubInterface(system, ctx, service_name);
+}
 
 void ServiceFrameworkBase::ReportUnimplementedFunction(HLERequestContext& ctx,
                                                        const FunctionInfoBase* info) {

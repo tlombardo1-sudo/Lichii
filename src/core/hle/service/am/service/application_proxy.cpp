@@ -31,6 +31,12 @@ IApplicationProxy::IApplicationProxy(Core::System& system_, std::shared_ptr<Appl
         {11, D<&IApplicationProxy::GetLibraryAppletCreator>, "GetLibraryAppletCreator"},
         {20, D<&IApplicationProxy::GetApplicationFunctions>, "GetApplicationFunctions"},
         {1000, D<&IApplicationProxy::GetDebugFunctions>, "GetDebugFunctions"},
+        {40, &IApplicationProxy::StubReplyInterface, "Nx2Getter40"},
+        {50, &IApplicationProxy::StubReplyInterface, "Nx2Getter50"},
+        {60, &IApplicationProxy::StubReplyInterface, "Nx2Getter60"},
+        {70, &IApplicationProxy::StubReplyInterface, "Nx2Getter70"},
+        {80, &IApplicationProxy::StubReplyInterface, "Nx2Getter80"},
+        {90, &IApplicationProxy::StubReplyInterface, "Nx2Getter90"},
     };
     // clang-format on
 

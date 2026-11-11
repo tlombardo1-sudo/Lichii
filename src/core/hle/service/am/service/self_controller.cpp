@@ -72,7 +72,7 @@ ISelfController::ISelfController(Core::System& system_, std::shared_ptr<Applet> 
         {130, D<&ISelfController::SetRecordVolumeMuted>, "SetRecordVolumeMuted"},
         {230, D<&ISelfController::Unknown230>, "Unknown230"},
         {240, D<&ISelfController::Unknown240>, "Unknown240"},
-        {1000, nullptr, "GetDebugStorageChannel"},
+        {1000, &ISelfController::StubReplyInterface, "GetDebugStorageChannel"},
     };
     // clang-format on
 

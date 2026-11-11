@@ -79,7 +79,7 @@ IApplicationFunctions::IApplicationFunctions(Core::System& system_, std::shared_
         {34, nullptr, "SelectApplicationLicense"},
         {35, nullptr, "GetDeviceSaveDataSizeMax"},
         {36, nullptr, "GetLimitedApplicationLicense"},
-        {37, nullptr, "GetLimitedApplicationLicenseUpgradableEvent"},
+        {37, &IApplicationFunctions::StubReplyEvent, "GetLimitedApplicationLicenseUpgradableEvent"},
         {40, D<&IApplicationFunctions::NotifyRunning>, "NotifyRunning"},
         {50, D<&IApplicationFunctions::GetPseudoDeviceId>, "GetPseudoDeviceId"},
         {60, D<&IApplicationFunctions::SetMediaPlaybackStateForApplication>, "SetMediaPlaybackStateForApplication"},
@@ -107,7 +107,7 @@ IApplicationFunctions::IApplicationFunctions(Core::System& system_, std::shared_
         {140, D<&IApplicationFunctions::GetFriendInvitationStorageChannelEvent>, "GetFriendInvitationStorageChannelEvent"},
         {141, D<&IApplicationFunctions::TryPopFromFriendInvitationStorageChannel>, "TryPopFromFriendInvitationStorageChannel"},
         {150, D<&IApplicationFunctions::GetNotificationStorageChannelEvent>, "GetNotificationStorageChannelEvent"},
-        {151, nullptr, "TryPopFromNotificationStorageChannel"},
+        {151, &IApplicationFunctions::StubReplyInterface, "TryPopFromNotificationStorageChannel"},
         {160, D<&IApplicationFunctions::GetHealthWarningDisappearedSystemEvent>, "GetHealthWarningDisappearedSystemEvent"},
         {170, nullptr, "SetHdcpAuthenticationActivated"},
         {180, nullptr, "GetLaunchRequiredVersion"},
@@ -116,12 +116,12 @@ IApplicationFunctions::IApplicationFunctions(Core::System& system_, std::shared_
         {200, nullptr, "GetLastApplicationExitReason"},
         {210, D<&IApplicationFunctions::GetUnknownEvent210>, "Unknown210"},
         {220, nullptr, "Unknown220"}, // [20.0.0+]
-        {300, nullptr, "CreateMovieWriter"}, // [19.0.0+]
+        {300, &IApplicationFunctions::StubReplyInterface, "CreateMovieWriter"}, // [19.0.0+]
         {310, nullptr, "Unknown310"}, // [20.0.0+]
         {320, nullptr, "Unknown320"}, // [20.0.0+]
         {330, D<&IApplicationFunctions::Unknown330>, "Unknown330"}, // [20.0.0+]
-        {500, nullptr, "StartContinuousRecordingFlushForDebug"},
-        {1000, nullptr, "CreateMovieMaker"},
+        {500, &IApplicationFunctions::StubReplyEvent, "StartContinuousRecordingFlushForDebug"},
+        {1000, &IApplicationFunctions::StubReplyInterface, "CreateMovieMaker"},
         {1001, D<&IApplicationFunctions::PrepareForJit>, "PrepareForJit"},
     };
     // clang-format on
