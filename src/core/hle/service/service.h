@@ -104,6 +104,7 @@ private:
     void RegisterHandlersBaseTipc(const FunctionInfoBase* functions, std::size_t n);
     void ReportUnimplementedFunction(HLERequestContext& ctx, const FunctionInfoBase* info);
 
+public:
     /// Placeholder handlers for commands whose reply shape is known but whose meaning is not, for
     /// Switch 2 callers (others get the unimplemented-function path): StubReplyZeroed replies
     /// with zeroed data words, StubReplyEvent adds a copy handle to an event that never fires and
