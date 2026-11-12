@@ -30,6 +30,9 @@ public:
                              Kernel::KProcess* process);
     ~ISelfController() override;
 
+    // Switch 2: returns a raw session handle (not a CMIF interface).
+    void GetNx2GraphicsSystemSession(HLERequestContext& ctx);
+
     std::string_view PulseKind() const override {
         return "ISelfController";
     }

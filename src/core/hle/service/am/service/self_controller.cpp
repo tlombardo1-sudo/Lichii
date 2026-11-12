@@ -12,6 +12,7 @@
 #include "core/hle/service/caps/caps_su.h"
 #include "core/hle/service/cmif_serialization.h"
 #include "core/hle/service/nvnflinger/nvnflinger.h"
+#include "core/hle/service/nx2_stub_interface.h"
 #include "core/hle/service/sm/sm.h"
 #include "core/hle/service/vi/vi_results.h"
 
@@ -73,6 +74,8 @@ ISelfController::ISelfController(Core::System& system_, std::shared_ptr<Applet> 
         {230, D<&ISelfController::Unknown230>, "Unknown230"},
         {240, D<&ISelfController::Unknown240>, "Unknown240"},
         {1000, &ISelfController::StubReplyInterface, "GetDebugStorageChannel"},
+        // Switch 2 SDKs ask for the graphics system server session here (TIPC); see below.
+        {2000, &ISelfController::GetNx2GraphicsSystemSession, "GetGraphicsSystemSession (Switch 2, guessed)"},
     };
     // clang-format on
 
@@ -81,6 +84,13 @@ ISelfController::ISelfController(Core::System& system_, std::shared_ptr<Applet> 
     std::scoped_lock lk{m_applet->lock};
     m_applet->display_layer_manager.Initialize(system, m_process, m_applet->applet_id,
                                                m_applet->library_applet_mode);
+}
+
+void ISelfController::GetNx2GraphicsSystemSession(HLERequestContext& ctx) {
+    // Placeholder: a session on which every command is auto-stubbed (nx2: prefix), so the SDK
+    // gets a valid handle. nn::gsv::BootWithRemoteMemory sends TIPC on it.
+    LOG_WARNING(Service_AM, "(STUBBED) Switch 2 ISelfController::2000, returning a nx2:gsv session");
+    ReturnRawSession(system, ctx, std::make_shared<INx2StubInterface>(system, "nx2:gsv"));
 }
 
 ISelfController::~ISelfController() {
