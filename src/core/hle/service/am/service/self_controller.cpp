@@ -12,7 +12,7 @@
 #include "core/hle/service/caps/caps_su.h"
 #include "core/hle/service/cmif_serialization.h"
 #include "core/hle/service/nvnflinger/nvnflinger.h"
-#include "core/hle/service/nx2_stub_interface.h"
+#include "core/hle/service/nx2_gsv.h"
 #include "core/hle/service/sm/sm.h"
 #include "core/hle/service/vi/vi_results.h"
 
@@ -87,10 +87,10 @@ ISelfController::ISelfController(Core::System& system_, std::shared_ptr<Applet> 
 }
 
 void ISelfController::GetNx2GraphicsSystemSession(HLERequestContext& ctx) {
-    // Placeholder: a session on which every command is auto-stubbed (nx2: prefix), so the SDK
-    // gets a valid handle. nn::gsv::BootWithRemoteMemory sends TIPC on it.
+    // Placeholder: a session on which the boot commands succeed and the rest is auto-stubbed
+    // (nx2: prefix), so the SDK gets valid handles. nn::gsv::BootWithRemoteMemory sends TIPC on it.
     LOG_WARNING(Service_AM, "(STUBBED) Switch 2 ISelfController::2000, returning a nx2:gsv session");
-    ReturnRawSession(system, ctx, std::make_shared<INx2StubInterface>(system, "nx2:gsv"));
+    ReturnRawSession(system, ctx, std::make_shared<INx2GraphicsSystemSession>(system));
 }
 
 ISelfController::~ISelfController() {
