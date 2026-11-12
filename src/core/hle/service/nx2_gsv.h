@@ -121,6 +121,66 @@ private:
     std::array<Kernel::KEvent*, NumIds> m_events{};
 };
 
+// TIPC reply: one-word success result followed directly by raw data words.
+inline void TipcReplyWords(HLERequestContext& ctx, std::initializer_list<u32> words) {
+    IPC::ResponseBuilder rb{ctx, static_cast<u32>(2 + words.size())};
+    rb.PushRaw<u32>(ResultSuccess.raw);
+    for (const u32 w : words) {
+        rb.Push<u32>(w);
+    }
+}
+
+// TIPC 0(u64 token): handshake newer SDKs send first; echo the token.
+inline void TipcHandshake(HLERequestContext& ctx) {
+    const auto* w = ctx.CommandBuffer();
+    TipcReplyWords(ctx, {w[2], w[3]});
+}
+
+// nn::gpu time session handed out by gsv 1121; a missing handle ends in InvalidHandle (0xe401).
+class INx2GpuTimeSession final : public ServiceFramework<INx2GpuTimeSession> {
+public:
+    explicit INx2GpuTimeSession(Core::System& system_)
+        : ServiceFramework{system_, "nx2:gpu_time"} {
+        RegisterHandlersTipc({
+            {0, &INx2GpuTimeSession::Handshake, "Handshake"},
+            {11, &INx2GpuTimeSession::NotSupported, "QueryApplicationGpuTimeSpan"},
+        });
+    }
+
+private:
+    void Handshake(HLERequestContext& ctx) {
+        TipcHandshake(ctx);
+    }
+    void NotSupported(HLERequestContext& ctx) {
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.PushRaw<u32>(IPC::ResultNotSupported.raw);
+    }
+};
+
+// nn::vi2 session handed out by gsv 305 (minimal: no display or events behind it).
+class INx2Vi2Session final : public ServiceFramework<INx2Vi2Session> {
+public:
+    explicit INx2Vi2Session(Core::System& system_) : ServiceFramework{system_, "nx2:vi2"} {
+        RegisterHandlersTipc({
+            {0, &INx2Vi2Session::Handshake, "Handshake"},
+            {1, &INx2Vi2Session::ReturnOne, "Unknown1"},
+            {3, &INx2Vi2Session::ReturnOne, "GetDisplayCount (guessed)"},
+            {5, &INx2Vi2Session::GetTimestampRecorderCount, "GetTimestampRecorderCount (guessed)"},
+        });
+    }
+
+private:
+    void Handshake(HLERequestContext& ctx) {
+        TipcHandshake(ctx);
+    }
+    void ReturnOne(HLERequestContext& ctx) {
+        TipcReplyWords(ctx, {1});
+    }
+    void GetTimestampRecorderCount(HLERequestContext& ctx) {
+        TipcReplyWords(ctx, {7});
+    }
+};
+
 // The graphics-system server nn::gsv::BootWithRemoteMemory talks to over TIPC.
 class INx2GraphicsSystemSession final : public ServiceFramework<INx2GraphicsSystemSession> {
 public:
@@ -132,6 +192,10 @@ public:
             {101, &INx2GraphicsSystemSession::Stub, "Unknown101"},
             {202, &INx2GraphicsSystemSession::OpenSyncptSession, "OpenSyncptSession (guessed)"},
             {204, &INx2GraphicsSystemSession::AttachSyncptMemory, "AttachSyncptMemory (guessed)"},
+            {301, &INx2GraphicsSystemSession::Stub, "CheckPermission301"},
+            {303, &INx2GraphicsSystemSession::Stub, "Unknown303"},
+            {305, &INx2GraphicsSystemSession::OpenViSession, "OpenViSession (guessed)"},
+            {1121, &INx2GraphicsSystemSession::OpenGpuTimeSession, "OpenGpuTimeSession"},
             {497, &INx2GraphicsSystemSession::OpenGpuSession, "OpenGpuSession (guessed)"},
             {1402, &INx2GraphicsSystemSession::OpenNvsrvSession, "OpenNvsrvSession (guessed)"},
         });
@@ -210,6 +274,16 @@ private:
         LOG_WARNING(Service, "(STUBBED) nx2:gsv TIPC 497 arg={:#x}, returning a nx2:gpu session",
                     u64{cmd_buf[data]} | (u64{cmd_buf[data + 1]} << 32));
         ReturnRawSession(system, ctx, std::make_shared<INx2GpuSession>(system));
+    }
+
+    void OpenViSession(HLERequestContext& ctx) {
+        LOG_WARNING(Service, "(STUBBED) nx2:gsv TIPC 305, returning a nx2:vi2 session");
+        ReturnRawSession(system, ctx, std::make_shared<INx2Vi2Session>(system));
+    }
+
+    void OpenGpuTimeSession(HLERequestContext& ctx) {
+        LOG_INFO(Service, "nx2:gsv TIPC 1121, returning a nx2:gpu_time session");
+        ReturnRawSession(system, ctx, std::make_shared<INx2GpuTimeSession>(system));
     }
 
     void OpenNvsrvSession(HLERequestContext& ctx) {
