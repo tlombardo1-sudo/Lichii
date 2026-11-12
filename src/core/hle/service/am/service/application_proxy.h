@@ -11,6 +11,7 @@ namespace Service::AM {
 
 struct Applet;
 class IAudioController;
+class IGraphicsScaleController;
 class IApplicationFunctions;
 class ICommonStateGetter;
 class IDebugFunctions;
@@ -35,6 +36,7 @@ public:
     }
 
 private:
+    Result GetGraphicsScaleController(Out<SharedPointer<IGraphicsScaleController>> out_controller);
     Result GetAudioController(Out<SharedPointer<IAudioController>> out_audio_controller);
     Result GetDisplayController(Out<SharedPointer<IDisplayController>> out_display_controller);
     Result GetProcessWindingController(

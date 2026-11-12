@@ -4,6 +4,7 @@
 #include "core/hle/service/am/service/applet_common_functions.h"
 #include "core/hle/service/am/service/application_functions.h"
 #include "core/hle/service/am/service/application_proxy.h"
+#include "core/hle/service/am/service/graphics_scale_controller.h"
 #include "core/hle/service/am/service/audio_controller.h"
 #include "core/hle/service/am/service/common_state_getter.h"
 #include "core/hle/service/am/service/debug_functions.h"
@@ -33,7 +34,7 @@ IApplicationProxy::IApplicationProxy(Core::System& system_, std::shared_ptr<Appl
         {1000, D<&IApplicationProxy::GetDebugFunctions>, "GetDebugFunctions"},
         {40, &IApplicationProxy::StubReplyInterface, "Nx2Getter40"},
         {50, &IApplicationProxy::StubReplyInterface, "Nx2Getter50"},
-        {60, &IApplicationProxy::StubReplyInterface, "Nx2Getter60"},
+        {60, D<&IApplicationProxy::GetGraphicsScaleController>, "GetGraphicsScaleController (Switch 2)"},
         {70, &IApplicationProxy::StubReplyInterface, "Nx2Getter70"},
         {80, &IApplicationProxy::StubReplyInterface, "Nx2Getter80"},
         {90, &IApplicationProxy::StubReplyInterface, "Nx2Getter90"},
@@ -44,6 +45,13 @@ IApplicationProxy::IApplicationProxy(Core::System& system_, std::shared_ptr<Appl
 }
 
 IApplicationProxy::~IApplicationProxy() = default;
+
+Result IApplicationProxy::GetGraphicsScaleController(
+    Out<SharedPointer<IGraphicsScaleController>> out_controller) {
+    LOG_DEBUG(Service_AM, "called");
+    *out_controller = std::make_shared<IGraphicsScaleController>(system);
+    R_SUCCEED();
+}
 
 Result IApplicationProxy::GetAudioController(
     Out<SharedPointer<IAudioController>> out_audio_controller) {
