@@ -21,6 +21,7 @@
 #include "core/hle/service/nvdrv/nvdrv_interface.h"
 #include "core/hle/service/nx2_stub_interface.h"
 #include "core/hle/service/service.h"
+#include "core/hle/service/sm/sm.h"
 #include "core/memory.h"
 
 // Placeholders for the Switch 2 graphics system servers (nn::gsv and the sessions it hands out).
