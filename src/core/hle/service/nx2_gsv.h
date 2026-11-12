@@ -215,6 +215,7 @@ public:
             {101, &INx2GraphicsSystemSession::Stub, "Unknown101"},
             {202, &INx2GraphicsSystemSession::OpenSyncptSession, "OpenSyncptSession (guessed)"},
             {204, &INx2GraphicsSystemSession::AttachSyncptMemory, "AttachSyncptMemory (guessed)"},
+            {115, &INx2GraphicsSystemSession::QueryGrantedFeatures, "QueryGrantedFeatures"},
             {301, &INx2GraphicsSystemSession::Stub, "CheckPermission301"},
             {303, &INx2GraphicsSystemSession::Stub, "Unknown303"},
             {305, &INx2GraphicsSystemSession::OpenViSession, "OpenViSession (guessed)"},
@@ -297,6 +298,14 @@ private:
         LOG_WARNING(Service, "(STUBBED) nx2:gsv TIPC 497 arg={:#x}, returning a nx2:gpu session",
                     u64{cmd_buf[data]} | (u64{cmd_buf[data + 1]} << 32));
         ReturnRawSession(system, ctx, std::make_shared<INx2GpuSession>(system));
+    }
+
+    // 115(u64 requested feature flags): the granted subset, which is all of them here. A zeroed
+    // reply would deny every feature.
+    void QueryGrantedFeatures(HLERequestContext& ctx) {
+        const auto* w = ctx.CommandBuffer();
+        LOG_INFO(Service, "nx2:gsv TIPC 115 features {:#x}", u64{w[2]} | (u64{w[3]} << 32));
+        TipcReplyWords(ctx, {w[2], w[3]});
     }
 
     void OpenViSession(HLERequestContext& ctx) {
