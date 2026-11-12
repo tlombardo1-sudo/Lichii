@@ -179,6 +179,29 @@ void DynarmicCallbacks64::LogNullJump() {
         describe("x", i, gpr[i]);
     }
     describe("sp", 0, jit.GetSP());
+    // Raw guest code around the failing call chain, so it can be disassembled offline:
+    // "CODE <start>: <8 words>" lines for the thunk (x17) and the code before each return address
+    // along the frame-pointer chain.
+    const auto dump_code = [&](const char* what, u64 start, u32 words) {
+        if (start < 0x10000 || m_memory.GetPointerSilent(start) == nullptr) {
+            return;
+        }
+        for (u32 i = 0; i < words; i += 8) {
+            std::string line;
+            for (u32 j = 0; j < 8 && i + j < words; ++j) {
+                line += fmt::format(" {:08x}", m_memory.Read32(start + (i + j) * 4));
+            }
+            LOG_CRITICAL(Core_ARM, "CODE {} {:#x}:{}", what, start + i * 4, line);
+        }
+    };
+    dump_code("x17", gpr[17], 8);
+    dump_code("lr", lr - 0x100, 72);
+    u64 fp = gpr[29];
+    for (int frame = 0; frame < 8 && fp >= 0x10000 && m_memory.GetPointerSilent(fp) != nullptr; ++frame) {
+        const u64 ret = m_memory.Read64(fp + 8);
+        dump_code("frame", ret - 0x80, 40);
+        fp = m_memory.Read64(fp);
+    }
     LOG_CRITICAL(Core_ARM, "Null jump: {}", Common::Permafrost::Describe());
 }
 
