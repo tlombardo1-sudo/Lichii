@@ -77,6 +77,9 @@ public:
     /// Opens a device node and returns a file descriptor to it.
     DeviceFD Open(const std::string& device_name, NvCore::SessionId session_id);
 
+    /// Set once a Switch 2 nvsrv session exists: unknown /dev/nvhost-* nodes open as stubs.
+    bool nx2_stub_nodes = false;
+
     /// Sends an ioctl command to the specified file descriptor.
     NvResult Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> input, std::span<u8> output);
 
@@ -108,6 +111,8 @@ public:
 
 private:
     friend class EventInterface;
+
+    Core::System* m_system = nullptr;
 
     /// Manages syncpoints on the host
     NvCore::Container container;

@@ -39,7 +39,7 @@ void NVDRV::Open(HLERequestContext& ctx) {
     const auto& buffer = ctx.ReadBuffer();
     const std::string device_name(Common::StringFromBuffer(buffer));
 
-    if (device_name == "/dev/nvhost-prof-gpu") {
+    if (device_name == "/dev/nvhost-prof-gpu" && !nvdrv->nx2_stub_nodes) {
         rb.Push<DeviceFD>(0);
         rb.PushEnum(NvResult::NotSupported);
 
@@ -192,6 +192,7 @@ void NVDRV::InitializeForProcess(Kernel::KProcess* process) {
         return;
     }
     session_id = nvdrv->GetContainer().OpenSession(process);
+    nvdrv->nx2_stub_nodes = true;
     is_initialized = true;
 }
 
