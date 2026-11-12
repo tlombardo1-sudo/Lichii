@@ -5,6 +5,7 @@
 
 #include <array>
 #include <memory>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -16,6 +17,8 @@
 #include "core/hle/service/hle_ipc.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/kernel_helpers.h"
+#include "core/hle/service/nvdrv/nvdrv.h"
+#include "core/hle/service/nvdrv/nvdrv_interface.h"
 #include "core/hle/service/nx2_stub_interface.h"
 #include "core/hle/service/service.h"
 #include "core/memory.h"
@@ -160,13 +163,21 @@ private:
 // nn::vi2 session handed out by gsv 305 (minimal: no display or events behind it).
 class INx2Vi2Session final : public ServiceFramework<INx2Vi2Session> {
 public:
-    explicit INx2Vi2Session(Core::System& system_) : ServiceFramework{system_, "nx2:vi2"} {
+    explicit INx2Vi2Session(Core::System& system_)
+        : ServiceFramework{system_, "nx2:vi2"}, m_context{system_, "nx2:vi2"} {
         RegisterHandlersTipc({
             {0, &INx2Vi2Session::Handshake, "Handshake"},
             {1, &INx2Vi2Session::ReturnOne, "Unknown1"},
             {3, &INx2Vi2Session::ReturnOne, "GetDisplayCount (guessed)"},
             {5, &INx2Vi2Session::GetTimestampRecorderCount, "GetTimestampRecorderCount (guessed)"},
+            {11, &INx2Vi2Session::ReturnEvent, "Unknown11"},
         });
+    }
+
+    ~INx2Vi2Session() override {
+        for (auto* event : m_events) {
+            m_context.CloseEvent(event);
+        }
     }
 
 private:
@@ -179,6 +190,17 @@ private:
     void GetTimestampRecorderCount(HLERequestContext& ctx) {
         TipcReplyWords(ctx, {7});
     }
+    void ReturnEvent(HLERequestContext& ctx) {
+        LOG_WARNING(Service, "(STUBBED) nx2:vi2 TIPC {}, returning an event", ctx.GetCommand());
+        auto* event = m_context.CreateEvent("nx2:vi2:Event");
+        m_events.push_back(event);
+        IPC::ResponseBuilder rb{ctx, 2, 1, 0};
+        rb.Push(ResultSuccess);
+        rb.PushCopyObjects(ctx, event->GetReadableEvent());
+    }
+
+    KernelHelpers::ServiceContext m_context;
+    std::vector<Kernel::KEvent*> m_events;
 };
 
 // The graphics-system server nn::gsv::BootWithRemoteMemory talks to over TIPC.
@@ -289,7 +311,10 @@ private:
     void OpenNvsrvSession(HLERequestContext& ctx) {
         // The SDK reads the handle at word 3 and the result at word 4.
         LOG_WARNING(Service, "(STUBBED) nx2:gsv TIPC 1402, returning a nx2:nvsrv session");
-        ReturnRawSession(system, ctx, std::make_shared<INx2NvsrvSession>(system));
+        auto module = system.ServiceManager().GetService<Nvidia::NVDRV>("nvdrv", true)->GetModule();
+        auto nvsrv = std::make_shared<Nvidia::NVDRV>(system, module, "nx2:nvsrv");
+        nvsrv->InitializeForProcess(ctx.GetThread().GetOwnerProcess());
+        ReturnRawSession(system, ctx, std::move(nvsrv));
     }
 
     KernelHelpers::ServiceContext m_context;

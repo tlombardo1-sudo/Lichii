@@ -187,6 +187,14 @@ void NVDRV::Initialize(HLERequestContext& ctx) {
     is_initialized = true;
 }
 
+void NVDRV::InitializeForProcess(Kernel::KProcess* process) {
+    if (is_initialized) {
+        return;
+    }
+    session_id = nvdrv->GetContainer().OpenSession(process);
+    is_initialized = true;
+}
+
 void NVDRV::QueryEvent(HLERequestContext& ctx) {
     IPC::RequestParser rp{ctx};
     const auto fd = rp.Pop<DeviceFD>();
