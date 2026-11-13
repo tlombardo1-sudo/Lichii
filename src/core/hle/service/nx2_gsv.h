@@ -30,6 +30,21 @@
 // other command is auto-stubbed and logged through the nx2: prefix.
 namespace Service {
 
+// TIPC reply: one-word success result followed directly by raw data words.
+inline void TipcReplyWords(HLERequestContext& ctx, std::initializer_list<u32> words) {
+    IPC::ResponseBuilder rb{ctx, static_cast<u32>(2 + words.size())};
+    rb.PushRaw<u32>(ResultSuccess.raw);
+    for (const u32 w : words) {
+        rb.Push<u32>(w);
+    }
+}
+
+// TIPC 0(u64 token): handshake newer SDKs send first; echo the token.
+inline void TipcHandshake(HLERequestContext& ctx) {
+    const auto* w = ctx.CommandBuffer();
+    TipcReplyWords(ctx, {w[2], w[3]});
+}
+
 // nn::nvsrv: no handlers, so every command (CMIF or TIPC) gets an empty success.
 class INx2NvsrvSession final : public ServiceFramework<INx2NvsrvSession> {
 public:
@@ -198,21 +213,6 @@ private:
     KernelHelpers::ServiceContext m_context;
     std::array<Kernel::KEvent*, NumIds> m_events{};
 };
-
-// TIPC reply: one-word success result followed directly by raw data words.
-inline void TipcReplyWords(HLERequestContext& ctx, std::initializer_list<u32> words) {
-    IPC::ResponseBuilder rb{ctx, static_cast<u32>(2 + words.size())};
-    rb.PushRaw<u32>(ResultSuccess.raw);
-    for (const u32 w : words) {
-        rb.Push<u32>(w);
-    }
-}
-
-// TIPC 0(u64 token): handshake newer SDKs send first; echo the token.
-inline void TipcHandshake(HLERequestContext& ctx) {
-    const auto* w = ctx.CommandBuffer();
-    TipcReplyWords(ctx, {w[2], w[3]});
-}
 
 // nn::gpu time session handed out by gsv 1121; a missing handle ends in InvalidHandle (0xe401).
 class INx2GpuTimeSession final : public ServiceFramework<INx2GpuTimeSession> {
