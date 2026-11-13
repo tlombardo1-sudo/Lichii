@@ -14,6 +14,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/kernel/k_transfer_memory.h"
+#include "core/hle/kernel/svc_results.h"
 #include "core/hle/service/hle_ipc.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/kernel_helpers.h"
@@ -68,6 +69,12 @@ public:
             {12, &INx2GpuSession::GetIdEvent, "GetIdEvent (guessed)"},
             {21, &INx2GpuSession::Start, "Start (guessed)"},
             {22, &INx2GpuSession::OpenSubSession, "OpenSubSession (guessed)"},
+            {33, &INx2GpuSession::GetCount33, "Unknown33 (u32 count)"},
+            {41, &INx2GpuSession::CreateGraphicsDevice, "CreateGraphicsDevice"},
+            {42, &INx2GpuSession::DestroyGraphicsDevice, "DestroyGraphicsDevice"},
+            {201, &INx2GpuSession::GetUserPartition, "GetUserPartition (newer SDKs)"},
+            {202, &INx2GpuSession::GetGsvPartition, "GetGsvPartition (newer SDKs)"},
+            {203, &INx2GpuSession::GetVaRange, "GetVaRange (guessed)"},
         });
     }
 
@@ -81,6 +88,73 @@ public:
 
 private:
     static constexpr u32 NumIds = 32;
+
+    std::array<bool, 64> m_devices{};
+
+    void GetCount33(HLERequestContext& ctx) {
+        LOG_WARNING(Service, "(STUBBED) nx2:gpu TIPC 33 [2]={:#x}, returning 1", ctx.CommandBuffer()[2]);
+        TipcReplyWords(ctx, {1});
+    }
+
+    // Used by nn::gpu::sdk::CreateGpuAddressSpace: three u64s after the result, a kind (< 5, 0 =
+    // none) and the GPU VA range of the in-process VirtualMachine that serves AllocSpace
+    // (nn::gpu::sdk::util::ExecuteVirtualMachineAllocSpace). NVN reserves fixed VA from 0x8000000
+    // up to 512 GiB, so report the same range NvRm gives AllocAsEx: [0x8000000, 0xC000000000).
+    void GetVaRange(HLERequestContext& ctx) {
+        LOG_WARNING(Service, "(STUBBED) nx2:gpu TIPC 203 [2]={:#x}", ctx.CommandBuffer()[2]);
+        constexpr u64 kind = 1;
+        constexpr u64 start = 0x8000000ULL;
+        constexpr u64 size = 0xC000000000ULL - start;
+        TipcReplyWords(ctx, {static_cast<u32>(kind), static_cast<u32>(kind >> 32),
+                             static_cast<u32>(start), static_cast<u32>(start >> 32),
+                             static_cast<u32>(size), static_cast<u32>(size >> 32)});
+    }
+
+    // Newer SDKs (title 1) query the address space's user and gsv partitions with 201/202(id):
+    // two u64s each, stored as the partition's min/max. The user value works whether it is read
+    // as (start, size) or (min, max). Title 4 never needed the gsv partition, so it stays empty.
+    void GetUserPartition(HLERequestContext& ctx) {
+        LOG_WARNING(Service, "(STUBBED) nx2:gpu TIPC 201 [2]={:#x}", ctx.CommandBuffer()[2]);
+        constexpr u64 first = 0x8000000ULL;
+        constexpr u64 second = 0xC000000000ULL - first;
+        TipcReplyWords(ctx, {static_cast<u32>(first), static_cast<u32>(first >> 32),
+                             static_cast<u32>(second), static_cast<u32>(second >> 32)});
+    }
+
+    // An empty partition is min = ~0, max = 0 (min > max). Fire Emblem: Fortune's Weave's SDK
+    // reads (0, 0) as a one-byte partition at address 0 and aborts in nn::gpu::sdk.
+    void GetGsvPartition(HLERequestContext& ctx) {
+        LOG_WARNING(Service, "(STUBBED) nx2:gpu TIPC 202 [2]={:#x}, empty", ctx.CommandBuffer()[2]);
+        TipcReplyWords(ctx, {~0U, ~0U, 0, 0});
+    }
+
+    // Fire Emblem: Fortune's Weave: 41(name u64, flags u64, debug label u64) returns a device id
+    // that later NvRm calls name; 0 is not a valid id. Only flags 0 has been seen.
+    void CreateGraphicsDevice(HLERequestContext& ctx) {
+        const auto* b = ctx.CommandBuffer();
+        const u64 name = u64{b[2]} | (u64{b[3]} << 32);
+        const u64 flags = u64{b[4]} | (u64{b[5]} << 32);
+        u32 id = 0;
+        for (u32 candidate = 1; candidate < m_devices.size(); ++candidate) {
+            if (!m_devices[candidate]) {
+                m_devices[candidate] = true;
+                id = candidate;
+                break;
+            }
+        }
+        LOG_INFO(Service, "nx2:gpu 41 create graphics device name={:#x} flags={:#x} -> id {}", name,
+                 flags, id);
+        IPC::ResponseBuilder rb{ctx, 3};
+        rb.Push(id != 0 ? ResultSuccess : Kernel::ResultOutOfResource);
+        rb.Push(id);
+    }
+
+    void DestroyGraphicsDevice(HLERequestContext& ctx) {
+        const u32 id = ctx.CommandBuffer()[2] & 0xff;
+        const bool existed = id < m_devices.size() && std::exchange(m_devices[id], false);
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(existed ? ResultSuccess : Kernel::ResultNotFound);
+    }
 
     Kernel::KEvent* EventFor(u32 id) {
         id %= NumIds;
@@ -218,6 +292,7 @@ public:
             {115, &INx2GraphicsSystemSession::QueryGrantedFeatures, "QueryGrantedFeatures"},
             {301, &INx2GraphicsSystemSession::Stub, "CheckPermission301"},
             {303, &INx2GraphicsSystemSession::Stub, "Unknown303"},
+            {434, &INx2GraphicsSystemSession::AttachGpuAddressSpace, "AttachGpuAddressSpace"},
             {305, &INx2GraphicsSystemSession::OpenViSession, "OpenViSession (guessed)"},
             {1121, &INx2GraphicsSystemSession::OpenGpuTimeSession, "OpenGpuTimeSession"},
             {497, &INx2GraphicsSystemSession::OpenGpuSession, "OpenGpuSession (guessed)"},
@@ -306,6 +381,11 @@ private:
         const auto* w = ctx.CommandBuffer();
         LOG_INFO(Service, "nx2:gsv TIPC 115 features {:#x}", u64{w[2]} | (u64{w[3]} << 32));
         TipcReplyWords(ctx, {w[2], w[3]});
+    }
+
+    void AttachGpuAddressSpace(HLERequestContext& ctx) {
+        LOG_INFO(Service, "nx2:gsv TIPC 434 address space {:#x}", ctx.CommandBuffer()[2]);
+        TipcReplyWords(ctx, {});
     }
 
     void OpenViSession(HLERequestContext& ctx) {
