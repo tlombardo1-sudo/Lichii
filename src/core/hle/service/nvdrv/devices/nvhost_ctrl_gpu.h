@@ -218,6 +218,12 @@ private:
     Kernel::KEvent* unknown_event;
 
     // ZBC Tables
+    NvResult Nx2GetEngineInfo(std::span<const u8> input, std::span<u8> output,
+                              std::span<u8> inline_output);
+
+    // Set once a caller asked for the Switch 2 characteristics layout.
+    bool nx2_caller{};
+
     mutable std::mutex zbc_mutex{};
     std::vector<ZbcColorEntry> zbc_colors{};
     std::vector<ZbcDepthEntry> zbc_depths{};
