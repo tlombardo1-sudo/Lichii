@@ -61,6 +61,8 @@ NvResult nvhost_as_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> i
             return WrapFixed(this, &nvhost_as_gpu::GetVARegions1, input, output);
         case 0x9:
             return WrapFixed(this, &nvhost_as_gpu::AllocAsEx, input, output);
+        case 0xb:
+            return WrapFixed(this, &nvhost_as_gpu::Nx2GetSyncpointShimInfo, input, output);
         case 0x14:
             return WrapVariable(this, &nvhost_as_gpu::Remap, input, output);
         default:
@@ -119,6 +121,26 @@ void WatchProgramRegion(const void* owner, const Tegra::MemoryManager* gmmu, con
 }
 } // namespace
 
+// Switch 2 NvRm asks for the read-only syncpoint shim: a GPU page whose u32 at id * stride reads as
+// that syncpoint's value; NVN waits on syncpoints through it and asserts without one.
+NvResult nvhost_as_gpu::Nx2GetSyncpointShimInfo(IoctlNx2SyncpointShimInfo& params) {
+    std::scoped_lock lock(mutex);
+    if (!vm.initialised || !gmmu) {
+        return NvResult::NotSupported;
+    }
+    const u64 address = vm.va_range_end - VM::YUZU_PAGESIZE;
+    if (!nx2_syncpoint_shim) {
+        nx2_syncpoint_shim = true;
+        gmmu->SetNativeSyncpointShim(address);
+    }
+    params.address = address;
+    params.stride = sizeof(u32);
+    params.count = Tegra::MemoryManager::NumShimSyncpoints;
+    LOG_INFO(Service_NVDRV, "Switch 2 syncpoint shim at {:#x} ({} syncpoints)", address,
+             params.count);
+    return NvResult::Success;
+}
+
 NvResult nvhost_as_gpu::AllocAsEx(IoctlAllocAsEx& params) {
     LOG_DEBUG(Service_NVDRV, "called, big_page_size={:#x}", params.big_page_size);
 
@@ -151,6 +173,14 @@ NvResult nvhost_as_gpu::AllocAsEx(IoctlAllocAsEx& params) {
         vm.va_range_start = params.va_range_start;
         vm.va_range_split = params.va_range_split;
         vm.va_range_end = params.va_range_end;
+        if (vm.va_range_split == 0) {
+            // Switch 2 NvRm asks for small pages over the whole range and then reserves 4 KiB VA up
+            // to 512 GiB. Keep a small big-page region past the end so both allocators stay valid.
+            vm.va_range_split = vm.va_range_end;
+            vm.va_range_end += 4ULL << 30;
+            vm.absolute_big_page_limit = true;
+            LOG_WARNING(Service_NVDRV, "No VA split given; small pages up to {:#x}", vm.va_range_split);
+        }
     }
 
     const u64 max_big_page_bits = Common::Log2Ceil(vm.va_range_end);
@@ -161,7 +191,9 @@ NvResult nvhost_as_gpu::AllocAsEx(IoctlAllocAsEx& params) {
 
     const auto start_big_pages{static_cast<u32>(vm.va_range_split >> vm.big_page_size_bits)};
     const auto end_big_pages{
-        static_cast<u32>((vm.va_range_end - vm.va_range_split) >> vm.big_page_size_bits)};
+        static_cast<u32>((vm.absolute_big_page_limit ? vm.va_range_end
+                                              : vm.va_range_end - vm.va_range_split) >>
+                         vm.big_page_size_bits)};
     vm.big_page_allocator.emplace(start_big_pages, end_big_pages);
 
     gmmu = std::make_unique<Tegra::MemoryManager>(system, max_big_page_bits, vm.va_range_split, vm.big_page_size_bits, VM::PAGE_SIZE_BITS);

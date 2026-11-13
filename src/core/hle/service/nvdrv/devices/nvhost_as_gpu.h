@@ -241,7 +241,17 @@ private:
         std::optional<Allocator> small_page_allocator; //! Shared as this is also used by nvhost::GpuChannel
 
         bool initialised{};
+        bool absolute_big_page_limit{}; //!< Switch 2 layout: big-page limit is va_range_end
     } vm;
+
+    struct IoctlNx2SyncpointShimInfo {
+        u64_le address;
+        u32_le stride;
+        u32_le count;
+    };
+    static_assert(sizeof(IoctlNx2SyncpointShimInfo) == 16);
+    NvResult Nx2GetSyncpointShimInfo(IoctlNx2SyncpointShimInfo& params);
+    bool nx2_syncpoint_shim{};
     std::unique_ptr<Tegra::MemoryManager> gmmu;
 };
 

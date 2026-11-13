@@ -35,6 +35,10 @@ namespace Tegra {
 
 class MemoryManager final {
 public:
+    /// Switch 2: GPU reads of u32s inside this page return guest syncpoint values (0 = unset).
+    void SetNativeSyncpointShim(GPUVAddr address);
+    static constexpr u32 NumShimSyncpoints = 192; // Tegra::Host1x::SyncpointManager
+
     explicit MemoryManager(Core::System& system_, u64 address_space_bits_ = 40,
                            GPUVAddr split_address = 1ULL << 34, u64 big_page_bits_ = 16,
                            u64 page_bits_ = 12);
@@ -160,6 +164,8 @@ public:
     u8* GetSpan(const GPUVAddr src_addr, const std::size_t size);
 
 private:
+    std::atomic<GPUVAddr> native_syncpoint_shim{};
+
     template <typename FuncMapped, typename FuncReserved, typename FuncUnmapped>
     inline void MemoryOperation(GPUVAddr gpu_src_addr, std::size_t size, bool is_big_page, FuncMapped&& func_mapped, FuncReserved&& func_reserved, FuncUnmapped&& func_unmapped) const;
 
