@@ -274,11 +274,40 @@ void DynarmicCallbacks64::LogTimedWaitDeep(u32 svc) {
         }
     };
     dump("data", gpr[0] - 0x40, 64);
+    // Code pointers stored in the waited-on object (callbacks), and the targets of the calls that
+    // lead into the wait.
+    for (u64 a = gpr[0] - 0x40; a < gpr[0] + 0xc0; a += 8) {
+        if (m_memory.GetPointerSilent(a) == nullptr) {
+            continue;
+        }
+        const u64 value = m_memory.Read64(a);
+        if (value >= 0x80000000ULL && value < 0x90000000ULL && (value & 3) == 0 &&
+            m_memory.GetPointerSilent(value) != nullptr) {
+            LOG_INFO(Core_ARM, "DEEPPTR {:#x} -> {:#x}", a, value);
+            dump("fnptr", value, 96);
+        }
+    }
+    const auto dump_call_target = [&](u64 ret) {
+        if (m_memory.GetPointerSilent(ret - 4) == nullptr) {
+            return;
+        }
+        const u32 insn = m_memory.Read32(ret - 4);
+        if ((insn & 0xFC000000) == 0x94000000) {
+            const s64 imm = static_cast<s32>((insn & 0x03FFFFFF) << 6) >> 6;
+            const u64 target = (ret - 4) + static_cast<u64>(imm * 4);
+            LOG_INFO(Core_ARM, "DEEPCALL ret={:#x} -> {:#x}", ret, target);
+            dump("callee", target, 96);
+        }
+    };
+    dump_call_target(gpr[30]);
     u64 fp = gpr[29];
     for (int frame = 0; frame < 9 && fp >= 0x10000 && m_memory.GetPointerSilent(fp) != nullptr; ++frame) {
         const u64 ret = m_memory.Read64(fp + 8);
         LOG_INFO(Core_ARM, "DEEPFRAME {} ret={:#x} fp={:#x}", frame, ret, fp);
         dump("code", ret - 0x180, 160);
+        if (frame < 4) {
+            dump_call_target(ret);
+        }
         dump("stack", fp, 32);
         fp = m_memory.Read64(fp);
     }
