@@ -2555,7 +2555,7 @@ void Call(Core::System& system, u32 imm) {
                              "Switch 2 thread t{} state={:#x} wait_reason={} key={:#x}/{:#x} svc={:#x} prio={} core={}",
                              thread.GetThreadId(), static_cast<u32>(thread.GetState()),
                              static_cast<u32>(thread.GetWaitReasonForDebugging()),
-                             static_cast<u64>(thread.GetAddressKey()), thread.GetAddressKeyValue(),
+                             GetInteger(thread.GetAddressKey()), thread.GetAddressKeyValue(),
                              thread.GetStackParameters().current_svc_id, thread.GetPriority(),
                              thread.GetActiveCore());
                 }
