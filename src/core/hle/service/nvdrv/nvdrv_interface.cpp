@@ -5,6 +5,10 @@
 // SPDX-FileCopyrightText: 2021 Skyline Team and Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <mutex>
+#include <set>
+#include <string>
+#include <tuple>
 #include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/string_util.h"
@@ -23,6 +27,22 @@
 
 namespace Service::Nvidia {
 
+
+namespace {
+// Switch 2 diagnostics: each distinct (kind, fd, ioctl) once, at info level.
+void LogNx2Nv(bool nx2, const char* kind, u32 fd, u32 raw) {
+    if (!nx2) {
+        return;
+    }
+    static std::mutex m;
+    static std::set<std::tuple<std::string, u32, u32>> seen;
+    std::scoped_lock lk{m};
+    if (seen.size() < 400 && seen.emplace(kind, fd, raw).second) {
+        LOG_INFO(Service_NVDRV, "Switch 2 nvdrv {} fd={} ioctl={:#010x}", kind, fd, raw);
+    }
+}
+} // namespace
+
 void NVDRV::Open(HLERequestContext& ctx) {
     LOG_DEBUG(Service_NVDRV, "called");
     IPC::ResponseBuilder rb{ctx, 4};
@@ -38,6 +58,9 @@ void NVDRV::Open(HLERequestContext& ctx) {
 
     const auto& buffer = ctx.ReadBuffer();
     const std::string device_name(Common::StringFromBuffer(buffer));
+    if (nvdrv && nvdrv->nx2_stub_nodes) {
+        LOG_INFO(Service_NVDRV, "Switch 2 nvdrv open {}", device_name);
+    }
 
     if (device_name == "/dev/nvhost-prof-gpu" && !nvdrv->nx2_stub_nodes) {
         rb.Push<DeviceFD>(0);
@@ -65,6 +88,7 @@ void NVDRV::Ioctl1(HLERequestContext& ctx) {
     const auto fd = rp.Pop<DeviceFD>();
     const auto command = rp.PopRaw<Ioctl>();
     LOG_DEBUG(Service_NVDRV, "called fd={}, ioctl={:#08x}", fd, command.raw);
+    LogNx2Nv(nvdrv && nvdrv->nx2_stub_nodes, "ioctl", fd, command.raw);
 
     if (!is_initialized) {
         ServiceError(ctx, NvResult::NotInitialized);
@@ -91,6 +115,7 @@ void NVDRV::Ioctl2(HLERequestContext& ctx) {
     const auto fd = rp.Pop<DeviceFD>();
     const auto command = rp.PopRaw<Ioctl>();
     LOG_DEBUG(Service_NVDRV, "called fd={}, ioctl={:#08x}", fd, command.raw);
+    LogNx2Nv(nvdrv && nvdrv->nx2_stub_nodes, "ioctl", fd, command.raw);
 
     if (!is_initialized) {
         ServiceError(ctx, NvResult::NotInitialized);
@@ -118,6 +143,7 @@ void NVDRV::Ioctl3(HLERequestContext& ctx) {
     const auto fd = rp.Pop<DeviceFD>();
     const auto command = rp.PopRaw<Ioctl>();
     LOG_DEBUG(Service_NVDRV, "called fd={}, ioctl={:#08x}", fd, command.raw);
+    LogNx2Nv(nvdrv && nvdrv->nx2_stub_nodes, "ioctl", fd, command.raw);
 
     if (!is_initialized) {
         ServiceError(ctx, NvResult::NotInitialized);
