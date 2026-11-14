@@ -41,12 +41,16 @@
 namespace Service {
 
 // TIPC reply: one-word success result followed directly by raw data words.
-inline void TipcReplyWords(HLERequestContext& ctx, std::initializer_list<u32> words) {
+inline void TipcReplyWords(HLERequestContext& ctx, std::span<const u32> words) {
     IPC::ResponseBuilder rb{ctx, static_cast<u32>(2 + words.size())};
     rb.PushRaw<u32>(ResultSuccess.raw);
     for (const u32 w : words) {
         rb.Push<u32>(w);
     }
+}
+
+inline void TipcReplyWords(HLERequestContext& ctx, std::initializer_list<u32> words) {
+    TipcReplyWords(ctx, std::span<const u32>{words.begin(), words.size()});
 }
 
 // TIPC 0(u64 token): handshake newer SDKs send first; echo the token.
