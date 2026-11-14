@@ -77,8 +77,7 @@ private:
 // - TIPC 12(id): event handle for that id (the SDK attaches it as a SystemEvent).
 // - TIPC 21(id): starts an operation the SDK then waits on; signalled at once here.
 // - TIPC 22: another handle the SDK keeps like a session.
-class INx2GpuSession final : public ServiceFramework<INx2GpuSession>,
-                        public std::enable_shared_from_this<INx2GpuSession> {
+class INx2GpuSession final : public ServiceFramework<INx2GpuSession> {
 public:
     explicit INx2GpuSession(Core::System& system_)
         : ServiceFramework{system_, "nx2:gpu"}, m_context{system_, "nx2:gpu"} {
