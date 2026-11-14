@@ -252,6 +252,12 @@ private:
     static_assert(sizeof(IoctlNx2SyncpointShimInfo) == 16);
     NvResult Nx2GetSyncpointShimInfo(IoctlNx2SyncpointShimInfo& params);
     bool nx2_syncpoint_shim{};
+
+    // Switch 2: mappings made through nx2:gpu land in this address space too.
+    void Nx2Map(u64 gpu_address, u64 cpu_address, u64 size);
+    void Nx2Unmap(u64 gpu_address, u64 size);
+    NvCore::SessionId nx2_session{};
+    std::map<std::pair<u64, u64>, DAddr> nx2_device_ranges;
     std::unique_ptr<Tegra::MemoryManager> gmmu;
 };
 

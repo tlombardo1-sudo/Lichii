@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -18,6 +19,7 @@
 #include "core/hle/service/hle_ipc.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/kernel_helpers.h"
+#include "core/hle/service/nvdrv/devices/nx2_stub_device.h"
 #include "core/hle/service/nvdrv/nvdrv.h"
 #include "core/hle/service/nvdrv/nvdrv_interface.h"
 #include "core/hle/service/nx2_stub_interface.h"
@@ -75,7 +77,8 @@ private:
 // - TIPC 12(id): event handle for that id (the SDK attaches it as a SystemEvent).
 // - TIPC 21(id): starts an operation the SDK then waits on; signalled at once here.
 // - TIPC 22: another handle the SDK keeps like a session.
-class INx2GpuSession final : public ServiceFramework<INx2GpuSession> {
+class INx2GpuSession final : public ServiceFramework<INx2GpuSession>,
+                        public std::enable_shared_from_this<INx2GpuSession> {
 public:
     explicit INx2GpuSession(Core::System& system_)
         : ServiceFramework{system_, "nx2:gpu"}, m_context{system_, "nx2:gpu"} {
@@ -90,6 +93,15 @@ public:
             {201, &INx2GpuSession::GetUserPartition, "GetUserPartition (newer SDKs)"},
             {202, &INx2GpuSession::GetGsvPartition, "GetGsvPartition (newer SDKs)"},
             {203, &INx2GpuSession::GetVaRange, "GetVaRange (guessed)"},
+            // Sub-session commands (gpu 22 hands out a second session to this same object).
+            {101, &INx2GpuSession::SubRegisterMemory, "CreateGpuAccessibleMemory"},
+            {102, &INx2GpuSession::SubDestroyMemory, "DestroyGpuAccessibleMemory (guessed)"},
+            {211, &INx2GpuSession::SubSubmitJob, "NormalMapGpuMemory4K"},
+            {212, &INx2GpuSession::SubModifyKind, "NormalModifyMemoryKind4K"},
+            {213, &INx2GpuSession::SubUnmapJob, "NormalUnmapGpuMemory4K"},
+            {214, &INx2GpuSession::SubCreateGpuOnlyRegion, "CreateSparseRegion"},
+            {215, &INx2GpuSession::SubDestroySparseRegion, "DestroySparseRegion"},
+            {216, &INx2GpuSession::SubSparseMap, "ExecuteSparseMapRequests"},
         });
     }
 
@@ -204,14 +216,114 @@ private:
     }
 
     void OpenSubSession(HLERequestContext& ctx) {
-        LOG_WARNING(Service, "(STUBBED) nx2:gpu TIPC 22, returning a nx2:gpu-sub session");
-        ReturnRawSession(system, ctx,
-                         std::make_shared<INx2StubInterface>(
-                             system, INx2StubInterface::InternName("nx2:gpu-sub")));
+        // Served by this object so sub-session jobs can signal the per-id events.
+        LOG_WARNING(Service, "(STUBBED) nx2:gpu TIPC 22, returning a sub-session on nx2:gpu");
+        ReturnRawSession(system, ctx, std::static_pointer_cast<INx2GpuSession>(shared_from_this()));
+    }
+
+    // Sub 101: (start u64, last u64, flags...) after CreateGpuAccessibleMemory's svc 0x80. The
+    // reply's word 3 is the GpuMemoryHandle that later map jobs (211) name.
+    void SubRegisterMemory(HLERequestContext& ctx) {
+        const auto* b = ctx.CommandBuffer();
+        const u64 start = u64{b[2]} | (u64{b[3]} << 32);
+        const u64 last = u64{b[4]} | (u64{b[5]} << 32);
+        LOG_INFO(Service, "nx2:gpu sub 101 start={:#x} last={:#x}", start, last);
+        if (last > start) {
+            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Register(start, last - start + 1);
+        }
+        const u32 handle = m_next_memory_handle++;
+        m_memory[handle] = {start, last > start ? last - start + 1 : 0};
+        TipcReplyWords(ctx, {handle});
+    }
+
+    // Sub 102: word 2 is the memory handle 101 returned, word 3 the job slot.
+    void SubDestroyMemory(HLERequestContext& ctx) {
+        const auto* w = ctx.CommandBuffer();
+        if (const auto it = m_memory.find(w[2]); it != m_memory.end()) {
+            if (it->second.second != 0) {
+                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(it->second.first,
+                                                                   it->second.second);
+            }
+            m_memory.erase(it);
+        } else {
+            LOG_WARNING(Service, "nx2:gpu 102 destroy of unknown handle {}", w[2]);
+        }
+        EventFor(w[3])->Signal(system.Kernel());
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    // Sub 211: map job. Words 3-4 first GPU address, 5-6 last, 7 memory handle, 8-9 offset into
+    // it; word 17 is the job slot whose event the SDK then waits on. Nothing runs asynchronously,
+    // so complete it at once.
+    void SubSubmitJob(HLERequestContext& ctx) {
+        const auto* w = ctx.CommandBuffer();
+        const u64 a = u64{w[3]} | (u64{w[4]} << 32);
+        const u64 b = u64{w[5]} | (u64{w[6]} << 32);
+        const u64 offset = u64{w[8]} | (u64{w[9]} << 32);
+        LOG_DEBUG(Service, "nx2:gpu 211 map [{:#x}, {:#x}] handle={} offset={:#x} slot={}", a, b,
+                  w[7], offset, w[17]);
+        if (const auto it = m_memory.find(w[7]); it != m_memory.end() && b > a) {
+            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapAt(a, it->second.first + offset,
+                                                               b - a + 1);
+        } else {
+            LOG_WARNING(Service, "nx2:gpu 211 map of unknown handle {}", w[7]);
+        }
+        EventFor(w[17])->Signal(system.Kernel());
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    // Sub 212: kinds do not matter to the emulated GPU; keep the mapping, report the wanted kind.
+    void SubModifyKind(HLERequestContext& ctx) {
+        const auto* w = ctx.CommandBuffer();
+        EventFor(w[10])->Signal(system.Kernel());
+        TipcReplyWords(ctx, {w[7] & 0xff});
+    }
+
+    // Sub 213: words 3-4 first GPU address, 5-6 last, job slot in word 8.
+    void SubUnmapJob(HLERequestContext& ctx) {
+        const auto* w = ctx.CommandBuffer();
+        const u64 first = u64{w[3]} | (u64{w[4]} << 32);
+        const u64 last = u64{w[5]} | (u64{w[6]} << 32);
+        if (last > first) {
+            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(first, last - first + 1);
+        }
+        EventFor(w[8])->Signal(system.Kernel());
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    // Sub 214/215/216: GPU-only and sparse regions are not backed yet; complete the job so the
+    // game carries on (job slot in word 11 for 214, word 8 for 215, word 14 for 216).
+    void SubCreateGpuOnlyRegion(HLERequestContext& ctx) {
+        const auto* w = ctx.CommandBuffer();
+        LOG_WARNING(Service, "(STUBBED) nx2:gpu 214 region [{:#x}, {:#x}] not backed",
+                    u64{w[3]} | (u64{w[4]} << 32), u64{w[5]} | (u64{w[6]} << 32));
+        EventFor(w[11])->Signal(system.Kernel());
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void SubDestroySparseRegion(HLERequestContext& ctx) {
+        EventFor(ctx.CommandBuffer()[8])->Signal(system.Kernel());
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void SubSparseMap(HLERequestContext& ctx) {
+        const auto* w = ctx.CommandBuffer();
+        const size_t count =
+            ctx.BufferDescriptorA().empty() ? 0 : ctx.GetReadBufferSize(0) / 40;
+        LOG_WARNING(Service, "(STUBBED) nx2:gpu 216 {} sparse map requests ignored", count);
+        EventFor(w[14])->Signal(system.Kernel());
+        TipcReplyWords(ctx, {static_cast<u32>(count)});
     }
 
     KernelHelpers::ServiceContext m_context;
     std::array<Kernel::KEvent*, NumIds> m_events{};
+    u32 m_next_memory_handle = 1;
+    std::map<u32, std::pair<u64, u64>> m_memory; // handle -> (address, size)
 };
 
 // nn::gpu time session handed out by gsv 1121; a missing handle ends in InvalidHandle (0xe401).

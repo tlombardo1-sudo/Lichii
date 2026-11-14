@@ -25,6 +25,7 @@
 #include "core/hle/service/nvdrv/core/nvmap.h"
 #include "core/hle/service/nvdrv/devices/ioctl_serialization.h"
 #include "core/hle/service/nvdrv/devices/nvhost_as_gpu.h"
+#include "core/hle/service/nvdrv/devices/nx2_stub_device.h"
 #include "core/hle/service/nvdrv/devices/nvhost_gpu.h"
 #include "core/hle/service/nvdrv/nvdrv.h"
 #include "core/hle/service/pulse_service.h"
@@ -40,7 +41,9 @@ nvhost_as_gpu::nvhost_as_gpu(Core::System& system_, Module& module_, NvCore::Con
     : nvdevice{system_}, module{module_}, container{core}, nvmap{core.GetNvMapFile()}, vm{},
       gmmu{} {}
 
-nvhost_as_gpu::~nvhost_as_gpu() = default;
+nvhost_as_gpu::~nvhost_as_gpu() {
+    Nx2GpuMemoryRegistry::Get().RemoveListener(this);
+}
 
 NvResult nvhost_as_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> input,
                                std::span<u8> output) {
@@ -59,8 +62,18 @@ NvResult nvhost_as_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> i
             return WrapFixed(this, &nvhost_as_gpu::MapBufferEx, input, output);
         case 0x8:
             return WrapFixed(this, &nvhost_as_gpu::GetVARegions1, input, output);
-        case 0x9:
-            return WrapFixed(this, &nvhost_as_gpu::AllocAsEx, input, output);
+        case 0x9: {
+            const auto result = WrapFixed(this, &nvhost_as_gpu::AllocAsEx, input, output);
+            if (result == NvResult::Success && module.nx2_stub_nodes) {
+                Nx2GpuMemoryRegistry::Get().AddListener(
+                    this,
+                    [this](u64 gpu_address, u64 cpu_address, u64 size) {
+                        Nx2Map(gpu_address, cpu_address, size);
+                    },
+                    [this](u64 gpu_address, u64 size) { Nx2Unmap(gpu_address, size); });
+            }
+            return result;
+        }
         case 0xb:
             return WrapFixed(this, &nvhost_as_gpu::Nx2GetSyncpointShimInfo, input, output);
         case 0x14:
@@ -102,7 +115,9 @@ NvResult nvhost_as_gpu::Ioctl3(DeviceFD fd, Ioctl command, std::span<const u8> i
     return NvResult::NotImplemented;
 }
 
-void nvhost_as_gpu::OnOpen(NvCore::SessionId session_id, DeviceFD fd) {}
+void nvhost_as_gpu::OnOpen(NvCore::SessionId session_id, DeviceFD fd) {
+    nx2_session = session_id;
+}
 void nvhost_as_gpu::OnClose(DeviceFD fd) {}
 
 namespace {
@@ -123,6 +138,41 @@ void WatchProgramRegion(const void* owner, const Tegra::MemoryManager* gmmu, con
 
 // Switch 2 NvRm asks for the read-only syncpoint shim: a GPU page whose u32 at id * stride reads as
 // that syncpoint's value; NVN waits on syncpoints through it and asserts without one.
+void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
+    std::scoped_lock lock(mutex);
+    auto* session = container.GetSession(nx2_session);
+    if (!gmmu || session == nullptr) {
+        LOG_ERROR(Service_NVDRV, "Switch 2 GPU mapping {:#x}+{:#x}: no address space or session",
+                  gpu_address, size);
+        return;
+    }
+    // The same CPU range is often mapped twice, so reuse its SMMU mapping.
+    DAddr device_address{};
+    if (const auto it = nx2_device_ranges.find({cpu_address, size}); it != nx2_device_ranges.end()) {
+        device_address = it->second;
+    } else {
+        auto& smmu = system.Host1x().MemoryManager();
+        device_address = smmu.Allocate(Common::AlignUp(size, 0x20000));
+        if (device_address == 0) {
+            LOG_CRITICAL(Service_NVDRV, "Switch 2 GPU memory {:#x}+{:#x}: out of SMMU space",
+                         cpu_address, size);
+            return;
+        }
+        smmu.Map(device_address, cpu_address, size, session->asid, true);
+        nx2_device_ranges[{cpu_address, size}] = device_address;
+    }
+    gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
+    LOG_DEBUG(Service_NVDRV, "Switch 2 GPU mapping {:#x}+{:#x} -> CPU {:#x}", gpu_address, size,
+              cpu_address);
+}
+
+void nvhost_as_gpu::Nx2Unmap(u64 gpu_address, u64 size) {
+    std::scoped_lock lock(mutex);
+    if (gmmu) {
+        gmmu->Unmap(gpu_address, size);
+    }
+}
+
 NvResult nvhost_as_gpu::Nx2GetSyncpointShimInfo(IoctlNx2SyncpointShimInfo& params) {
     std::scoped_lock lock(mutex);
     if (!vm.initialised || !gmmu) {

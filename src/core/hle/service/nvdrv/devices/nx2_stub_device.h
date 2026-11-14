@@ -4,6 +4,10 @@
 #pragma once
 
 #include <algorithm>
+#include <functional>
+#include <map>
+#include <mutex>
+#include <vector>
 #include <string>
 #include <utility>
 
@@ -50,6 +54,99 @@ private:
     }
 
     std::string name;
+};
+
+} // namespace Service::Nvidia::Devices
+
+namespace Service::Nvidia::Devices {
+
+// GPU mappings a Switch 2 process made through nx2:gpu: CreateGpuAccessibleMemory (sub 101) maps
+// the memory at GPU address == CPU address, and NormalMapGpuMemory4K (211) maps a memory handle at
+// a chosen GPU address. Every nvhost-as-gpu address space applies each mapping, including ones
+// made before the address space existed.
+class Nx2GpuMemoryRegistry {
+public:
+    using MapListener = std::function<void(u64 gpu_address, u64 cpu_address, u64 size)>;
+    using UnmapListener = std::function<void(u64 gpu_address, u64 size)>;
+
+    static Nx2GpuMemoryRegistry& Get() {
+        static Nx2GpuMemoryRegistry registry;
+        return registry;
+    }
+
+    void AddListener(const void* owner, MapListener map, UnmapListener unmap) {
+        std::scoped_lock lk{mutex};
+        for (const auto& m : mappings) {
+            map(m.gpu_address, m.cpu_address, m.size);
+        }
+        listeners[owner] = {std::move(map), std::move(unmap)};
+    }
+
+    void RemoveListener(const void* owner) {
+        std::scoped_lock lk{mutex};
+        listeners.erase(owner);
+    }
+
+    void Register(u64 address, u64 size) {
+        MapAt(address, address, size);
+    }
+
+    void MapAt(u64 gpu_address, u64 cpu_address, u64 size) {
+        std::scoped_lock lk{mutex};
+        Trim(gpu_address, size);
+        mappings.push_back({gpu_address, cpu_address, size});
+        for (auto& [owner, l] : listeners) {
+            l.map(gpu_address, cpu_address, size);
+        }
+    }
+
+    void Unmap(u64 gpu_address, u64 size) {
+        std::scoped_lock lk{mutex};
+        Trim(gpu_address, size);
+        for (auto& [owner, l] : listeners) {
+            l.unmap(gpu_address, size);
+        }
+    }
+
+    void Reset() {
+        std::scoped_lock lk{mutex};
+        mappings.clear();
+    }
+
+private:
+    struct Mapping {
+        u64 gpu_address;
+        u64 cpu_address;
+        u64 size;
+    };
+    struct Listeners {
+        MapListener map;
+        UnmapListener unmap;
+    };
+
+    // Forget what overlaps [gpu_address, +size), keeping the parts outside it.
+    void Trim(u64 gpu_address, u64 size) {
+        const u64 end = gpu_address + size;
+        std::vector<Mapping> kept;
+        for (const auto& m : mappings) {
+            const u64 m_end = m.gpu_address + m.size;
+            if (m_end <= gpu_address || m.gpu_address >= end) {
+                kept.push_back(m);
+                continue;
+            }
+            if (m.gpu_address < gpu_address) {
+                kept.push_back({m.gpu_address, m.cpu_address, gpu_address - m.gpu_address});
+            }
+            if (m_end > end) {
+                kept.push_back({end, m.cpu_address + (end - m.gpu_address), m_end - end});
+            }
+        }
+        mappings = std::move(kept);
+    }
+
+    std::mutex mutex;
+    std::vector<Mapping> mappings;
+    std::map<const void*, Listeners> listeners;
 };
 
 } // namespace Service::Nvidia::Devices
