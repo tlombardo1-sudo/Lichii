@@ -70,9 +70,7 @@ public:
 private:
     void GetCount(HLERequestContext& ctx) {
         LOG_WARNING(Service, "(STUBBED) nx2:syncpt TIPC 1, returning 32");
-        IPC::ResponseBuilder rb{ctx, 3};
-        rb.Push(ResultSuccess);
-        rb.Push<u32>(32);
+        TipcReplyWords(ctx, {32});
     }
 };
 
@@ -174,9 +172,12 @@ private:
         }
         LOG_INFO(Service, "nx2:gpu 41 create graphics device name={:#x} flags={:#x} -> id {}", name,
                  flags, id);
-        IPC::ResponseBuilder rb{ctx, 3};
-        rb.Push(id != 0 ? ResultSuccess : Kernel::ResultOutOfResource);
-        rb.Push(id);
+        if (id != 0) {
+            TipcReplyWords(ctx, {id});
+        } else {
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.PushRaw<u32>(Kernel::ResultOutOfResource.raw);
+        }
     }
 
     void DestroyGraphicsDevice(HLERequestContext& ctx) {
@@ -196,10 +197,7 @@ private:
 
     void GetIdRange(HLERequestContext& ctx) {
         LOG_WARNING(Service, "(STUBBED) nx2:gpu TIPC 11, returning [0, {}]", NumIds - 1);
-        IPC::ResponseBuilder rb{ctx, 4};
-        rb.Push(ResultSuccess);
-        rb.Push<u32>(0);
-        rb.Push<u32>(NumIds - 1);
+        TipcReplyWords(ctx, {0, NumIds - 1});
     }
 
     void GetIdEvent(HLERequestContext& ctx) {
