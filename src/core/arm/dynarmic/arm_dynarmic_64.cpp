@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
+#include <set>
 #include <atomic>
 #include <cstring>
 
@@ -205,7 +207,48 @@ void DynarmicCallbacks64::LogNullJump() {
     LOG_CRITICAL(Core_ARM, "Null jump: {}", Common::Permafrost::Describe());
 }
 
+// Diagnostic for Switch 2 guests that go quiet: at the first condition variable wait of each
+// thread, the registers and the code behind the call chain, for offline disassembly.
+void DynarmicCallbacks64::LogWaitStack(u32 svc) {
+    static std::atomic<u32> dumps{};
+    static std::mutex dump_mutex;
+    static std::set<u64> seen_sp;
+    if (svc != 0x1c || !m_process->IsSwitch2() || dumps.load() >= 12) {
+        return;
+    }
+    const auto& jit = *m_parent.m_jit;
+    std::scoped_lock lk{dump_mutex};
+    if (!seen_sp.insert(jit.GetSP() >> 16).second) {
+        return;
+    }
+    ++dumps;
+    const auto gpr = jit.GetRegisters();
+    LOG_INFO(Core_ARM, "WAITSTACK svc {:#x} x0={:#x} x1={:#x} x2={:#x} x3={:#x} lr={:#x} sp={:#x} fp={:#x}",
+             svc, gpr[0], gpr[1], gpr[2], gpr[3], gpr[30], jit.GetSP(), gpr[29]);
+    const auto dump_code = [&](u64 start, u32 words) {
+        if (start < 0x10000 || m_memory.GetPointerSilent(start) == nullptr) {
+            return;
+        }
+        for (u32 i = 0; i < words; i += 8) {
+            std::string line;
+            for (u32 j = 0; j < 8 && i + j < words; ++j) {
+                line += fmt::format(" {:08x}", m_memory.Read32(start + (i + j) * 4));
+            }
+            LOG_INFO(Core_ARM, "CODE wait {:#x}:{}", start + i * 4, line);
+        }
+    };
+    dump_code(gpr[30] - 0x40, 24);
+    u64 fp = gpr[29];
+    for (int frame = 0; frame < 10 && fp >= 0x10000 && m_memory.GetPointerSilent(fp) != nullptr; ++frame) {
+        const u64 ret = m_memory.Read64(fp + 8);
+        LOG_INFO(Core_ARM, "WAITSTACK frame {} ret={:#x}", frame, ret);
+        dump_code(ret - 0x40, 24);
+        fp = m_memory.Read64(fp);
+    }
+}
+
 void DynarmicCallbacks64::CallSVC(u32 svc) {
+    LogWaitStack(svc);
     m_parent.m_svc = svc;
     m_parent.m_jit->HaltExecution(SupervisorCall);
 }

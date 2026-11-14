@@ -53,6 +53,7 @@ public:
     void InstructionCacheOperationRaised(Dynarmic::A64::InstructionCacheOperation op, u64 value) override;
     void ExceptionRaised(u64 pc, Dynarmic::A64::Exception exception) override;
     void LogNullJump();
+    void LogWaitStack(u32 svc);
     void CallSVC(u32 svc) override;
     void AddTicks(u64 ticks) override;
     u64 GetTicksRemaining() override;
