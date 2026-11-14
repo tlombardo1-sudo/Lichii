@@ -4,9 +4,11 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <functional>
 #include <map>
 #include <mutex>
+#include <span>
 #include <vector>
 #include <string>
 #include <utility>
@@ -15,6 +17,21 @@
 #include "core/hle/service/nvdrv/devices/nvdevice.h"
 
 namespace Service::Nvidia::Devices {
+
+/// Set once a Switch 2 NvRm identified itself (nvhost-ctrl-gpu GetCharacteristics3 with the 0xD0
+/// buffer). Reset when a new nvdrv module is created.
+inline std::atomic<bool> g_nx2_driver{false};
+
+/// Unknown ioctl of a Switch 2 driver: logged zeroed success that echoes the input.
+inline NvResult Nx2UnknownIoctl(const char* device, Ioctl command, std::span<const u8> input,
+                                std::span<u8> output) {
+    LOG_WARNING(Service_NVDRV,
+                "(STUBBED) Switch 2 {} ioctl={:08X} group={:01X} command={:02X} in={:#x}", device,
+                command.raw, command.group, command.cmd, input.size());
+    std::fill(output.begin(), output.end(), u8{0});
+    std::copy_n(input.begin(), std::min(input.size(), output.size()), output.begin());
+    return NvResult::Success;
+}
 
 // Placeholder for the newer nvgpu nodes Switch 2 drivers open (nvhost-tsg-gpu, nvhost-prof-gpu...).
 // Every ioctl is logged and succeeds, echoing its input so in/out structures keep their fields.

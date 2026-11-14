@@ -14,6 +14,7 @@
 #include "core/hle/service/nvdrv/core/syncpoint_manager.h"
 #include "core/hle/service/nvdrv/devices/ioctl_serialization.h"
 #include "core/hle/service/nvdrv/devices/nvhost_gpu.h"
+#include "core/hle/service/nvdrv/devices/nx2_stub_device.h"
 #include "core/hle/service/nvdrv/nvdrv.h"
 #include "core/hle/service/nvdrv/devices/nvhost_as_gpu.h"
 #include "core/hle/service/pulse_service.h"
@@ -50,6 +51,9 @@ nvhost_gpu::~nvhost_gpu() {
     events_interface.FreeEvent(sm_exception_breakpoint_int_report_event);
     events_interface.FreeEvent(sm_exception_breakpoint_pause_report_event);
     events_interface.FreeEvent(error_notifier_event);
+    for (auto& [id, event] : nx2_events) {
+        events_interface.FreeEvent(event);
+    }
     syncpoint_manager.FreeSyncpoint(channel_syncpoint);
 }
 
@@ -103,6 +107,9 @@ NvResult nvhost_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> inpu
         }
         break;
     }
+    if (g_nx2_driver) {
+        return Nx2UnknownIoctl("nvhost-gpu", command, input, output);
+    }
     UNIMPLEMENTED_MSG("Unimplemented ioctl={:08X}", command.raw);
     return NvResult::NotImplemented;
 };
@@ -118,12 +125,19 @@ NvResult nvhost_gpu::Ioctl2(DeviceFD fd, Ioctl command, std::span<const u8> inpu
         }
         break;
     }
+    if (g_nx2_driver) {
+        return Nx2UnknownIoctl("nvhost-gpu", command, input, output);
+    }
     UNIMPLEMENTED_MSG("Unimplemented ioctl={:08X}", command.raw);
     return NvResult::NotImplemented;
 }
 
 NvResult nvhost_gpu::Ioctl3(DeviceFD fd, Ioctl command, std::span<const u8> input,
                             std::span<u8> output, std::span<u8> inline_output) {
+    if (g_nx2_driver) {
+        std::fill(inline_output.begin(), inline_output.end(), u8{0});
+        return Nx2UnknownIoctl("nvhost-gpu", command, input, output);
+    }
     UNIMPLEMENTED_MSG("Unimplemented ioctl={:08X}", command.raw);
     return NvResult::NotImplemented;
 }
@@ -280,7 +294,36 @@ NvResult nvhost_gpu::AllocateObjectContext(IoctlAllocObjCtx& params) {
         params.flags = allowed_mask;
     }
 
-    s32_le ctx_class_number_index = 
+    if (g_nx2_driver) {
+        // Switch 2 NvRm asks for Ampere classes, or class 0. Map them onto the Maxwell slots.
+        u32 mapped = params.class_num;
+        switch (params.class_num) {
+        case 0xC797: case 0xC697: case 0xC597: mapped = static_cast<u32>(CtxClasses::Ctx3D); break;
+        case 0xC7C0: case 0xC6C0: case 0xC5C0: mapped = static_cast<u32>(CtxClasses::CtxCompute); break;
+        case 0xC7B5: case 0xC6B5: case 0xC5B5: mapped = static_cast<u32>(CtxClasses::CtxDMA); break;
+        case 0xC56F: case 0xC76F: mapped = static_cast<u32>(CtxClasses::CtxChannelGPFIFO); break;
+        case 0: {
+            for (const auto candidate : {CtxClasses::Ctx3D, CtxClasses::CtxCompute, CtxClasses::CtxDMA,
+                                         CtxClasses::Ctx2D, CtxClasses::CtxKepler}) {
+                const auto index = GetObjectContextClassNumberIndex(candidate);
+                if (index >= 0 && !ctxObjs[index].has_value()) {
+                    mapped = static_cast<u32>(candidate);
+                    break;
+                }
+            }
+            break;
+        }
+        default:
+            break;
+        }
+        if (mapped != params.class_num) {
+            LOG_WARNING(Service_NVDRV, "Switch 2 object class {:#x} -> {:#x}", params.class_num,
+                        mapped);
+            params.class_num = mapped;
+        }
+    }
+
+    s32_le ctx_class_number_index =
         GetObjectContextClassNumberIndex(static_cast<CtxClasses>(params.class_num));
     if (ctx_class_number_index < 0) {
         LOG_ERROR(Service_NVDRV, "Invalid class number for object context: {:#x}",
@@ -329,6 +372,27 @@ static boost::container::small_vector<Tegra::CommandHeader, 512> BuildIncrementC
     return result;
 }
 
+// Switch 2 pushbuffers signal completion with semaphore releases, never host1x syncpoint methods,
+// but the driver still has the kernel raise the syncpoint max by the submission's increment value
+// and then waits for that value. Append the increments after its commands.
+static boost::container::small_vector<Tegra::CommandHeader, 512> BuildIncrementCountCommandList(
+    NvFence fence, u32 count) {
+    boost::container::small_vector<Tegra::CommandHeader, 512> result{
+        Tegra::BuildCommandHeader(Tegra::BufferMethods::WaitForIdle, 1,
+                                  Tegra::SubmissionMode::Increasing),
+        {},
+        Tegra::BuildCommandHeader(Tegra::BufferMethods::SyncpointPayload, 1,
+                                  Tegra::SubmissionMode::Increasing),
+        {}};
+    for (u32 i = 0; i < count; ++i) {
+        result.push_back(Tegra::BuildCommandHeader(Tegra::BufferMethods::SyncpointOperation, 1,
+                                                   Tegra::SubmissionMode::Increasing));
+        result.push_back(
+            BuildFenceAction(Tegra::Engines::Puller::FenceOperation::Increment, fence.id));
+    }
+    return result;
+}
+
 static boost::container::small_vector<Tegra::CommandHeader, 512> BuildIncrementWithWfiCommandList(
     NvFence fence) {
     boost::container::small_vector<Tegra::CommandHeader, 512> result{
@@ -373,6 +437,11 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
                   (flags.increment_value.Value() != 0 ? params.fence.value : 0)};
     params.fence.value = syncpoint_manager.IncrementSyncpointMaxExt(channel_syncpoint, increment);
     gpu.PushGPUEntries(bind_id, std::move(entries));
+
+    if (g_nx2_driver && !flags.fence_increment.Value() && increment > 0) {
+        gpu.PushGPUEntries(bind_id,
+                           Tegra::CommandList{BuildIncrementCountCommandList(params.fence, increment)});
+    }
 
     if (flags.fence_increment.Value()) {
         if (flags.suppress_wfi.Value()) {
@@ -561,6 +630,16 @@ Kernel::KEvent* nvhost_gpu::QueryEvent(u32 event_id) {
     case 3:
         return error_notifier_event;
     default:
+        if (g_nx2_driver) {
+            // Switch 2 NVN also asks for event 7 and multi-waits on it with its syncpoint events.
+            // Nothing signals it yet.
+            auto*& event = nx2_events[event_id];
+            if (event == nullptr) {
+                event = events_interface.CreateEvent(fmt::format("GpuChannelNx2Event{}", event_id));
+            }
+            LOG_WARNING(Service_NVDRV, "(STUBBED) Switch 2 channel event {}", event_id);
+            return event;
+        }
         LOG_CRITICAL(Service_NVDRV, "Unknown Ctrl GPU Event {}", event_id);
         return nullptr;
     }

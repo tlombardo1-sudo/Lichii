@@ -333,6 +333,7 @@ NvResult nvhost_ctrl_gpu::GetCharacteristics3(
     params.gpu_characteristics_buf_addr = 0xdeadbeef; // Cannot be 0 (UNUSED)
     if (nx2) {
         nx2_caller = true;
+        g_nx2_driver = true;
         ApplyNx2Characteristics(params.gc);
         params.gpu_characteristics_buf_size = Nx2CharacteristicsSize;
         LOG_WARNING(Service_NVDRV, "Switch 2 caller, reporting Ampere chip 0x17E");
