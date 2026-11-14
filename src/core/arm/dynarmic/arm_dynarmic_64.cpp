@@ -212,19 +212,20 @@ void DynarmicCallbacks64::LogNullJump() {
 void DynarmicCallbacks64::LogWaitStack(u32 svc) {
     static std::atomic<u32> dumps{};
     static std::mutex dump_mutex;
-    static std::set<u64> seen_sp;
-    if (svc != 0x1c || !m_process->IsSwitch2() || dumps.load() >= 12) {
+    static std::set<std::pair<u32, u64>> seen_wait;
+    if ((svc != 0x1c && svc != 0x18 && svc != 0x43 && svc != 0x44 && svc != 0x0b && svc != 0x1f) ||
+        !m_process->IsSwitch2() || dumps.load() >= 40) {
         return;
     }
     const auto& jit = *m_parent.m_jit;
     std::scoped_lock lk{dump_mutex};
-    if (!seen_sp.insert(jit.GetSP() >> 16).second) {
+    if (!seen_wait.insert({svc, jit.GetRegisters()[30]}).second) {
         return;
     }
     ++dumps;
     const auto gpr = jit.GetRegisters();
-    LOG_INFO(Core_ARM, "WAITSTACK svc {:#x} x0={:#x} x1={:#x} x2={:#x} x3={:#x} lr={:#x} sp={:#x} fp={:#x}",
-             svc, gpr[0], gpr[1], gpr[2], gpr[3], gpr[30], jit.GetSP(), gpr[29]);
+    LOG_INFO(Core_ARM, "WAITSTACK svc {:#x} thread {} x0={:#x} x1={:#x} x2={:#x} x3={:#x} lr={:#x} sp={:#x} fp={:#x}",
+             svc, Kernel::GetCurrentThread(m_parent.m_system.Kernel()).GetThreadId(), gpr[0], gpr[1], gpr[2], gpr[3], gpr[30], jit.GetSP(), gpr[29]);
     const auto dump_code = [&](u64 start, u32 words) {
         if (start < 0x10000 || m_memory.GetPointerSilent(start) == nullptr) {
             return;
