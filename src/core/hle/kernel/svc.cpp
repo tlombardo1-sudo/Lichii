@@ -2546,6 +2546,20 @@ void Call(Core::System& system, u32 imm) {
             }
             counts.fill(0);
             LOG_INFO(Kernel_SVC, "Switch 2 svc counts, last 5 s:{}", text);
+            static int thread_dumps = 0;
+            if (thread_dumps < 3 && now - std::chrono::steady_clock::time_point{} > std::chrono::seconds{1}) {
+                ++thread_dumps;
+                KScopedLightLock list_lock{process.GetListLock()};
+                for (auto& thread : process.GetThreadList()) {
+                    LOG_INFO(Kernel_SVC,
+                             "Switch 2 thread t{} state={:#x} wait_reason={} key={:#x}/{:#x} svc={:#x} prio={} core={}",
+                             thread.GetThreadId(), static_cast<u32>(thread.GetState()),
+                             static_cast<u32>(thread.GetWaitReasonForDebugging()),
+                             static_cast<u64>(thread.GetAddressKey()), thread.GetAddressKeyValue(),
+                             thread.GetStackParameters().current_svc_id, thread.GetPriority(),
+                             thread.GetActiveCore());
+                }
+            }
         }
     }
     if (imm == 0x18 && process.IsSwitch2()) {
