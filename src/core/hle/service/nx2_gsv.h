@@ -5,12 +5,16 @@
 
 #include <array>
 #include <map>
+#include <chrono>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include <fmt/format.h>
 
 #include "core/core.h"
+#include "core/core_timing.h"
+#include "video_core/host1x/host1x.h"
 #include "core/hle/kernel/k_event.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_readable_event.h"
@@ -411,6 +415,17 @@ public:
         });
     }
 
+    ~INx2GraphicsSystemSession() override {
+        if (m_syncpt_poll) {
+            system.CoreTiming().UnscheduleEvent(m_syncpt_poll);
+        }
+        for (auto* event : m_syncpt_events) {
+            if (event != nullptr) {
+                m_context.CloseEvent(event);
+            }
+        }
+    }
+
 private:
     // Index of the first raw data word of a TIPC request: header (2 words), then an optional
     // special header with pid and copy/move handle words.
@@ -450,30 +465,98 @@ private:
         LOG_WARNING(Service, "(STUBBED) nx2:gsv TIPC 204, version={} max_syncpoints={:#x}",
                     version_requested, max_syncpoints);
 
+        const u32 count = std::min<u32>(max_syncpoints, (0x1000 - 0x40) / 8);
+        auto rw = ctx.GetObjectFromHandle<Kernel::KTransferMemory>(ctx.GetCopyHandle(0));
         auto ro = ctx.GetObjectFromHandle<Kernel::KTransferMemory>(ctx.GetCopyHandle(1));
-        if (ro.IsNotNull() && ro->GetSize() >= 0x2000) {
-            auto& memory = ro->GetOwner()->GetMemory();
-            const u64 base = GetInteger(ro->GetSourceAddress());
-            memory.Write32(base + 0x00, 1);              // version
-            memory.Write32(base + 0x04, 0);              // base id (guess)
-            memory.Write32(base + 0x08, max_syncpoints); // count
-            memory.Write32(base + 0x0c, 0x40);           // -> RO region
-            memory.Write32(base + 0x10, 0x000);          // -> RW region
-            memory.Write32(base + 0x14, 0x800);          // -> RO region
-            memory.Write32(base + 0x18, 0x800);          // -> RW region
-            memory.Write32(base + 0x1c, 0x1000);         // -> RO region
+        if (rw.IsNotNull() && ro.IsNotNull() && ro->GetSize() >= 0x2000) {
+            m_syncpt_memory = &ro->GetOwner()->GetMemory();
+            m_syncpt_rw = GetInteger(rw->GetSourceAddress());
+            m_syncpt_ro = GetInteger(ro->GetSourceAddress());
+            m_syncpt_count = count;
+            auto& memory = *m_syncpt_memory;
+            memory.Write32(m_syncpt_ro + 0x00, 1);                     // version
+            memory.Write32(m_syncpt_ro + 0x04, 0);                     // base id (guess)
+            memory.Write32(m_syncpt_ro + 0x08, max_syncpoints);        // count
+            memory.Write32(m_syncpt_ro + 0x0c, SyncptValuesOffset);    // -> RO region
+            memory.Write32(m_syncpt_ro + 0x10, SyncptRwSummaryOffset); // -> RW region
+            memory.Write32(m_syncpt_ro + 0x14, SyncptRoSummaryOffset); // -> RO region
+            memory.Write32(m_syncpt_ro + 0x18, SyncptRwBitsOffset);    // -> RW region
+            memory.Write32(m_syncpt_ro + 0x1c, SyncptRoBitsOffset);    // -> RO region
+            UpdateSyncptValues();
+            if (!m_syncpt_poll) {
+                m_syncpt_poll = Core::Timing::CreateEvent(
+                    "nx2:gsv:SyncptPoll",
+                    [this](s64, std::chrono::nanoseconds) -> std::optional<std::chrono::nanoseconds> {
+                        PollSyncpts();
+                        return std::nullopt;
+                    });
+                system.CoreTiming().ScheduleLoopingEvent(SyncptPollInterval, SyncptPollInterval,
+                                                         m_syncpt_poll);
+            }
         } else {
-            LOG_ERROR(Service, "nx2:gsv TIPC 204: no read-only transfer memory");
+            LOG_ERROR(Service, "nx2:gsv TIPC 204: missing syncpt transfer memory");
         }
 
         if (m_syncpt_events[0] == nullptr) {
-            m_syncpt_events[0] = m_context.CreateEvent("nx2:gsv:SyncptEvent0");
-            m_syncpt_events[1] = m_context.CreateEvent("nx2:gsv:SyncptEvent1");
+            m_syncpt_events[0] = m_context.CreateEvent("nx2:gsv:SyncptRequest");
+            m_syncpt_events[1] = m_context.CreateEvent("nx2:gsv:SyncptNotify");
         }
         IPC::ResponseBuilder rb{ctx, 2, 2, 0};
         rb.Push(ResultSuccess);
-        rb.PushCopyObjects(ctx, m_syncpt_events[0]->GetReadableEvent(),
-                           m_syncpt_events[1]->GetReadableEvent());
+        rb.PushCopyObjects(ctx, *m_syncpt_events[0]); // signalled by the client
+        rb.PushCopyObjects(ctx, m_syncpt_events[1]->GetReadableEvent());
+    }
+
+    // RO: u64 values at +0x40; RW armed bits at +0x100; RO acknowledge bits at +0x1100;
+    // summaries at RW+0x0 and RO+0x1040. The client arms a wait by making its RW bit differ from
+    // the RO bit, signals the first event and waits on the second until the bits match again.
+    static constexpr u32 SyncptValuesOffset = 0x40;
+    static constexpr u32 SyncptRoSummaryOffset = 0x1040;
+    static constexpr u32 SyncptRoBitsOffset = 0x1100;
+    static constexpr u32 SyncptRwSummaryOffset = 0x0;
+    static constexpr u32 SyncptRwBitsOffset = 0x100;
+    static constexpr u32 HostSyncpoints = 192;
+    static constexpr std::chrono::nanoseconds SyncptPollInterval{std::chrono::microseconds{500}};
+
+    bool UpdateSyncptValues() {
+        auto& manager = system.Host1x().GetSyncpointManager();
+        bool changed = false;
+        for (u32 id = 0; id < std::min(m_syncpt_count, HostSyncpoints); ++id) {
+            const u64 value = manager.GetGuestSyncpointValue(id);
+            const u64 address = m_syncpt_ro + SyncptValuesOffset + id * 8;
+            if (m_syncpt_memory->Read64(address) != value) {
+                m_syncpt_memory->Write64(address, value);
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    // Answers every armed wait: the value page is current, so the client rechecks its threshold
+    // and rearms if it still has to wait.
+    void PollSyncpts() {
+        if (m_syncpt_memory == nullptr) {
+            return;
+        }
+        const u32 words = (m_syncpt_count + 63) / 64;
+        std::array<u64, 0x40> armed{};
+        for (u32 w = 0; w < words; ++w) {
+            armed[w] = m_syncpt_memory->Read64(m_syncpt_rw + SyncptRwBitsOffset + w * 8);
+        }
+        UpdateSyncptValues();
+        bool acked = false;
+        for (u32 w = 0; w < words; ++w) {
+            const u64 ro_address = m_syncpt_ro + SyncptRoBitsOffset + w * 8;
+            if (m_syncpt_memory->Read64(ro_address) != armed[w]) {
+                m_syncpt_memory->Write64(ro_address, armed[w]);
+                acked = true;
+            }
+        }
+        m_syncpt_memory->Write64(m_syncpt_ro + SyncptRoSummaryOffset,
+                                 m_syncpt_memory->Read64(m_syncpt_rw + SyncptRwSummaryOffset));
+        if (acked) {
+            m_syncpt_events[1]->Signal(system.Kernel());
+        }
     }
 
     void OpenGpuSession(HLERequestContext& ctx) {
@@ -520,6 +603,11 @@ private:
 
     KernelHelpers::ServiceContext m_context;
     std::array<Kernel::KEvent*, 2> m_syncpt_events{};
+    Core::Memory::Memory* m_syncpt_memory{};
+    u64 m_syncpt_rw{};
+    u64 m_syncpt_ro{};
+    u32 m_syncpt_count{};
+    std::shared_ptr<Core::Timing::EventType> m_syncpt_poll;
 };
 
 } // namespace Service
