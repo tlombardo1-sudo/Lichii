@@ -24,6 +24,13 @@ Result WaitProcessWideKeyAtomic(Core::System& system, u64 address, u64 cv_key, u
     R_UNLESS(!IsKernelAddress(address), ResultInvalidCurrentMemory);
     R_UNLESS(Common::IsAligned(address, sizeof(s32)), ResultInvalidAddress);
 
+    // Switch 2 experiment: an untimed wait wakes spuriously after 500 ms (allowed for any
+    // condition variable). Switch 2 guests park their worker threads untimed; if a wake-up was
+    // lost the predicate re-check finds the work.
+    if (timeout_ns < 0 && GetCurrentProcess(system.Kernel()).IsSwitch2()) {
+        timeout_ns = 500'000'000;
+    }
+
     // Convert timeout from nanoseconds to ticks.
     s64 timeout{};
     if (timeout_ns > 0) {
