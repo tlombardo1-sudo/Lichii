@@ -4,7 +4,10 @@
 #pragma once
 
 #include <array>
+#include <algorithm>
 #include <map>
+#include <mutex>
+#include <span>
 #include <chrono>
 #include <memory>
 #include <optional>
@@ -26,6 +29,7 @@
 #include "core/hle/service/nvdrv/devices/nx2_stub_device.h"
 #include "core/hle/service/nvdrv/nvdrv.h"
 #include "core/hle/service/nvdrv/nvdrv_interface.h"
+#include "core/hle/service/nx2_image_layout.h"
 #include "core/hle/service/nx2_stub_interface.h"
 #include "core/hle/service/service.h"
 #include "core/hle/service/sm/sm.h"
@@ -359,10 +363,37 @@ public:
             {3, &INx2Vi2Session::ReturnOne, "GetDisplayCount (guessed)"},
             {5, &INx2Vi2Session::GetTimestampRecorderCount, "GetTimestampRecorderCount (guessed)"},
             {11, &INx2Vi2Session::ReturnEvent, "Unknown11"},
+            {31, &INx2Vi2Session::AcquireNativeEvent, "AcquireNativeEvent"},
+            {32, &INx2Vi2Session::DuplicateNativeEvent, "DuplicateNativeEvent"},
+            {261, &INx2Vi2Session::BindVsync, "BindDisplayVsyncEvent"},
+            {262, &INx2Vi2Session::UnbindNativeEvent, "UnbindDisplayVsyncEvent"},
+            {263, &INx2Vi2Session::BindChange, "BindDisplayRefreshRateEvent"},
+            {264, &INx2Vi2Session::UnbindNativeEvent, "UnbindDisplayRefreshRateEvent"},
+            {265, &INx2Vi2Session::BindChange, "BindDisplayHdrStatusEvent"},
+            {266, &INx2Vi2Session::UnbindNativeEvent, "UnbindDisplayHdrStatusEvent"},
+            {267, &INx2Vi2Session::BindChange, "BindDisplayHdrPaperWhiteEvent"},
+            {268, &INx2Vi2Session::UnbindNativeEvent, "UnbindDisplayHdrPaperWhiteEvent"},
+            {269, &INx2Vi2Session::BindChange, "BindDisplayBufferMaxResolutionEvent"},
+            {270, &INx2Vi2Session::UnbindNativeEvent, "UnbindDisplayBufferMaxResolutionEvent"},
+            {271, &INx2Vi2Session::BindChange, "BindDisplayModeCapabilityEvent"},
+            {272, &INx2Vi2Session::UnbindNativeEvent, "UnbindDisplayModeCapabilityEvent"},
+            {103, &INx2Vi2Session::QueryDisplayRefreshRate, "QueryDisplayRefreshRate"},
+            {104, &INx2Vi2Session::QueryDisplayHdrStatus, "QueryDisplayHdrStatus"},
+            {105, &INx2Vi2Session::QueryDisplayHdrPaperWhite, "QueryDisplayHdrPaperWhite"},
+            {212, &INx2Vi2Session::GetLayerBufferBits, "GetLayerBufferBits"},
+            {228, &INx2Vi2Session::CancelClientBuffer, "CancelClientBuffer"},
         });
     }
 
     ~INx2Vi2Session() override {
+        if (m_vsync_timer) {
+            system.CoreTiming().UnscheduleEvent(m_vsync_timer);
+        }
+        {
+            // The vsync callback may be running on the host timing thread.
+            std::scoped_lock lk{m_vsync->mutex};
+            m_vsync->events.clear();
+        }
         for (auto* event : m_events) {
             m_context.CloseEvent(event);
         }
@@ -387,6 +418,138 @@ private:
         rb.PushCopyObjects(ctx, event->GetReadableEvent());
     }
 
+    // 31(u32 index) / 32(handle, u32 index): one of eight display events (vsync, refresh rate,
+    // HDR...). Title 1's main thread waits on its vsync slot forever if it is never signalled.
+    void AcquireNativeEvent(HLERequestContext& ctx) {
+        const u32 index = ctx.CommandBuffer()[2];
+        if (index >= m_native_events.size()) {
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(ResultUnknown);
+            return;
+        }
+        LOG_INFO(Service, "nx2:vi2 31 native event {}", index);
+        ReplyNativeEvent(ctx, index);
+    }
+
+    void DuplicateNativeEvent(HLERequestContext& ctx) {
+        const u32* words = ctx.CommandBuffer();
+        u32 data = 2;
+        if (words[1] >> 31) {
+            const u32 descriptor = words[2];
+            data = 3 + ((descriptor >> 1) & 0xf) + ((descriptor >> 5) & 0xf) +
+                   (descriptor & 1 ? 2 : 0);
+        }
+        const u32 index = words[data];
+        if (index >= m_native_events.size()) {
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(ResultUnknown);
+            return;
+        }
+        LOG_INFO(Service, "nx2:vi2 32 native event {}", index);
+        ReplyNativeEvent(ctx, index);
+    }
+
+    // 261 (u64 display name, u32 index): fire the slot on every vsync.
+    void BindVsync(HLERequestContext& ctx) {
+        const u32 index = ctx.CommandBuffer()[4];
+        LOG_INFO(Service, "nx2:vi2 261 native event {} -> vsync", index);
+        if (index < m_native_events.size() && m_native_events[index]) {
+            SetVsyncSlot(index, true);
+        }
+        TipcReplyWords(ctx, {});
+    }
+
+    // 263..271 odd: the slot reports a change; signal it once.
+    void BindChange(HLERequestContext& ctx) {
+        const u32 index = ctx.CommandBuffer()[4];
+        LOG_INFO(Service, "nx2:vi2 {} native event {} -> change notification", ctx.GetCommand(),
+                 index);
+        if (index < m_native_events.size() && m_native_events[index]) {
+            SetVsyncSlot(index, false);
+            m_native_events[index]->Signal(system.Kernel());
+        }
+        TipcReplyWords(ctx, {});
+    }
+
+    void UnbindNativeEvent(HLERequestContext& ctx) {
+        const u32 index = ctx.CommandBuffer()[4];
+        LOG_INFO(Service, "nx2:vi2 {} native event {} unbound", ctx.GetCommand(), index);
+        if (index < m_native_events.size() && m_native_events[index]) {
+            SetVsyncSlot(index, false);
+        }
+        TipcReplyWords(ctx, {});
+    }
+
+    void QueryDisplayRefreshRate(HLERequestContext& ctx) {
+        TipcReplyWords(ctx, {60, 0});
+    }
+    void QueryDisplayHdrStatus(HLERequestContext& ctx) {
+        TipcReplyWords(ctx, {1, 0, 400});
+    }
+    void QueryDisplayHdrPaperWhite(HLERequestContext& ctx) {
+        TipcReplyWords(ctx, {203});
+    }
+    void GetLayerBufferBits(HLERequestContext& ctx) {
+        constexpr u64 AvailableSlots = 0x7fff;
+        TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots), static_cast<u32>(AvailableSlots >> 32)});
+    }
+    void CancelClientBuffer(HLERequestContext& ctx) {
+        constexpr u64 AvailableSlots = 0x7fff;
+        TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots),
+                             static_cast<u32>(AvailableSlots >> 32), 0, 0, 0, 0});
+    }
+
+    void ReplyNativeEvent(HLERequestContext& ctx, u32 index) {
+        auto*& event = m_native_events[index];
+        if (!event) {
+            event = m_context.CreateEvent(fmt::format("nx2:vi2:Native{}", index));
+            m_events.push_back(event);
+            SetVsyncSlot(index, true);
+            StartVsyncTimer();
+        }
+        IPC::ResponseBuilder rb{ctx, 2, 1, 0};
+        rb.Push(ResultSuccess);
+        rb.PushCopyObjects(ctx, event->GetReadableEvent());
+    }
+
+    void SetVsyncSlot(u32 index, bool on) {
+        auto* event = m_native_events[index];
+        std::scoped_lock lk{m_vsync->mutex};
+        auto& list = m_vsync->events;
+        const auto it = std::find(list.begin(), list.end(), event);
+        if (on && it == list.end()) {
+            list.push_back(event);
+        } else if (!on && it != list.end()) {
+            list.erase(it);
+        }
+    }
+
+    void StartVsyncTimer() {
+        if (m_vsync_timer) {
+            return;
+        }
+        constexpr std::chrono::nanoseconds VblankInterval{1'000'000'000LL / 60};
+        m_vsync_timer = Core::Timing::CreateEvent(
+            "nx2:vi2 vsync",
+            [vsync_state = m_vsync, &kernel = system.Kernel()](
+                s64, std::chrono::nanoseconds) -> std::optional<std::chrono::nanoseconds> {
+                std::scoped_lock lk{vsync_state->mutex};
+                for (auto* vsync : vsync_state->events) {
+                    vsync->Signal(kernel);
+                }
+                return std::nullopt;
+            });
+        system.CoreTiming().ScheduleLoopingEvent(VblankInterval, VblankInterval, m_vsync_timer);
+    }
+
+    struct VsyncState {
+        std::mutex mutex;
+        std::vector<Kernel::KEvent*> events;
+    };
+    std::array<Kernel::KEvent*, 8> m_native_events{};
+    std::shared_ptr<VsyncState> m_vsync = std::make_shared<VsyncState>();
+    std::shared_ptr<Core::Timing::EventType> m_vsync_timer;
+
     KernelHelpers::ServiceContext m_context;
     std::vector<Kernel::KEvent*> m_events;
 };
@@ -410,6 +573,36 @@ public:
             {1121, &INx2GraphicsSystemSession::OpenGpuTimeSession, "OpenGpuTimeSession"},
             {497, &INx2GraphicsSystemSession::OpenGpuSession, "OpenGpuSession (guessed)"},
             {1402, &INx2GraphicsSystemSession::OpenNvsrvSession, "OpenNvsrvSession (guessed)"},
+            {111, &INx2GraphicsSystemSession::CreateNativeMemory, "CreateNativeMemory"},
+            {112, &INx2GraphicsSystemSession::DestroyNativeMemory, "DestroyNativeMemory"},
+            {114, &INx2GraphicsSystemSession::BindNativeMemory, "BindNativeMemory"},
+            {314, &INx2GraphicsSystemSession::ConfigureWindowImagePool, "DestroyNativeWindowAliasImagePool"},
+            {315, &INx2GraphicsSystemSession::ConfigureWindowImagePool, "CreateNativeWindowAliasImagePool"},
+            {423, &INx2GraphicsSystemSession::BindNativeGpuMemory, "BindNativeGpuMemory"},
+            {426, &INx2GraphicsSystemSession::QueryNativeImage, "MapNativeImage"},
+            {428, &INx2GraphicsSystemSession::QueryNativeImage, "QueryNativeImage"},
+            {429, &INx2GraphicsSystemSession::CreateNativeImage, "CreateNativeImage"},
+            {430, &INx2GraphicsSystemSession::DestroyNativeImage, "DestroyNativeImage"},
+            {435, &INx2GraphicsSystemSession::CalculateNativeImageSize, "CalculateNativeImageSize"},
+            {1510, &INx2GraphicsSystemSession::CalculateRequirements, "CalculateRequirements"},
+            {126, &INx2GraphicsSystemSession::GetSessionFlag, "GetSessionFlag"},
+            {1111, &INx2GraphicsSystemSession::SetFeatureVersion, "SetFeatureVersion"},
+            {311, &INx2GraphicsSystemSession::CreateNativeImage, "CreateFeatureImagePool311"},
+            {312, &INx2GraphicsSystemSession::DestroyNativeImage, "DestroyFeatureImagePool312"},
+            {321, &INx2GraphicsSystemSession::CreateNativeImage, "CreateFeatureImagePool321"},
+            {615, &INx2GraphicsSystemSession::CreateNativeImage, "CreateFeatureImagePool615"},
+            {612, &INx2GraphicsSystemSession::DestroyNativeImage, "DestroyFeatureImagePool612"},
+            {811, &INx2GraphicsSystemSession::CreateNativeImage, "CreateFeatureImagePool811"},
+            {812, &INx2GraphicsSystemSession::DestroyNativeImage, "DestroyFeatureImagePool812"},
+            {1211, &INx2GraphicsSystemSession::CreateNativeImage, "CreateChatImagePool"},
+            {1212, &INx2GraphicsSystemSession::DestroyNativeImage, "DestroyFeatureImagePool1212"},
+            {1611, &INx2GraphicsSystemSession::CreateNativeImage, "CreateFeatureImagePool1611"},
+            {1612, &INx2GraphicsSystemSession::DestroyNativeImage, "DestroyFeatureImagePool1612"},
+            {391, &INx2GraphicsSystemSession::CalculateChatImagePoolSize, "CalculateFeatureImagePoolSize391"},
+            {691, &INx2GraphicsSystemSession::CalculateChatImagePoolSize, "CalculateFeatureImagePoolSize691"},
+            {891, &INx2GraphicsSystemSession::CalculateChatImagePoolSize, "CalculateFeatureImagePoolSize891"},
+            {1291, &INx2GraphicsSystemSession::CalculateChatImagePoolSize, "CalculateFeatureImagePoolSize1291"},
+            {1691, &INx2GraphicsSystemSession::CalculateChatImagePoolSize, "CalculateFeatureImagePoolSize1691"},
         });
     }
 
@@ -515,6 +708,200 @@ private:
     static constexpr u32 SyncptRwBitsOffset = 0x100;
     static constexpr u32 HostSyncpoints = 192;
     static constexpr std::chrono::nanoseconds SyncptPollInterval{std::chrono::microseconds{500}};
+
+    // ---- Native memory and image objects (guest-side bookkeeping, no rendering). ----
+    struct NativeMemory {
+        u64 size{};
+        u64 address{};
+        u32 parent{};
+        u64 parent_offset{};
+    };
+    struct NativeImage {
+        u32 memory{};
+        std::array<u32, 16> preference{};
+        u64 size{};
+        u32 count{1};
+        bool window_pool{};
+    };
+
+    static u64 Pair(const u32* w, size_t i) {
+        return u64{w[i]} | (u64{w[i + 1]} << 32);
+    }
+
+    // 111(u8 mode at word 2, u64 size): u32 native memory id.
+    void CreateNativeMemory(HLERequestContext& ctx) {
+        const auto* w = ctx.CommandBuffer();
+        const u64 size = Pair(w, 3);
+        std::scoped_lock lk{m_objects_mutex};
+        const u32 id = m_next_native_memory++;
+        m_native_memories[id] = {size, 0, 0, 0};
+        LOG_INFO(Service, "nx2:gsv 111 CreateNativeMemory mode={} size={:#x} -> id {}", w[2] & 0xFF,
+                 size, id);
+        TipcReplyWords(ctx, {id});
+    }
+
+    void DestroyNativeMemory(HLERequestContext& ctx) {
+        const u32 id = ctx.CommandBuffer()[2];
+        {
+            std::scoped_lock lk{m_objects_mutex};
+            m_native_memories.erase(id);
+        }
+        LOG_DEBUG(Service, "nx2:gsv 112 DestroyNativeMemory id {}", id);
+        TipcReplyWords(ctx, {});
+    }
+
+    void BindMemory(u32 id, u64 address, u64 size, const char* command, u32 parent = 0,
+                    u64 parent_offset = 0) {
+        std::scoped_lock lk{m_objects_mutex};
+        auto& memory = m_native_memories[id];
+        memory.address = address;
+        memory.parent = parent;
+        memory.parent_offset = parent_offset;
+        if (memory.size == 0) {
+            memory.size = size;
+        }
+        LOG_INFO(Service, "nx2:gsv {} bind native memory {} at {:#x}+{:#x}", command, id, address,
+                 size);
+    }
+
+    void BindNativeMemory(HLERequestContext& ctx) {
+        const auto* w = ctx.CommandBuffer();
+        BindMemory(w[2], Pair(w, 3), Pair(w, 5), "114");
+        TipcReplyWords(ctx, {});
+    }
+
+    void BindNativeGpuMemory(HLERequestContext& ctx) {
+        const auto* w = ctx.CommandBuffer();
+        LOG_DEBUG(Service, "nx2:gsv 423 parent={} offset={:#x}", w[7], Pair(w, 8));
+        BindMemory(w[2], Pair(w, 3), Pair(w, 5), "423", w[7], Pair(w, 8));
+        TipcReplyWords(ctx, {});
+    }
+
+    // 429(preference[16], u32 count, u32 memory id): u32 native image id.
+    void CreateNativeImage(HLERequestContext& ctx) {
+        const auto* w = ctx.CommandBuffer();
+        std::scoped_lock lk{m_objects_mutex};
+        const u32 id = m_next_native_image;
+        auto& image = m_native_images[id];
+        image.count = std::max<u32>(w[18], 1);
+        // nn::gs::sdk::CalculateNativeImageHandle(pool, i) is pool + i, so keep those free.
+        m_next_native_image += image.count;
+        image.memory = w[19];
+        std::copy_n(w + 2, image.preference.size(), image.preference.begin());
+        image.size = Nx2CalculateImageLayout(w + 2).size;
+        LOG_INFO(Service, "nx2:gsv {} CreateNativeImage memory={} count={} size={:#x} -> id {}",
+                 ctx.GetCommand(), w[19], w[18], image.size, id);
+        TipcReplyWords(ctx, {id});
+    }
+
+    void DestroyNativeImage(HLERequestContext& ctx) {
+        const u32 id = ctx.CommandBuffer()[2];
+        {
+            std::scoped_lock lk{m_objects_mutex};
+            m_native_images.erase(id);
+        }
+        TipcReplyWords(ctx, {});
+    }
+
+    // 428(u32 handle) QueryNativeImage and 426 MapNativeImage: an address, an offset and a
+    // 0x90-byte descriptor of the image.
+    void QueryNativeImage(HLERequestContext& ctx) {
+        const u32 handle = ctx.CommandBuffer()[2];
+        std::array<u32, 16> preference{};
+        u64 image_offset = 0;
+        u64 memory_address = 0;
+        {
+            std::scoped_lock lk{m_objects_mutex};
+            auto it = m_native_images.upper_bound(handle);
+            if (it != m_native_images.begin()) {
+                --it;
+                if (handle - it->first < it->second.count) {
+                    preference = it->second.preference;
+                    image_offset = (handle - it->first) * it->second.size;
+                    if (const auto memory = m_native_memories.find(it->second.memory);
+                        memory != m_native_memories.end()) {
+                        memory_address = memory->second.address;
+                    }
+                }
+            }
+        }
+        const auto layout = Nx2CalculateImageLayout(preference.data());
+        const u64 gpu_address = ctx.GetCommand() == 426 ? memory_address + image_offset : 0;
+        std::array<u32, 37> words{};
+        words[0] = static_cast<u32>(gpu_address);
+        words[1] = static_cast<u32>(gpu_address >> 32);
+        words[2] = static_cast<u32>(image_offset);
+        words[3] = static_cast<u32>(image_offset >> 32);
+        u32* const desc = words.data() + 4;
+        desc[0] = 1;
+        desc[1] = preference[1];
+        desc[2] = preference[2];
+        desc[4] = layout.block_height_log2;
+        desc[5] = static_cast<u32>(layout.pitch / 64);
+        desc[8] = 1;
+        desc[9] = 1;
+        desc[11] = static_cast<u32>(layout.size);
+        LOG_INFO(Service, "nx2:gsv {} handle={} {}x{} size={:#x} gpu={:#x}", ctx.GetCommand(),
+                 handle, layout.width, layout.height, layout.size, gpu_address);
+        TipcReplyWords(ctx, std::span<const u32>{words.data(), words.size()});
+    }
+
+    void CalculateNativeImageSize(HLERequestContext& ctx) {
+        const auto* w = ctx.CommandBuffer();
+        const u64 size = Nx2CalculateImageLayout(w + 2).size * std::max<u32>(w[18], 1);
+        LOG_DEBUG(Service, "nx2:gsv 435 count={} -> size={:#x}", w[18], size);
+        TipcReplyWords(ctx, {static_cast<u32>(size), static_cast<u32>(size >> 32)});
+    }
+
+    // 1510 gsv::shim::CalculateRequirements: size and alignment of a window image.
+    void CalculateRequirements(HLERequestContext& ctx) {
+        const auto* w = ctx.CommandBuffer();
+        const auto layout =
+            Nx2CalculateNativeImageRequirements(std::span<const u32, 16>{w + 2, 16}, w[18]);
+        LOG_INFO(Service, "nx2:gsv 1510 kind={} {}x{} block={} pitch={:#x} format={} -> size={:#x} align={:#x}",
+                 w[3], layout.width, layout.height, layout.block_height_log2, layout.pitch, w[8],
+                 layout.size, layout.alignment);
+        TipcReplyWords(ctx, {static_cast<u32>(layout.size), static_cast<u32>(layout.size >> 32),
+                             static_cast<u32>(layout.alignment),
+                             static_cast<u32>(layout.alignment >> 32)});
+    }
+
+    // Pool size of a feature's images (391, 691, 891, 1291, 1691 share the server template):
+    // preference[16], u32 count -> u64 size, u64 alignment.
+    void CalculateChatImagePoolSize(HLERequestContext& ctx) {
+        const auto* w = ctx.CommandBuffer();
+        const auto layout = Nx2CalculateImageLayout(w + 2);
+        const u64 size = layout.size * std::max<u32>(w[18], 1);
+        TipcReplyWords(ctx, {static_cast<u32>(size), static_cast<u32>(size >> 32),
+                             static_cast<u32>(layout.alignment),
+                             static_cast<u32>(layout.alignment >> 32)});
+    }
+
+    void ConfigureWindowImagePool(HLERequestContext& ctx) {
+        const u32 id = ctx.CommandBuffer()[2];
+        const bool create = ctx.GetCommand() == 315;
+        std::scoped_lock lk{m_objects_mutex};
+        if (auto it = m_native_images.find(id); it != m_native_images.end()) {
+            it->second.window_pool = create;
+        }
+        LOG_INFO(Service, "nx2:gsv {} window image pool image {}", ctx.GetCommand(), id);
+        TipcReplyWords(ctx, {});
+    }
+
+    void GetSessionFlag(HLERequestContext& ctx) {
+        TipcReplyWords(ctx, {0});
+    }
+
+    void SetFeatureVersion(HLERequestContext& ctx) {
+        LOG_INFO(Service, "nx2:gsv TIPC 1111 value {:#x}", ctx.CommandBuffer()[2]);
+        TipcReplyWords(ctx, {});
+    }
+
+    std::mutex m_objects_mutex;
+    std::map<u32, NativeMemory> m_native_memories;
+    std::map<u32, NativeImage> m_native_images;
+    u32 m_next_native_memory{1};
+    u32 m_next_native_image{1};
 
     bool UpdateSyncptValues() {
         auto& manager = system.Host1x().GetSyncpointManager();
