@@ -7,6 +7,9 @@
 #include "core/core.h"
 #include "core/hle/kernel/k_memory_layout.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_thread.h"
+#include <mutex>
+#include <set>
 #include "core/hle/kernel/svc.h"
 
 namespace Kernel::Svc {
@@ -20,7 +23,31 @@ Result ArbitrateLock(Core::System& system, Handle thread_handle, u64 address, u3
     R_UNLESS(!IsKernelAddress(address), ResultInvalidCurrentMemory);
     R_UNLESS(Common::IsAligned(address, sizeof(u32)), ResultInvalidAddress);
 
-    R_RETURN(KConditionVariable::WaitForAddress(system.Kernel(), thread_handle, address, tag));
+    auto& kernel = system.Kernel();
+    auto& process = GetCurrentProcess(kernel);
+    if (process.IsSwitch2()) {
+        // Log each contended lock once: who owns it and what that thread is doing.
+        static std::mutex m;
+        static std::set<u64> seen;
+        std::scoped_lock lk{m};
+        if (seen.size() < 64 && seen.insert(address).second) {
+            KScopedAutoObject owner =
+                process.GetHandleTable().GetObjectWithoutPseudoHandle<KThread>(kernel, thread_handle);
+            if (owner.IsNotNull()) {
+                LOG_INFO(Kernel_SVC,
+                         "Switch 2 lock {:#x} contended by t{}: owner t{} state={} svc={:#x} word={:#x}",
+                         address, GetCurrentThread(kernel).GetThreadId(), owner->GetThreadId(),
+                         static_cast<u32>(owner->GetState()),
+                         owner->GetStackParameters().current_svc_id,
+                         process.GetMemory().Read32(address));
+            } else {
+                LOG_INFO(Kernel_SVC, "Switch 2 lock {:#x} contended, owner handle {:#x} unresolved",
+                         address, thread_handle);
+            }
+        }
+    }
+
+    R_RETURN(KConditionVariable::WaitForAddress(kernel, thread_handle, address, tag));
 }
 
 /// Unlock a mutex
