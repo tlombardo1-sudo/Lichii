@@ -14,6 +14,8 @@
 #include "core/hle/kernel/k_thread.h"
 #include "common/alignment.h"
 #include "core/hle/kernel/k_page_table.h"
+#include <array>
+#include <chrono>
 #include <mutex>
 #include <set>
 #include "core/hle/kernel/k_readable_event.h"
@@ -2518,6 +2520,34 @@ void Call(Core::System& system, u32 imm) {
     LOG_TRACE(Kernel_SVC, "{} [0]={:#x} [1]={:#x} [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x} [6]={:#x}",
         imm, GetArg64(args, 0), GetArg64(args, 1), GetArg64(args, 2),
         GetArg64(args, 3), GetArg64(args, 4), GetArg64(args, 5), GetArg64(args, 6));
+    if (process.IsSwitch2()) {
+        // Every 5 s: how many of each SVC ran, and which addresses the guest blocks on, to show
+        // whether a quiet guest sleeps, spins or waits on a lock.
+        static std::mutex stat_mutex;
+        static std::array<u64, 256> counts{};
+        static std::set<std::pair<u32, u64>> blockers;
+        static std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+        std::scoped_lock lk{stat_mutex};
+        ++counts[imm & 0xff];
+        if ((imm == 0x1a || imm == 0x1b || imm == 0x1c || imm == 0x1d || imm == 0x1e ||
+             imm == 0x1f || imm == 0x34 || imm == 0x35) &&
+            blockers.size() < 200 && blockers.insert({imm, GetArg64(args, 0)}).second) {
+            LOG_INFO(Kernel_SVC, "Switch 2 svc {:#04x} first on {:#x} (t{})", imm, GetArg64(args, 0),
+                     GetCurrentThread(kernel).GetThreadId());
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last >= std::chrono::seconds{5}) {
+            last = now;
+            std::string text;
+            for (u32 i = 0; i < counts.size(); ++i) {
+                if (counts[i] != 0) {
+                    text += fmt::format(" {:#04x}x{}", i, counts[i]);
+                }
+            }
+            counts.fill(0);
+            LOG_INFO(Kernel_SVC, "Switch 2 svc counts, last 5 s:{}", text);
+        }
+    }
     if (imm == 0x18 && process.IsSwitch2()) {
         // WaitSynchronization on a Switch 2 program: log each distinct set of handles once, with
         // the names services gave their events, to show what a stalled guest waits on.
