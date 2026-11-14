@@ -2564,9 +2564,12 @@ void Call(Core::System& system, u32 imm) {
                                     ? "=" + Service::KernelHelpers::EventName(event->GetParent())
                                     : std::string{});
         }
+        const std::string key = fmt::format("t{}{} timeout={}", GetCurrentThread(kernel).GetThreadId(),
+                                            list, static_cast<s64>(GetArg64(args, 3)) < 0 ? "inf" : "timed");
         std::scoped_lock lk{wait_mutex};
-        if (seen.size() < 400 && seen.insert(list).second) {
-            LOG_INFO(Kernel_SVC, "Switch 2 svc 0x18 waits on{}", list);
+        if (seen.size() < 400 && seen.insert(key).second) {
+            LOG_INFO(Kernel_SVC, "Switch 2 svc 0x18 {} waits on{}", GetCurrentThread(kernel).GetThreadId(),
+                     list);
         }
     }
     if (imm == 0x80 && process.Is64Bit()) {
