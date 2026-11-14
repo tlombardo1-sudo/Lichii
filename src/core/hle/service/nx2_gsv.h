@@ -260,7 +260,7 @@ private:
         const u64 a = u64{w[3]} | (u64{w[4]} << 32);
         const u64 b = u64{w[5]} | (u64{w[6]} << 32);
         const u64 offset = u64{w[8]} | (u64{w[9]} << 32);
-        LOG_DEBUG(Service, "nx2:gpu 211 map [{:#x}, {:#x}] handle={} offset={:#x} slot={}", a, b,
+        LOG_INFO(Service, "nx2:gpu 211 map [{:#x}, {:#x}] handle={} offset={:#x} slot={}", a, b,
                   w[7], offset, w[17]);
         if (const auto it = m_memory.find(w[7]); it != m_memory.end() && b > a) {
             Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapAt(a, it->second.first + offset,

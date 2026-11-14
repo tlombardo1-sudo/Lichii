@@ -14,6 +14,10 @@
 #include "core/hle/kernel/k_thread.h"
 #include "common/alignment.h"
 #include "core/hle/kernel/k_page_table.h"
+#include <mutex>
+#include <set>
+#include "core/hle/kernel/k_readable_event.h"
+#include "core/hle/service/kernel_helpers.h"
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/svc_results.h"
 
@@ -2514,6 +2518,27 @@ void Call(Core::System& system, u32 imm) {
     LOG_TRACE(Kernel_SVC, "{} [0]={:#x} [1]={:#x} [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x} [6]={:#x}",
         imm, GetArg64(args, 0), GetArg64(args, 1), GetArg64(args, 2),
         GetArg64(args, 3), GetArg64(args, 4), GetArg64(args, 5), GetArg64(args, 6));
+    if (imm == 0x18 && process.IsSwitch2()) {
+        // WaitSynchronization on a Switch 2 program: log each distinct set of handles once, with
+        // the names services gave their events, to show what a stalled guest waits on.
+        static std::mutex wait_mutex;
+        static std::set<std::string> seen;
+        std::string list;
+        const s32 count = static_cast<s32>(GetArg64(args, 2));
+        for (s32 i = 0; i < std::min(count, 8); ++i) {
+            const u32 handle = process.GetMemory().Read32(GetArg64(args, 1) + 4 * i);
+            KScopedAutoObject event =
+                process.GetHandleTable().GetObject<KReadableEvent>(kernel, handle);
+            list += fmt::format(" {:#x}{}", handle,
+                                event.IsNotNull() && event->GetParent() != nullptr
+                                    ? "=" + Service::KernelHelpers::EventName(event->GetParent())
+                                    : std::string{});
+        }
+        std::scoped_lock lk{wait_mutex};
+        if (seen.size() < 400 && seen.insert(list).second) {
+            LOG_INFO(Kernel_SVC, "Switch 2 svc 0x18 waits on{}", list);
+        }
+    }
     if (imm == 0x80 && process.Is64Bit()) {
         // Switch 2 only: svcSetGpuMemoryAttribute(address, size, mask, attr). nn::gpu::sdk and
         // nn::gs native memory set the "GPU accessible" attribute (0x20) before registering memory
