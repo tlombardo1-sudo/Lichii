@@ -12,7 +12,10 @@
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
+#include "common/alignment.h"
+#include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/svc.h"
+#include "core/hle/kernel/svc_results.h"
 
 namespace Kernel::Svc {
 
@@ -2511,7 +2514,35 @@ void Call(Core::System& system, u32 imm) {
     LOG_TRACE(Kernel_SVC, "{} [0]={:#x} [1]={:#x} [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x} [6]={:#x}",
         imm, GetArg64(args, 0), GetArg64(args, 1), GetArg64(args, 2),
         GetArg64(args, 3), GetArg64(args, 4), GetArg64(args, 5), GetArg64(args, 6));
-    if (process.Is64Bit()) {
+    if (imm == 0x80 && process.Is64Bit()) {
+        // Switch 2 only: svcSetGpuMemoryAttribute(address, size, mask, attr). nn::gpu::sdk and
+        // nn::gs native memory set the "GPU accessible" attribute (0x20) before registering memory
+        // with the GPU and clear it on destruction. Same checks as svcSetMemoryAttribute,
+        // restricted to that bit.
+        const u64 address = GetArg64(args, 0);
+        const u64 size = GetArg64(args, 1);
+        const u32 mask = static_cast<u32>(GetArg64(args, 2));
+        const u32 attr = static_cast<u32>(GetArg64(args, 3));
+        constexpr u32 Supported = static_cast<u32>(MemoryAttribute::GpuAccessible);
+        auto& page_table = process.GetPageTable();
+        Result result = ResultSuccess;
+        if (!Common::IsAligned(address, PageSize)) {
+            result = ResultInvalidAddress;
+        } else if (size == 0 || !Common::IsAligned(size, PageSize)) {
+            result = ResultInvalidSize;
+        } else if ((attr & ~mask) != 0 || ((mask | attr) & ~Supported) != 0) {
+            result = ResultInvalidCombination;
+        } else if (address + size <= address || !page_table.Contains(address, size)) {
+            result = ResultInvalidCurrentMemory;
+        } else {
+            result = page_table.SetMemoryAttribute(address, size,
+                                                   static_cast<KMemoryAttribute>(mask),
+                                                   static_cast<KMemoryAttribute>(attr));
+        }
+        LOG_DEBUG(Kernel_SVC, "Switch 2 svc 0x80 addr={:#x} size={:#x} mask={:#x} attr={:#x} -> {:#x}",
+                  address, size, mask, attr, result.raw);
+        args[0] = result.raw;
+    } else if (process.Is64Bit()) {
         Call64(system, imm, args);
     } else {
         Call32(system, imm, args);
