@@ -19,6 +19,8 @@
 #include "core/arm/dynarmic/jit_prewarm_owner.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_thread.h"
+#include "core/hle/kernel/kernel.h"
 #include "dynarmic/interface/A64/config.h"
 #include "dynarmic/interface/jit_profile.h"
 
