@@ -79,6 +79,23 @@ void PushStubZeroes(IPC::ResponseBuilder& rb) {
     }
 }
 
+
+// Switch 2 diagnostics: every distinct (service, command) a Switch 2 guest calls, once each, with
+// the calling thread and the handler's name when there is one.
+void LogNx2Call(ServiceFrameworkBase& service, HLERequestContext& ctx, const char* handler) {
+    const auto* const caller = ctx.GetThread().GetOwnerProcess();
+    if (caller == nullptr || !caller->IsSwitch2()) {
+        return;
+    }
+    static std::mutex mutex;
+    static std::set<std::pair<std::string, u32>> seen;
+    std::scoped_lock lk{mutex};
+    if (seen.size() < 1500 && seen.emplace(service.GetServiceName(), ctx.GetCommand()).second) {
+        LOG_INFO(Service, "Switch 2 IPC {} cmd {} ({}) from t{}", service.GetServiceName(),
+                 ctx.GetCommand(), handler, ctx.GetThread().GetThreadId());
+    }
+}
+
 } // namespace
 
 bool ServiceFrameworkBase::StubAllowed(HLERequestContext& ctx) {
@@ -177,6 +194,7 @@ void ServiceFrameworkBase::InvokeRequest(HLERequestContext& ctx) {
     if (info == nullptr || info->handler_callback == nullptr)
         return ReportUnimplementedFunction(ctx, info);
 
+    LogNx2Call(*this, ctx, info->name);
     LOG_TRACE(Service, "{}", MakeFunctionString(info->name, GetServiceName(), ctx.CommandBuffer()));
     handler_invoker(this, info->handler_callback, ctx);
 }
@@ -187,6 +205,7 @@ void ServiceFrameworkBase::InvokeRequestTipc(HLERequestContext& ctx) {
     if (info == nullptr || info->handler_callback == nullptr)
         return ReportUnimplementedFunction(ctx, info);
 
+    LogNx2Call(*this, ctx, info->name);
     LOG_TRACE(Service, "{}", MakeFunctionString(info->name, GetServiceName(), ctx.CommandBuffer()));
     handler_invoker(this, info->handler_callback, ctx);
 }
