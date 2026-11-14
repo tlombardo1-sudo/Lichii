@@ -250,7 +250,42 @@ void DynarmicCallbacks64::LogWaitStack(u32 svc) {
     }
 }
 
+void DynarmicCallbacks64::LogTimedWaitDeep(u32 svc) {
+    static std::atomic<bool> done{};
+    if (svc != 0x1c || !m_process->IsSwitch2()) {
+        return;
+    }
+    const auto& jit = *m_parent.m_jit;
+    const auto gpr = jit.GetRegisters();
+    if (gpr[3] == ~0ULL || done.exchange(true)) {
+        return; // only the first timed condition variable wait
+    }
+    LOG_INFO(Core_ARM, "DEEPWAIT x0={:#x} x1={:#x} x2={:#x} x3={:#x}", gpr[0], gpr[1], gpr[2], gpr[3]);
+    const auto dump = [&](const char* what, u64 start, u32 words) {
+        if (start < 0x10000 || m_memory.GetPointerSilent(start) == nullptr) {
+            return;
+        }
+        for (u32 i = 0; i < words; i += 8) {
+            std::string line;
+            for (u32 j = 0; j < 8 && i + j < words; ++j) {
+                line += fmt::format(" {:08x}", m_memory.Read32(start + (i + j) * 4));
+            }
+            LOG_INFO(Core_ARM, "DEEP {} {:#x}:{}", what, start + i * 4, line);
+        }
+    };
+    dump("data", gpr[0] - 0x40, 64);
+    u64 fp = gpr[29];
+    for (int frame = 0; frame < 9 && fp >= 0x10000 && m_memory.GetPointerSilent(fp) != nullptr; ++frame) {
+        const u64 ret = m_memory.Read64(fp + 8);
+        LOG_INFO(Core_ARM, "DEEPFRAME {} ret={:#x} fp={:#x}", frame, ret, fp);
+        dump("code", ret - 0x180, 160);
+        dump("stack", fp, 32);
+        fp = m_memory.Read64(fp);
+    }
+}
+
 void DynarmicCallbacks64::CallSVC(u32 svc) {
+    LogTimedWaitDeep(svc);
     LogWaitStack(svc);
     m_parent.m_svc = svc;
     m_parent.m_jit->HaltExecution(SupervisorCall);
