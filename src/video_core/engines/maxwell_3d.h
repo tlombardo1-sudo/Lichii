@@ -10,6 +10,8 @@
 #include <bitset>
 #include <cmath>
 #include <limits>
+#include <memory>
+#include <span>
 #include <optional>
 #include <type_traits>
 #include <vector>
@@ -3181,6 +3183,29 @@ public:
         return 0;
     }
 
+    /// Switch 2 macros: the channel's shared macro RAM, instead of this engine's own.
+    void SetNativeMacroContext(std::shared_ptr<NativeMacroContext> context) {
+        native_macro_context = std::move(context);
+    }
+    void SetNativeTuringMacroMode(bool enabled) {
+        GetNativeMacroEngine().native_turing = enabled;
+    }
+    MacroEngine& GetNativeMacroEngine() {
+        return native_macro_context ? native_macro_context->engine : macro_engine;
+    }
+    std::span<u32> GetNativeMacroPositions() {
+        return native_macro_context ? std::span<u32>{native_macro_context->positions}
+                                    : std::span<u32>{macro_positions};
+    }
+    /// The channel's MME data RAM (Turing macros' DREAD/DWRITE).
+    std::array<u32, 0xc00>& GetNativeDataRam() {
+        return native_data_ram;
+    }
+    /// GPU memory, for Turing macros that read memory into their FIFO or data RAM.
+    MemoryManager& GetMemoryManager() {
+        return memory_manager;
+    }
+
     void RefreshParameters() {
         if (!current_macro_dirty) {
             return;
@@ -3289,6 +3314,8 @@ private:
 
     /// Interpreter for the macro codes uploaded to the GPU.
     MacroEngine macro_engine;
+    std::shared_ptr<NativeMacroContext> native_macro_context;
+    std::array<u32, 0xc00> native_data_ram{};
 
     Upload::State upload_state;
 

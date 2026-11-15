@@ -93,6 +93,8 @@ add_library(video_core STATIC
     host1x/vic.h
     macro.cpp
     macro.h
+    macro_turing.h
+    nx2.h
     fence_manager.h
     frame_trace.cpp
     cpu_write_queue.h

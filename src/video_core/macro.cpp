@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <exception>
@@ -30,6 +32,7 @@
 #include "video_core/dirty_flags.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/macro.h"
+#include "video_core/memory_manager.h"
 #include "video_core/perf_counters.h"
 
 #include "common/assert.h"
@@ -1396,8 +1399,70 @@ static void Dump(u64 hash, std::span<const u32> code, bool decompiled = false) {
     macro_file.write(reinterpret_cast<const char*>(code.data()), code.size_bytes());
 }
 
+// Runs a Switch 2 (Turing+) macro through the interpreter. `method` is the instruction index the
+// macro starts at; its writes go through the 3D engine's method handler.
+void MacroEngine::ExecuteNative(Core::System& system, Engines::Maxwell3D& maxwell3d, u32 method,
+                                std::span<const u32> parameters) {
+    maxwell3d.RefreshParameters();
+    // Reused between calls (a macro never calls another: methods >= 0xe00 are refused below).
+    auto& fifo = native_fifo;
+    native_interpreter.active_dram = &maxwell3d.GetNativeDataRam();
+    const auto emit = [&](u32 address, u32 value) {
+        if (address >= 0xe00) {
+            return false;
+        }
+        maxwell3d.CallMethod(system, address, value, true);
+        // Turing MME memory reads (methods 0x550 SET_MME_MEM_ADDRESS_A/B, 0x558 data RAM address,
+        // 0x55c MME_DMA_READ into data RAM, 0x560 MME_DMA_READ_FIFOED into the load FIFO, which
+        // the macro then reads after a load barrier); as register indices these are 0x154..0x158.
+        constexpr u32 MemAddressA = 0x154, MemAddressB = 0x155, DataRamAddress = 0x156;
+        constexpr u32 DmaRead = 0x157, DmaReadFifoed = 0x158;
+        if (address == DmaRead || address == DmaReadFifoed) {
+            const GPUVAddr source =
+                (GPUVAddr{maxwell3d.GetRegisterValue(MemAddressA) & 0x1ffffff} << 32) |
+                maxwell3d.GetRegisterValue(MemAddressB);
+            auto& memory = maxwell3d.GetMemoryManager();
+            const u32 ram = maxwell3d.GetRegisterValue(DataRamAddress);
+            const u32 word_count = std::min<u32>(value, 0x1000);
+            const size_t read_bytes = size_t{word_count} * sizeof(u32);
+            // The words may have just been written by the GPU and still be only in host buffers.
+            if (memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+                memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+            }
+            std::array<u32, 0x1000> dma_words;
+            memory.ReadBlockUnsafe(source, dma_words.data(), read_bytes);
+            auto& data_ram = *native_interpreter.active_dram;
+            for (u32 i = 0; i < word_count; ++i) {
+                if (address == DmaReadFifoed) {
+                    fifo.push_back(dma_words[i]);
+                } else if (ram + i < data_ram.size()) {
+                    data_ram[ram + i] = dma_words[i];
+                }
+            }
+        }
+        return true;
+    };
+    fifo.assign(parameters.begin(), parameters.end());
+    const auto result = native_interpreter.Execute(
+        native_code, method, fifo,
+        [&](u32 address) {
+            return address < Engines::Maxwell3D::Regs::NUM_REGS ? maxwell3d.GetRegisterValue(address)
+                                                                : 0U;
+        },
+        emit);
+    if (!result.success) {
+        native_execution_failed = true;
+        LOG_ERROR(HW_GPU, "Native MME failed: start={:#x}, pc={:#x}, consumed={}/{}, error={}",
+                  method, result.pc, result.consumed, parameters.size(), result.error);
+    }
+}
+
 void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u32 method,
                           std::span<const u32> parameters) {
+    if (native_turing) {
+        ExecuteNative(system, maxwell3d, method, parameters);
+        return;
+    }
     const u32 outer_macro = std::exchange(VideoCore::Perf::current_macro, method);
     SCOPE_EXIT {
         VideoCore::Perf::current_macro = outer_macro;

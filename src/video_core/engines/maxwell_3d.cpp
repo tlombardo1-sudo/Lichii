@@ -340,9 +340,9 @@ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argume
         shadow_state.shadow_ram_control = static_cast<Regs::ShadowRamControl>(nonshadow_argument);
         return;
     case MAXWELL3D_REG_INDEX(load_mme.instruction_ptr):
-        return macro_engine.ClearCode(regs.load_mme.instruction_ptr);
+        return GetNativeMacroEngine().ClearCode(regs.load_mme.instruction_ptr);
     case MAXWELL3D_REG_INDEX(load_mme.instruction):
-        return macro_engine.AddCode(regs.load_mme.instruction_ptr, argument);
+        return GetNativeMacroEngine().AddCode(regs.load_mme.instruction_ptr, argument);
     case MAXWELL3D_REG_INDEX(load_mme.start_address):
         return ProcessMacroBind(argument);
     case MAXWELL3D_REG_INDEX(falcon[4]):
@@ -406,10 +406,10 @@ void Maxwell3D::CallMacroMethod(Core::System& system, u32 method, const std::vec
 
     // Lookup the macro offset
     const u32 entry =
-        ((method - MacroRegistersStart) >> 1) % static_cast<u32>(macro_positions.size());
+        ((method - MacroRegistersStart) >> 1) % static_cast<u32>(GetNativeMacroPositions().size());
 
     // Execute the current macro.
-    macro_engine.Execute(system, *this, macro_positions[entry], parameters);
+    GetNativeMacroEngine().Execute(system, *this, GetNativeMacroPositions()[entry], parameters);
     draw_manager.DrawDeferred(*this);
 }
 
@@ -481,11 +481,15 @@ void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* bas
 }
 
 void Maxwell3D::ProcessMacroUpload(u32 data) {
-    macro_engine.AddCode(regs.load_mme.instruction_ptr++, data);
+    GetNativeMacroEngine().AddCode(regs.load_mme.instruction_ptr++, data);
 }
 
 void Maxwell3D::ProcessMacroBind(u32 data) {
-    macro_positions[regs.load_mme.start_address_ptr++] = data;
+    const auto positions = GetNativeMacroPositions();
+    const u32 index = regs.load_mme.start_address_ptr++;
+    if (index < positions.size()) {
+        positions[index] = data;
+    }
 }
 
 void Maxwell3D::ProcessFirmwareCall4() {
