@@ -15,6 +15,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "memory_manager.h"
 #include "video_core/guest_memory.h"
+#include "video_core/nx2.h"
 #include "video_core/gpu_written_pages.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/invalidation_accumulator.h"
@@ -240,8 +241,9 @@ static void ReportUnmappedAccess(const MemoryManager& gmmu, GPUVAddr addr, size_
     static std::atomic<u32> reported{};
     if (reported.fetch_add(1) < 64) {
         const auto device = gmmu.GpuToCpuAddress(addr);
-        LOG_ERROR(HW_GPU, "GPU {} of {} bytes at unbacked address {:#x} (gmmu {}, device {:#x})",
-                  write ? "write" : "read", size, addr, fmt::ptr(&gmmu), device.value_or(0));
+        LOG_ERROR(HW_GPU, "GPU {} of {} bytes at unbacked address {:#x} (gmmu {}, device {:#x}) in engine {:#x} method {:#x}",
+                  write ? "write" : "read", size, addr, fmt::ptr(&gmmu), device.value_or(0),
+                  Tegra::g_gpu_trace_engine, Tegra::g_gpu_trace_method);
     }
 }
 

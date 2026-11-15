@@ -11,4 +11,9 @@ namespace Tegra {
 // Ampere classes and the Turing+ macro ISA, which the Maxwell engines don't implement.
 inline std::atomic<bool> g_nx2_ampere{false};
 
+// Diagnostic: the engine and method the GPU thread is running (a failing GPU memory access names
+// them). Engine 0xffff is the channel's own puller.
+inline thread_local unsigned g_gpu_trace_engine{};
+inline thread_local unsigned g_gpu_trace_method{};
+
 } // namespace Tegra

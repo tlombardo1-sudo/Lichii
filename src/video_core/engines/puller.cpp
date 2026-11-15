@@ -196,6 +196,8 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
 /// Calls a GPU puller method.
 void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_call) {
     regs.reg_array[method_call.method] = method_call.argument;
+    g_gpu_trace_engine = 0xffff;
+    g_gpu_trace_method = method_call.method;
     const auto method = static_cast<BufferMethods>(method_call.method);
 
     switch (method) {
@@ -270,6 +272,8 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
 /// Calls a GPU engine method.
 void Puller::CallEngineMethod(DmaPusher& dma_pusher, const MethodCall& method_call) {
     const EngineID engine = bound_engines[method_call.subchannel];
+    g_gpu_trace_engine = static_cast<unsigned>(engine);
+    g_gpu_trace_method = method_call.method;
     switch (engine) {
     case EngineID::FERMI_TWOD_A:
         dma_pusher.channel_state.payload->fermi_2d.CallMethod(dma_pusher.system, method_call.method, method_call.argument, method_call.IsLastCall());
