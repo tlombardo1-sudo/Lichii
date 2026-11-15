@@ -127,6 +127,7 @@ private:
     void ProcessSemaphoreAcquire(DmaPusher& dma_pusher);
     void ProcessSemaphoreRelease(DmaPusher& dma_pusher);
     void ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher);
+    void ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument);
     [[nodiscard]] bool ExecuteMethodOnEngine(DmaPusher& dma_pusher, u32 method);
 
     /// Mapping of command subchannels to their bound engine ids

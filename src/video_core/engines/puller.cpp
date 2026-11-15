@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <atomic>
+
 #include "common/assert.h"
 #include "common/logging.h"
 #include "common/settings.h"
@@ -16,6 +18,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/engines/puller.h"
+#include "video_core/nx2.h"
 #include "video_core/gpu.h"
 #include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
@@ -103,7 +106,12 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
     if (op == GpuSemaphoreOperation::WriteLong) {
         const GPUVAddr sequence_address{regs.semaphore_address.SemaphoreAddress()};
         const u32 payload = regs.semaphore_sequence;
-        dma_pusher.rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, VideoCommon::QueryPropertiesFlags::HasTimeout, payload, 0);
+        // RELEASE_SIZE (bit 24) set means a 4-byte release without the timestamp; writing 16
+        // bytes there clobbers the words next to it (Switch 2 packs semaphores tightly).
+        const auto properties = g_nx2_ampere && (regs.semaphore_trigger & (1U << 24)) != 0
+                                    ? VideoCommon::QueryPropertiesFlags::IsAFence
+                                    : VideoCommon::QueryPropertiesFlags::HasTimeout;
+        dma_pusher.rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
     } else {
         do {
             const u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
@@ -152,6 +160,36 @@ void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
         // TODO(kemathe73) figure out how to do the acquire_timeout
         regs.acquire_mode = false;
         regs.acquire_source = false;
+    }
+}
+
+// Ampere SEM_EXECUTE (method 0x1B): operation in bits 2:0 on the semaphore at
+// SEM_ADDR_HI:SEM_ADDR_LO (methods 0x18/0x17) with payload SEM_PAYLOAD_LO (0x19).
+void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
+    const GPUVAddr address = (GPUVAddr{regs.reg_array[0x18] & 0x1FFFFFF} << 32) |
+                             (regs.reg_array[0x17] & ~3U);
+    const u32 payload = regs.reg_array[0x19];
+    const u32 operation = argument & 7;
+    if (operation == 1) { // RELEASE
+        dma_pusher.rasterizer->Query(address, VideoCommon::QueryType::Payload,
+                                     VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
+        return;
+    }
+    // Acquires: check once after flushing pending fences; never block the GPU thread on them.
+    dma_pusher.rasterizer->ReleaseFences();
+    const u32 word = dma_pusher.memory_manager.Read<u32>(address);
+    const bool ready = operation == 0   ? word == payload
+                       : operation == 2 ? word >= payload
+                       : operation == 3 ? static_cast<s32>(word - payload) >= 0
+                       : operation == 4 ? (word & payload) != 0
+                       : operation == 5 ? (word & payload) == 0
+                                        : true;
+    if (!ready) {
+        static std::atomic<u32> reported{};
+        if (reported.fetch_add(1) < 8) {
+            LOG_WARNING(HW_GPU, "SEM_EXECUTE op {} at {:#x}: {:#x} vs {:#x} not met, continuing",
+                        operation, address, word, payload);
+        }
     }
 }
 
@@ -204,11 +242,18 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
         break;
     }
     case BufferMethods::SemaphoreAcquire: {
-        ProcessSemaphoreAcquire(dma_pusher);
+        // On Ampere host classes 0x17..0x1A are SEM_ADDR_LO/HI and SEM_PAYLOAD_LO/HI.
+        if (!g_nx2_ampere) {
+            ProcessSemaphoreAcquire(dma_pusher);
+        }
         break;
     }
     case BufferMethods::SemaphoreRelease: {
-        ProcessSemaphoreRelease(dma_pusher);
+        if (g_nx2_ampere) {
+            ProcessSemaphoreExecute(dma_pusher, method_call.argument);
+        } else {
+            ProcessSemaphoreRelease(dma_pusher);
+        }
         break;
     }
     case BufferMethods::Yield: {
