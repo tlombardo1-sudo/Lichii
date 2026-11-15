@@ -191,6 +191,7 @@ public:
     [[nodiscard]] F32F64 FPRecip(const F32F64& value);
     [[nodiscard]] F32F64 FPRecipSqrt(const F32F64& value);
     [[nodiscard]] F32 FPSqrt(const F32& value);
+    [[nodiscard]] F32 FPTanh(const F32& value);
     [[nodiscard]] F16F32F64 FPSaturate(const F16F32F64& value);
     [[nodiscard]] F16F32F64 FPClamp(const F16F32F64& value, const F16F32F64& min_value,
                                     const F16F32F64& max_value);

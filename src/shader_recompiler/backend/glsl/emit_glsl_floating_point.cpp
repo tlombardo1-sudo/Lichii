@@ -165,6 +165,12 @@ void EmitFPRecipSqrt64([[maybe_unused]] EmitContext& ctx, [[maybe_unused]] IR::I
     NotImplemented();
 }
 
+void EmitFPTanh(EmitContext& ctx, IR::Inst& inst, std::string_view value) {
+    // GLSL's tanh may be computed from e^x and e^-x, which overflow to inf/inf = NaN for large
+    // inputs. MUFU.TANH (and the SPIR-V and GLASM versions) reach +-1 instead; NaN stays NaN.
+    ctx.AddF32("{}=abs({})>15.0?sign({}):tanh({});", inst, value, value, value);
+}
+
 void EmitFPSqrt(EmitContext& ctx, IR::Inst& inst, std::string_view value) {
     ctx.AddF32("{}=sqrt({});", inst, value);
 }

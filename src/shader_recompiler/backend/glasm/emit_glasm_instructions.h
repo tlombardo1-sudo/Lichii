@@ -248,6 +248,7 @@ void EmitFPRecip64(EmitContext& ctx, Register value);
 void EmitFPRecipSqrt32(EmitContext& ctx, IR::Inst& inst, ScalarF32 value);
 void EmitFPRecipSqrt64(EmitContext& ctx, Register value);
 void EmitFPSqrt(EmitContext& ctx, IR::Inst& inst, ScalarF32 value);
+void EmitFPTanh(EmitContext& ctx, IR::Inst& inst, ScalarF32 value);
 void EmitFPSaturate16(EmitContext& ctx, Register value);
 void EmitFPSaturate32(EmitContext& ctx, IR::Inst& inst, ScalarF32 value);
 void EmitFPSaturate64(EmitContext& ctx, Register value);

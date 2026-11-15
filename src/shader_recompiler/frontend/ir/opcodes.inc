@@ -226,6 +226,7 @@ OPCODE(FPRecip64,                                           F64,            F64,
 OPCODE(FPRecipSqrt32,                                       F32,            F32,                                                                            )
 OPCODE(FPRecipSqrt64,                                       F64,            F64,                                                                            )
 OPCODE(FPSqrt,                                              F32,            F32,                                                                            )
+OPCODE(FPTanh,                                              F32,            F32,                                                                            )
 OPCODE(FPSin,                                               F32,            F32,                                                                            )
 OPCODE(FPExp2,                                              F32,            F32,                                                                            )
 OPCODE(FPCos,                                               F32,            F32,                                                                            )

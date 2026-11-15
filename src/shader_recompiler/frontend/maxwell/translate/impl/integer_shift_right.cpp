@@ -42,9 +42,17 @@ void SHR(TranslatorVisitor& v, u64 insn, const IR::U32& shift) {
         const IR::U32 zero{v.ir.Imm32(0)};
         const IR::U32 safe_bits{v.ir.Imm32(32)};
 
-        const IR::U1 is_negative{v.ir.ILessThan(result, zero, true)};
         const IR::U1 is_safe{v.ir.ILessThan(shift, safe_bits, false)};
-        const IR::U32 clamped_value{v.ir.Select(is_negative, v.ir.Imm32(-1), zero)};
+        IR::U32 clamped_value;
+        if (v.env.HasNativeInstructions()) {
+            // Shifting by 32 or more leaves the sign of the base for an arithmetic shift.
+            clamped_value = shr.is_signed != 0
+                                ? IR::U32{v.ir.ShiftRightArithmetic(base, v.ir.Imm32(31))}
+                                : zero;
+        } else {
+            const IR::U1 is_negative{v.ir.ILessThan(result, zero, true)};
+            clamped_value = v.ir.Select(is_negative, v.ir.Imm32(-1), zero);
+        }
         result = IR::U32{v.ir.Select(is_safe, result, clamped_value)};
     }
     v.X(shr.dest_reg, result);

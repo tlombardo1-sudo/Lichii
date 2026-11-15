@@ -129,6 +129,7 @@ add_library(shader_recompiler STATIC
     frontend/maxwell/translate/impl/integer_floating_point_conversion.cpp
     frontend/maxwell/translate/impl/integer_funnel_shift.cpp
     frontend/maxwell/translate/impl/integer_minimum_maximum.cpp
+    frontend/maxwell/translate/impl/integer_byte_permute.cpp
     frontend/maxwell/translate/impl/integer_multiply_add.cpp
     frontend/maxwell/translate/impl/integer_popcount.cpp
     frontend/maxwell/translate/impl/integer_scaled_add.cpp

@@ -285,6 +285,7 @@ void EmitFPRecip64(EmitContext& ctx, IR::Inst& inst, std::string_view value);
 void EmitFPRecipSqrt32(EmitContext& ctx, IR::Inst& inst, std::string_view value);
 void EmitFPRecipSqrt64(EmitContext& ctx, IR::Inst& inst, std::string_view value);
 void EmitFPSqrt(EmitContext& ctx, IR::Inst& inst, std::string_view value);
+void EmitFPTanh(EmitContext& ctx, IR::Inst& inst, std::string_view value);
 void EmitFPSaturate16(EmitContext& ctx, IR::Inst& inst, std::string_view value);
 void EmitFPSaturate32(EmitContext& ctx, IR::Inst& inst, std::string_view value);
 void EmitFPSaturate64(EmitContext& ctx, IR::Inst& inst, std::string_view value);

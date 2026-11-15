@@ -884,6 +884,10 @@ F32F64 IREmitter::FPRecipSqrt(const F32F64& value) {
     }
 }
 
+F32 IREmitter::FPTanh(const F32& value) {
+    return Inst<F32>(Opcode::FPTanh, value);
+}
+
 F32 IREmitter::FPSqrt(const F32& value) {
     return Inst<F32>(Opcode::FPSqrt, value);
 }

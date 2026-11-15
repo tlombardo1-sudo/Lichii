@@ -147,6 +147,10 @@ void TranslateF2I(TranslatorVisitor& v, u64 insn, const IR::F16F32F64& src_a) {
     }()};
     const bool is_signed{f2i.is_signed != 0};
     const auto [max_bound, min_bound] = ClampBounds(f2i.dest_format, is_signed);
+    // Native (Switch 2) lowered programs: an unsigned 64-bit result of an F32 saturates just below
+    // 2^64 and takes NaN as the lowest value.
+    const bool unsigned_f32_i64{v.env.HasNativeInstructions() && f2i.dest_format == DestFormat::I64 &&
+                                f2i.src_format == SrcFormat::F32 && !is_signed};
 
     IR::F16F32F64 intermediate;
     switch (f2i.src_format) {
@@ -157,9 +161,14 @@ void TranslateF2I(TranslatorVisitor& v, u64 insn, const IR::F16F32F64& src_a) {
         break;
     }
     case SrcFormat::F32: {
-        const IR::F32 max_val{v.ir.Imm32(static_cast<f32>(max_bound))};
+        const IR::F32 max_val{
+            v.ir.Imm32(unsigned_f32_i64 ? 0x1.fffffep63f : static_cast<f32>(max_bound))};
         const IR::F32 min_val{v.ir.Imm32(static_cast<f32>(min_bound))};
-        intermediate = v.ir.FPClamp(rounded_value, min_val, max_val);
+        IR::F32 safe_value{rounded_value};
+        if (unsigned_f32_i64) {
+            safe_value = IR::F32{v.ir.Select(v.ir.FPIsNan(op_a), min_val, safe_value)};
+        }
+        intermediate = v.ir.FPClamp(safe_value, min_val, max_val);
         break;
     }
     case SrcFormat::F64: {
