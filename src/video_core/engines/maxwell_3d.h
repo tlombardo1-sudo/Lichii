@@ -3189,6 +3189,7 @@ public:
     }
     void SetNativeTuringMacroMode(bool enabled) {
         GetNativeMacroEngine().native_turing = enabled;
+        upload_state.SetNativePartialTransfers(enabled);
     }
     MacroEngine& GetNativeMacroEngine() {
         return native_macro_context ? native_macro_context->engine : macro_engine;

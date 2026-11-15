@@ -66,6 +66,9 @@ public:
     void ProcessData(u32 data, bool is_last_call);
     void ProcessData(const u32* data, size_t num_data);
 
+    /// Switch 2: single-line linear uploads are written out as their words arrive.
+    void SetNativePartialTransfers(bool enabled) { native_partial = enabled; }
+
     /// Binds a rasterizer to this engine.
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
@@ -81,6 +84,8 @@ private:
     void ProcessData(std::span<const u8> read_buffer);
 
     u32 write_offset = 0;
+    bool native_partial{};
+    u32 flushed_offset{};
     u32 copy_size = 0;
     Common::ScratchBuffer<u8> inner_buffer;
     Common::ScratchBuffer<u8> tmp_buffer;

@@ -7,14 +7,19 @@
 #pragma once
 
 #include <array>
+#include <bitset>
 #include <cstddef>
+#include <memory>
 #include <optional>
+#include <span>
 #include <vector>
 #include "common/bit_field.h"
 #include "common/common_funcs.h"
 #include "common/common_types.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/engine_upload.h"
+#include "video_core/macro.h"
+#include "video_core/native_qmd.h"
 #include "video_core/textures/texture.h"
 
 namespace Core {
@@ -211,6 +216,31 @@ public:
         return indirect_compute;
     }
 
+    /// Switch 2: the channel's MME data RAM, shared with its 3D engine.
+    void SetNativeDataRam(std::array<u32, 0xc00>* data_ram) {
+        native_data_ram = data_ram;
+    }
+    /// Switch 2: runs the compute class in its native (Ampere) form: Turing macros, native QMDs.
+    void SetNativeMacroMode(MacroEngine* shared_macro, std::span<u32> positions,
+                            NativeMacroContext* context = nullptr) {
+        native_context = context;
+        native_mode = shared_macro != nullptr;
+        upload_state.SetNativePartialTransfers(native_mode);
+        native_macro = shared_macro;
+        native_macro_positions = positions;
+        if (native_mode) {
+            execution_mask.set();
+        } else {
+            execution_mask.reset();
+            execution_mask[KEPLER_COMPUTE_REG_INDEX(exec_upload)] = true;
+            execution_mask[KEPLER_COMPUTE_REG_INDEX(data_upload)] = true;
+            execution_mask[KEPLER_COMPUTE_REG_INDEX(launch)] = true;
+        }
+    }
+    bool IsNativeMode() const {
+        return native_mode;
+    }
+
 private:
     void ProcessLaunch();
 
@@ -236,6 +266,25 @@ private:
     };
     std::vector<UploadInfo> uploads;
     std::optional<GPUVAddr> indirect_compute{};
+
+    // Switch 2 (Ampere) compute class.
+    bool ProcessNativeMethod(Core::System& system, u32 method, u32 argument, bool is_last_call);
+    bool DispatchNativeCompute(const NativeQmdScheduler::Descriptor& descriptor);
+    void ProcessNativeReportSemaphore(u32 argument);
+    NativeQmdScheduler native_qmd;
+    std::array<u32, 0xc00>* native_data_ram{};
+    bool native_mode{};
+    NativeMacroContext* native_context{};
+    bool native_compute_uploaded{};
+    MacroEngine* native_macro{};
+    std::array<u32, 0x1000> native_registers{};
+    /// Native methods that only store their value (no macro, QMD, upload, semaphore or code
+    /// side effect): CallMethod writes those directly.
+    std::bitset<0xe00> native_plain_methods;
+    std::span<u32> native_macro_positions;
+    std::vector<u32> native_parameters;
+    std::optional<u32> native_executing_macro;
+    u32 native_bind_pointer{};
 };
 
 #define ASSERT_REG_POSITION(field_name, position)                                                  \

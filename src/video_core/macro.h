@@ -273,6 +273,9 @@ struct MacroEngine {
 struct NativeMacroContext {
     MacroEngine engine{true};
     std::array<u32, 0x80> positions{};
+    /// Compute class macros (loaded after the compute class's own 0x45/0x47 writes).
+    MacroEngine compute_engine{true};
+    std::array<u32, 0x80> compute_positions{};
 };
 
 } // namespace Tegra

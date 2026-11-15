@@ -94,6 +94,7 @@ add_library(video_core STATIC
     macro.cpp
     macro.h
     macro_turing.h
+    native_qmd.h
     nx2.h
     fence_manager.h
     frame_trace.cpp

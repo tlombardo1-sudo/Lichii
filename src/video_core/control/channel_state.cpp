@@ -35,6 +35,7 @@ std::shared_ptr<NativeMacroContext> Nx2MacroContext() {
     static const auto context = [] {
         auto created = std::make_shared<NativeMacroContext>();
         created->engine.native_turing = true;
+        created->compute_engine.native_turing = true;
         return created;
     }();
     return context;
@@ -129,8 +130,12 @@ void ChannelState::Init(Core::System& system, u64 program_id_) {
         // KeplerMemory has the same LINE_LENGTH_IN/OFFSET_OUT/LAUNCH_DMA/LOAD_INLINE_DATA layout.
         payload->dma_pusher.BindSubchannel(&payload->kepler_memory, NvkM2mfSubchannel,
                                            Engines::EngineTypes::KeplerMemory);
-        payload->maxwell_3d.SetNativeMacroContext(Nx2MacroContext());
+        const auto macros = Nx2MacroContext();
+        payload->maxwell_3d.SetNativeMacroContext(macros);
         payload->maxwell_3d.SetNativeTuringMacroMode(true);
+        payload->kepler_compute.SetNativeMacroMode(&macros->engine, macros->positions,
+                                                   macros.get());
+        payload->kepler_compute.SetNativeDataRam(&payload->maxwell_3d.GetNativeDataRam());
     }
     initialized = true;
 }
