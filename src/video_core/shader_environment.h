@@ -22,6 +22,7 @@
 #include "common/polyfill_thread.h"
 #include "common/unique_function.h"
 #include "shader_recompiler/environment.h"
+#include "shader_recompiler/frontend/ampere/instruction.h"
 #include "video_core/engines/maxwell_3d.h"
 
 namespace Tegra {
@@ -29,6 +30,21 @@ class Memorymanager;
 }
 
 namespace VideoCommon {
+
+/// A native (Switch 2) program after capture and lowering to Maxwell code. The shader cache keeps
+/// it so the environments built for the program's pipelines don't capture and lower it again.
+struct LoweredNativeCode {
+    u64 native_program_key{};
+    /// Shader header, lowered instructions with Maxwell scheduling words, then the native
+    /// address map (what the environment's `code` used to be filled with).
+    std::vector<u64> code;
+    std::vector<Shader::Ampere::Instruction> trap_prefix;
+    /// Bytes of the native program that were read, header included.
+    size_t source_size{};
+    /// Constant buffer holding the texture handles if the program requires one, otherwise ~0U
+    /// (the engine's register value is used).
+    u32 texture_bound = ~0U;
+};
 
 class GenericEnvironment : public Shader::Environment {
 public:
@@ -48,6 +64,14 @@ public:
 
     [[nodiscard]] u64 ReadInstruction(u32 address) final;
 
+    [[nodiscard]] u32 TranslateProgramAddress(u32 address) const override;
+
+    [[nodiscard]] bool IsNativeProgram() const override;
+
+    [[nodiscard]] bool IsCbufStorageBufferPointer(u32 index, u32 offset) override;
+
+    [[nodiscard]] bool HasNativeInstructions() const override;
+
     [[nodiscard]] std::optional<u64> Analyze();
 
     void SetCachedSize(size_t size_bytes);
@@ -57,6 +81,15 @@ public:
     [[nodiscard]] size_t CachedSizeBytes() const noexcept;
 
     [[nodiscard]] size_t ReadSizeBytes() const noexcept;
+
+    /// Bytes read from the native program (header included); 0 for a Maxwell program.
+    [[nodiscard]] size_t SourceSizeBytes() const noexcept {
+        return native_source_size;
+    }
+
+    [[nodiscard]] const std::shared_ptr<const LoweredNativeCode>& LoweredNative() const noexcept {
+        return lowered_native;
+    }
 
     [[nodiscard]] bool CanBeSerialized() const noexcept;
 
@@ -80,6 +113,18 @@ public:
 
 protected:
     std::optional<u64> TryFindSize();
+    virtual std::optional<u32> ReadTrapGuardConstant(u32, u32) {
+        return std::nullopt;
+    }
+
+    /// Adopts an already lowered native program, or captures and lowers it when there is none.
+    void InitializeNativeCode(std::shared_ptr<const LoweredNativeCode> lowered,
+                              u32 source_header_size = 128, bool geometry_stage = false);
+    std::shared_ptr<const LoweredNativeCode> LowerNativeCode(u32 source_header_size,
+                                                             bool geometry_stage);
+    size_t native_source_size{};
+    std::shared_ptr<const LoweredNativeCode> lowered_native;
+    ::Common::unordered_map<u64, u8> storage_pointer_types; ///< IsCbufStorageBufferPointer answers
 
     std::optional<Tegra::Texture::TICEntry> ReadTextureInfo(GPUVAddr tic_addr, u32 tic_limit,
                                                             bool via_header_index, u32 raw);
@@ -117,7 +162,8 @@ public:
     explicit GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                                  Tegra::MemoryManager& gpu_memory_,
                                  Tegra::Engines::Maxwell3D::Regs::ShaderType program,
-                                 GPUVAddr program_base_, u32 start_address_);
+                                 GPUVAddr program_base_, u32 start_address_,
+                                 std::shared_ptr<const LoweredNativeCode> lowered_native_ = {});
 
     ~GraphicsEnvironment() override = default;
 
@@ -143,7 +189,8 @@ public:
     explicit ComputeEnvironment() = default;
     explicit ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_compute_,
                                 Tegra::MemoryManager& gpu_memory_, GPUVAddr program_base_,
-                                u32 start_address_);
+                                u32 start_address_,
+                                std::shared_ptr<const LoweredNativeCode> lowered_native_ = {});
 
     ~ComputeEnvironment() override = default;
 
@@ -163,8 +210,13 @@ public:
     }
 
 private:
+    std::optional<u32> ReadTrapGuardConstant(u32 bank, u32 offset) override;
     Tegra::Engines::KeplerCompute* kepler_compute{};
 };
+
+/// A 32-bit word of a compute dispatch's constant buffer, if that bank is bound and mapped.
+std::optional<u32> ReadNativeGuardConstant(Tegra::Engines::KeplerCompute& compute,
+                                           Tegra::MemoryManager& memory, u32 bank, u32 offset);
 
 class FileEnvironment final : public Shader::Environment {
 public:

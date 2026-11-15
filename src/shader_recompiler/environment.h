@@ -75,6 +75,18 @@ public:
 
     [[nodiscard]] virtual u64 ReadInstruction(u32 address) = 0;
 
+    /// Switch 2 native programs lowered to Maxwell instructions: maps a branch target of the
+    /// native program to its address in the lowered code. Maxwell programs keep the address.
+    [[nodiscard]] virtual u32 TranslateProgramAddress(u32 address) const { return address; }
+
+    /// A Switch 2 native program lowered to Maxwell instructions. Its storage buffer pointers are
+    /// raw 8-byte arguments in constant buffers, without the NVN descriptor layout.
+    [[nodiscard]] virtual bool IsNativeProgram() const { return false; }
+
+    /// Native programs: whether the 8-byte constant at (index, offset) is a mapped GPU address.
+    /// Native argument tables mix pointers with scalars (sizes, strides).
+    [[nodiscard]] virtual bool IsCbufStorageBufferPointer(u32, u32) { return true; }
+
     [[nodiscard]] virtual u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) = 0;
 
     [[nodiscard]] virtual TextureType ReadTextureType(u32 raw_handle) = 0;
@@ -94,6 +106,9 @@ public:
     [[nodiscard]] virtual std::array<u32, 3> WorkgroupSize() const = 0;
 
     [[nodiscard]] virtual bool HasHLEMacroState() const = 0;
+
+    /// The program holds instructions lowered from Switch 2 (native) code that Maxwell lacks.
+    [[nodiscard]] virtual bool HasNativeInstructions() const { return false; }
 
     [[nodiscard]] virtual std::optional<ReplaceConstant> GetReplaceConstBuffer(u32 bank,
                                                                                u32 offset) = 0;
