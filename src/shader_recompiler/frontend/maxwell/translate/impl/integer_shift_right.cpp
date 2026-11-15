@@ -51,7 +51,7 @@ void SHR(TranslatorVisitor& v, u64 insn, const IR::U32& shift) {
                                 : zero;
         } else {
             const IR::U1 is_negative{v.ir.ILessThan(result, zero, true)};
-            clamped_value = v.ir.Select(is_negative, v.ir.Imm32(-1), zero);
+            clamped_value = IR::U32{v.ir.Select(is_negative, v.ir.Imm32(-1), zero)};
         }
         result = IR::U32{v.ir.Select(is_safe, result, clamped_value)};
     }
