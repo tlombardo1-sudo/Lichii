@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -234,6 +235,16 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr addr, std::size_t s
     return std::nullopt;
 }
 
+// A guest GPU address no mapping backs: log which one (the first ones) rather than aborting.
+static void ReportUnmappedAccess(const MemoryManager& gmmu, GPUVAddr addr, size_t size, bool write) {
+    static std::atomic<u32> reported{};
+    if (reported.fetch_add(1) < 64) {
+        const auto device = gmmu.GpuToCpuAddress(addr);
+        LOG_ERROR(HW_GPU, "GPU {} of {} bytes at unbacked address {:#x} (gmmu {}, device {:#x})",
+                  write ? "write" : "read", size, addr, fmt::ptr(&gmmu), device.value_or(0));
+    }
+}
+
 template <typename T>
 T MemoryManager::Read(GPUVAddr addr) const {
     if constexpr (sizeof(T) == sizeof(u32)) {
@@ -252,7 +263,7 @@ T MemoryManager::Read(GPUVAddr addr) const {
         return value;
     }
 
-    ASSERT(false);
+    ReportUnmappedAccess(*this, addr, sizeof(T), false);
 
     return {};
 }
@@ -265,7 +276,7 @@ void MemoryManager::Write(GPUVAddr addr, T data) {
         return;
     }
 
-    ASSERT(false);
+    ReportUnmappedAccess(*this, addr, sizeof(T), true);
 }
 
 template u8 MemoryManager::Read<u8>(GPUVAddr addr) const;

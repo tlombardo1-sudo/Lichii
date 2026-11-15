@@ -163,8 +163,11 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
         nx2_device_ranges[{cpu_address, size}] = device_address;
     }
     gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
-    LOG_DEBUG(Service_NVDRV, "Switch 2 GPU mapping {:#x}+{:#x} -> CPU {:#x}", gpu_address, size,
-              cpu_address);
+    static u32 map_logs{};
+    if (map_logs++ < 48) {
+        LOG_INFO(Service_NVDRV, "Switch 2 GPU mapping {:#x}+{:#x} -> CPU {:#x} (device {:#x}, gmmu {})",
+                 gpu_address, size, cpu_address, device_address, fmt::ptr(gmmu.get()));
+    }
 }
 
 void nvhost_as_gpu::Nx2Unmap(u64 gpu_address, u64 size) {
