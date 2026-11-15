@@ -35,6 +35,24 @@ void Puller::ProcessBindMethod(DmaPusher& dma_pusher, const MethodCall& method_c
     if ((engine & ~Gf100BindClassMask) != 0 && (engine & ~Gf100BindValidMask) == 0) {
         engine &= Gf100BindClassMask;
     }
+    // Switch 2 binds Ampere classes; run them on the Maxwell engines (same method layout for most
+    // state). Switch 1 never binds these ids. Class 0 unbinds the subchannel.
+    switch (engine & 0xFFFF) {
+    case 0xC797: // AMPERE_B
+        engine = static_cast<u32>(EngineID::MAXWELL_B);
+        break;
+    case 0xC7C0: // AMPERE_COMPUTE_B
+        engine = static_cast<u32>(EngineID::KEPLER_COMPUTE_B);
+        break;
+    case 0xC7B5: // AMPERE_DMA_COPY_B
+        engine = static_cast<u32>(EngineID::MAXWELL_DMA_COPY_A);
+        break;
+    case 0x0:
+        LOG_DEBUG(HW_GPU, "Unbinding subchannel {}", method_call.subchannel);
+        return;
+    default:
+        break;
+    }
 
     const auto engine_id = static_cast<EngineID>(engine);
     bound_engines[method_call.subchannel] = engine_id;
