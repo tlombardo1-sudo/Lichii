@@ -314,7 +314,7 @@ jobs:
           name: lichii-test-package
           path: out/*
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 60
 
   symbolize:
     if: ${{ inputs.symbolize_run_id != '' }}
