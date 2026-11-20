@@ -352,7 +352,7 @@ jobs:
           out=""
           for o in ${{ inputs.symbolize_offsets }}; do
             o="${o#+}"; o="${o#0x}"
-            res="$("$SYM" --obj="$exe" --relative-address --inlining --demangle "$o" 2>&1 | head -6 | tr '\n' ' ')"
+            res="$("$SYM" --obj="$exe" --relative-address --inlining --demangle "0x$o" 2>&1 | head -6 | tr '\n' ' ')"
             line="$o => $res"
             echo "$line"
             echo "::notice title=frame::$line"
