@@ -267,6 +267,9 @@ jobs:
     if: ${{ !cancelled() && needs.build.result == 'success' }}
     runs-on: windows-2025
     timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: read
     steps:
       - uses: actions/checkout@v4
 
@@ -315,6 +318,19 @@ jobs:
           path: out/*
           if-no-files-found: error
           retention-days: 60
+
+      # The same files as a release, which downloads with one tap from a phone browser (artifact
+      # links need the Actions UI). Replaced on every build, so "latest-test" is always the newest.
+      - name: Publish test package as a release
+        if: ${{ github.event_name == 'push' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest-test --yes --cleanup-tag || true
+          gh release create latest-test out/* --prerelease --target "$GITHUB_SHA" \
+            --title "Latest test package" \
+            --notes "Built from $GITHUB_SHA. Install the .appx (and the .cer first if needed)."
 
   symbolize:
     if: ${{ inputs.symbolize_run_id != '' }}
