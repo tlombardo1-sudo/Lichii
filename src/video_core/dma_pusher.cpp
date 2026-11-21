@@ -50,6 +50,11 @@ bool DmaPusher::Step() {
         return false;
     }
 
+    // Suspended on a semaphore acquire: continue only once it is met.
+    if (puller.HasPendingAcquire() && !puller.ResumeAcquire(*this)) {
+        return false;
+    }
+
     CommandList& command_list = dma_pushbuffer.front();
 
     const size_t prefetch_size = command_list.prefetch_command_list.size();
@@ -62,7 +67,12 @@ bool DmaPusher::Step() {
     }
 
     if (prefetch_size > 0) {
-        ProcessCommands(command_list.prefetch_command_list);
+        const size_t done = ProcessCommands(command_list.prefetch_command_list, command_resume_offset);
+        if (done < command_list.prefetch_command_list.size() - command_resume_offset) {
+            command_resume_offset += done;
+            return false;
+        }
+        command_resume_offset = 0;
         dma_pushbuffer.pop();
         return true;
     }
@@ -78,6 +88,7 @@ bool DmaPusher::Step() {
         synced = false;
     }
 
+    size_t processed = 0;
     if (header.size > 0) {
         // dma_flush_filter=1: memory no cache ever held GPU writes for has nothing to flush, so
         // the safe read and the dirty check can skip the cache locks for it.
@@ -116,12 +127,18 @@ bool DmaPusher::Step() {
         }
         if (use_safe) {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
-            ProcessCommands(headers);
+            processed = ProcessCommands(headers, command_resume_offset);
         } else {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
-            ProcessCommands(headers);
+            processed = ProcessCommands(headers, command_resume_offset);
+        }
+        if (processed < header.size - command_resume_offset) {
+            // A semaphore acquire suspended the channel: resume this entry after it.
+            command_resume_offset += processed;
+            return false;
         }
     }
+    command_resume_offset = 0;
 
     if (++dma_pushbuffer_subindex >= command_list_size) {
         dma_pushbuffer.pop();
@@ -141,24 +158,34 @@ bool DmaPusher::Step() {
     return true;
 }
 
-void DmaPusher::ProcessCommands(std::span<const CommandHeader> commands) {
-    for (size_t index = 0; index < commands.size();) {
+size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset) {
+    commands = commands.subspan(std::min(word_offset, commands.size()));
+    size_t index = 0;
+    // A semaphore acquire may suspend the channel after any word; stop right after it.
+    const auto suspended = [this] { return puller.HasPendingAcquire(); };
+    for (; index < commands.size();) {
+        if (suspended()) {
+            return index;
+        }
         // Data word of methods command
         if (dma_state.method_count && dma_state.non_incrementing) {
             auto const& command_header = commands[index]; //must ref (MUltiMethod re)
-            dma_state.dma_word_offset = u32(index * sizeof(u32));
-            const u32 max_write = u32(std::min<std::size_t>(index + dma_state.method_count, commands.size()) - index);
+            dma_state.dma_word_offset = u32((index + word_offset) * sizeof(u32));
+            u32 max_write = u32(std::min<std::size_t>(index + dma_state.method_count, commands.size()) - index);
+            if (dma_state.method < non_puller_methods && max_write > 1) {
+                max_write = 1; // a puller method (semaphore acquire) may suspend the channel
+            }
             CallMultiMethod(&command_header.argument, max_write);
             dma_state.method_count -= max_write;
             dma_state.is_last_call = true;
             index += max_write;
         } else if (dma_state.method_count) {
-            if (const u32 words = CallConstBufferRun(commands.subspan(index), index); words != 0) {
+            if (const u32 words = CallConstBufferRun(commands.subspan(index), index + word_offset); words != 0) {
                 index += words;
                 continue;
             }
             auto const command_header = commands[index]; //can copy
-            dma_state.dma_word_offset = u32(index * sizeof(u32));
+            dma_state.dma_word_offset = u32((index + word_offset) * sizeof(u32));
             dma_state.is_last_call = dma_state.method_count <= 1;
             CallMethod(command_header.argument);
             dma_state.method += !dma_state.non_incrementing ? 1 : 0;
@@ -198,6 +225,7 @@ void DmaPusher::ProcessCommands(std::span<const CommandHeader> commands) {
             index++;
         }
     }
+    return index;
 }
 
 namespace {
@@ -283,7 +311,7 @@ u32 DmaPusher::CallConstBufferRun(std::span<const CommandHeader> pending, size_t
     VideoCore::Perf::AddDetailed(VideoCore::Perf::Counter::DmaMaxwellCalls, 1);
     VideoCore::Perf::AddDetailed(VideoCore::Perf::Counter::ConstBufferRuns, 1);
     VideoCore::Perf::AddDetailed(VideoCore::Perf::Counter::ConstBufferRunWords, words);
-    dma_state.dma_word_offset = u32(index * sizeof(u32));
+    dma_state.dma_word_offset = u32((index + word_offset) * sizeof(u32));
     maxwell->ConsumeSink(system);
     maxwell->current_dma_segment = dma_state.dma_get + dma_state.dma_word_offset;
     maxwell->StoreConstBufferRun(dma_state.method, &pending[0].argument, words,

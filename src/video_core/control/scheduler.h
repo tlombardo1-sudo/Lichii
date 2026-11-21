@@ -6,7 +6,9 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
+#include <vector>
 #include <mutex>
 #include "common/container/unordered_map.h"
 
@@ -26,9 +28,20 @@ public:
 
     void DeclareChannel(std::shared_ptr<ChannelState> new_channel);
 
+    /// Runs channels suspended on a semaphore acquire whose value has been met.
+    void ResumePending(GPU& gpu);
+    [[nodiscard]] bool HasPendingChannels() const {
+        return any_pending.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] bool HasPendingChannelsAnyThread() const {
+        return HasPendingChannels();
+    }
+
 private:
     ::Common::unordered_map<s32, std::shared_ptr<ChannelState>> channels;
     std::mutex scheduling_guard;
+    std::vector<std::shared_ptr<ChannelState>> pending_channels; ///< GPU thread only
+    std::atomic<bool> any_pending{false};
 };
 
 } // namespace Control

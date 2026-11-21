@@ -7,6 +7,8 @@
 #pragma once
 
 #include <array>
+#include <chrono>
+#include <optional>
 #include <cstddef>
 #include <vector>
 #include "common/bit_field.h"
@@ -125,6 +127,26 @@ private:
     void ProcessBindMethod(DmaPusher& dma_pusher, const MethodCall& method_call);
     void ProcessFenceActionMethod(DmaPusher& dma_pusher);
     void ProcessSemaphoreAcquire(DmaPusher& dma_pusher);
+
+public:
+    /// Switch 2: a semaphore acquire this channel is suspended on.
+    struct PendingAcquire {
+        GPUVAddr address;
+        u32 value;
+        u32 operation; ///< Ampere SEM_EXECUTE operation (bits 2:0)
+        std::chrono::steady_clock::time_point since;
+        bool reported;
+        [[nodiscard]] bool Matches(u32 current) const;
+    };
+    [[nodiscard]] bool HasPendingAcquire() const {
+        return pending_acquire.has_value();
+    }
+    [[nodiscard]] bool CanResumeAcquire(DmaPusher& dma_pusher);
+    /// Clears the pending acquire once it is met; false while the channel has to keep waiting.
+    bool ResumeAcquire(DmaPusher& dma_pusher);
+
+private:
+    std::optional<PendingAcquire> pending_acquire;
     void ProcessSemaphoreRelease(DmaPusher& dma_pusher);
     void ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher);
     void ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument);

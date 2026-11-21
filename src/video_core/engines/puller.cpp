@@ -175,22 +175,67 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
                                      VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
         return;
     }
-    // Acquires: check once after flushing pending fences; never block the GPU thread on them.
-    dma_pusher.rasterizer->ReleaseFences();
-    const u32 word = dma_pusher.memory_manager.Read<u32>(address);
-    const bool ready = operation == 0   ? word == payload
-                       : operation == 2 ? word >= payload
-                       : operation == 3 ? static_cast<s32>(word - payload) >= 0
-                       : operation == 4 ? (word & payload) != 0
-                       : operation == 5 ? (word & payload) == 0
-                                        : true;
-    if (!ready) {
-        static std::atomic<u32> reported{};
-        if (reported.fetch_add(1) < 8) {
-            LOG_WARNING(HW_GPU, "SEM_EXECUTE op {} at {:#x}: {:#x} vs {:#x} not met, continuing",
-                        operation, address, word, payload);
-        }
+    // Acquire. The CPU (or another channel) releases the semaphore once it has written the
+    // commands this channel runs next: suspend the channel until it is met instead of reading
+    // ahead into stale commands.
+    PendingAcquire acquire{
+        .address = address,
+        .value = payload,
+        .operation = operation,
+        .since = std::chrono::steady_clock::now(),
+        .reported = false,
+    };
+    if (acquire.Matches(dma_pusher.memory_manager.Read<u32>(address))) {
+        return;
     }
+    dma_pusher.rasterizer->ReleaseFences();
+    if (!acquire.Matches(dma_pusher.memory_manager.Read<u32>(address))) {
+        pending_acquire = acquire;
+    }
+}
+
+bool Puller::PendingAcquire::Matches(u32 current) const {
+    switch (operation) {
+    case 0: // ACQUIRE
+        return current == value;
+    case 2: // ACQ_STRICT_GEQ
+        return current >= value;
+    case 3: // ACQ_CIRC_GEQ
+        return static_cast<s32>(current - value) >= 0;
+    case 4: // ACQ_AND
+        return (current & value) != 0;
+    case 5: // ACQ_NOR
+        return (current & value) == 0;
+    default:
+        return true;
+    }
+}
+
+bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
+    if (!pending_acquire) {
+        return true;
+    }
+    dma_pusher.rasterizer->ReleaseFences();
+    const u32 current = dma_pusher.memory_manager.Read<u32>(pending_acquire->address);
+    if (pending_acquire->Matches(current)) {
+        return true;
+    }
+    if (!pending_acquire->reported &&
+        std::chrono::steady_clock::now() - pending_acquire->since > std::chrono::seconds{2}) {
+        pending_acquire->reported = true;
+        LOG_WARNING(HW_GPU, "Channel {} waits on semaphore {:#x} (op {}, want {:#x}, now {:#x}) for 2 s",
+                    dma_pusher.channel_state.bind_id, pending_acquire->address,
+                    pending_acquire->operation, pending_acquire->value, current);
+    }
+    return false;
+}
+
+bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
+    if (!CanResumeAcquire(dma_pusher)) {
+        return false;
+    }
+    pending_acquire.reset();
+    return true;
 }
 
 /// Calls a GPU puller method.

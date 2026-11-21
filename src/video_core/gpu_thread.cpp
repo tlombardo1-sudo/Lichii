@@ -60,9 +60,25 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer,
 
         auto current_context = context.Acquire();
         CommandDataContainer next;
+        auto last_progress = std::chrono::steady_clock::now();
         bool failed = false;
         while (!stop_token.stop_requested()) {
-            {
+            if (scheduler.HasPendingChannels()) {
+                // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.
+                if (!failed) {
+                    scheduler.ResumePending(system.GPU());
+                }
+                if (!state.queue.TryPop(next)) {
+                    if (std::chrono::steady_clock::now() - last_progress <
+                        std::chrono::microseconds{500}) {
+                        std::this_thread::yield();
+                    } else {
+                        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+                    }
+                    continue;
+                }
+                last_progress = std::chrono::steady_clock::now();
+            } else {
                 // Time with nothing to do: the guest CPU has not produced the next work yet.
                 const auto idle_start = std::chrono::steady_clock::now();
                 VideoCore::Perf::ScopedTimer idle{VideoCore::Perf::Counter::GpuThreadIdleUs};

@@ -132,6 +132,14 @@ public:
 
     void DispatchCalls();
 
+    /// Switch 2: true while the channel is suspended on a semaphore acquire.
+    [[nodiscard]] bool HasPendingAcquire() const {
+        return puller.HasPendingAcquire();
+    }
+    [[nodiscard]] bool CanResumeAcquire() {
+        return puller.CanResumeAcquire(*this);
+    }
+
     void BindSubchannel(Engines::EngineInterface* engine, u32 subchannel_id, Engines::EngineTypes engine_type) {
         subchannels[subchannel_id] = engine;
         subchannel_type[subchannel_id] = engine_type;
@@ -143,7 +151,10 @@ private:
     static constexpr u32 non_puller_methods = 0x40;
     static constexpr u32 max_subchannels = 8;
     bool Step();
-    void ProcessCommands(std::span<const CommandHeader> commands);
+    /// Returns how many words were processed: fewer than given when a semaphore acquire
+    /// suspended the channel.
+    size_t ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset = 0);
+    size_t command_resume_offset{}; ///< Words of the current entry done before a suspension
 
     void SetState(const CommandHeader& command_header);
 
