@@ -352,7 +352,7 @@ jobs:
           out=""
           for o in ${{ inputs.symbolize_offsets }}; do
             o="${o#+}"; o="${o#0x}"
-            res="$("$SYM" --obj="$exe" --relative-address --inlining --demangle "0x$o" 2>&1 | head -6 | tr '\n' ' ')"
+            res="$("$SYM" --obj="$exe" --relative-address --inlining --demangle "0x$o" 2>&1 | head -14 | tr '\n' ' ')"
             line="$o => $res"
             echo "$line"
             echo "::notice title=frame::$line"
@@ -364,9 +364,9 @@ jobs:
           echo "image base: $base"
           n=0
           for o in ${{ inputs.symbolize_offsets }}; do
-            n=$((n+1)); [ $n -gt 2 ] && break
+            n=$((n+1)); [ $n -gt 3 ] && break
             o="${o#+}"; o="${o#0x}"
-            start=$(printf '0x%x' $(( 0x$base + 0x$o - 0x70 )))
+            start=$(printf '0x%x' $(( 0x$base + 0x$o - 0xd0 )))
             stop=$(printf '0x%x' $(( 0x$base + 0x$o + 0x10 )))
             dis="$("$OBJDUMP" -d --no-show-raw-insn -C --start-address=$start --stop-address=$stop "$exe" 2>&1 | tail -n +4 | tr '\n' '|')"
             echo "::notice title=disasm $o::$dis"
