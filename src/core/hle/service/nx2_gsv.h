@@ -160,7 +160,7 @@ private:
         const u32 syncpoint = ~cmd_buf[3];
         const u64 value = u64{cmd_buf[4]} | (u64{cmd_buf[5]} << 32);
         const u32 mode = cmd_buf[6];
-        LOG_DEBUG(Service, "nx2:syncpt TIPC 201 slot={:#x} syncpoint={} value={:#x} mode={}", slot,
+        LOG_INFO(Service, "nx2:syncpt TIPC 201 slot={:#x} syncpoint={} value={:#x} mode={}", slot,
                   syncpoint, value, mode);
         auto*& event = m_events[slot];
         if (event == nullptr) {
@@ -1099,7 +1099,32 @@ private:
         if (acked) {
             m_syncpt_events[1]->Signal(system.Kernel());
         }
+        // Diagnostics: which syncpoints are armed and what the host values are (first 40 acks,
+        // then once per ~5 s while anything stays armed).
+        bool any_armed = false;
+        for (u32 w = 0; w < words; ++w) {
+            any_armed |= armed[w] != 0;
+        }
+        ++m_syncpt_poll_count;
+        const bool periodic = any_armed && (m_syncpt_poll_count % 10000) == 0;
+        if ((acked && m_syncpt_ack_logs < 40) || periodic) {
+            if (acked) {
+                ++m_syncpt_ack_logs;
+            }
+            auto& manager = system.Host1x().GetSyncpointManager();
+            std::string ids;
+            for (u32 id = 0; id < std::min(m_syncpt_count, HostSyncpoints); ++id) {
+                if (manager.GetGuestSyncpointValue(id) != 0) {
+                    ids += fmt::format(" {}={:#x}", id, manager.GetGuestSyncpointValue(id));
+                }
+            }
+            LOG_INFO(Service,
+                     "nx2:gsv syncpt poll: acked={} armed words {:#x} {:#x} {:#x}, nonzero values:{}",
+                     acked, armed[0], armed[1], armed[2], ids);
+        }
     }
+    u64 m_syncpt_poll_count{};
+    u32 m_syncpt_ack_logs{};
 
     void OpenGpuSession(HLERequestContext& ctx) {
         // Used by nn::gpu::sdk::BootWithRemoteMemory; takes one u64, returns a session (handle at
