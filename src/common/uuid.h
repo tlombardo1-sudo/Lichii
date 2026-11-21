@@ -12,6 +12,7 @@
 #include <string>
 #include <type_traits>
 
+#include <bit>
 #include "common/common_types.h"
 
 namespace Common {
@@ -44,7 +45,10 @@ struct UUID {
      * @returns True if the stored UUID is valid, false otherwise.
      */
     constexpr bool IsValid() const {
-        return uuid != std::array<u8, 0x10>{};
+        // Two 64-bit halves (alignment-1 loads); avoids an aligned 16-byte vector load being
+        // generated for the byte array, which faulted at startup on Xbox.
+        const auto halves = std::bit_cast<std::array<u64, 2>>(uuid);
+        return (halves[0] | halves[1]) != 0;
     }
 
     /**
