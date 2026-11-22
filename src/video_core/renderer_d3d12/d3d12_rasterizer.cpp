@@ -18,6 +18,7 @@
 #include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "video_core/nx2.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/kepler_compute.h"
@@ -978,6 +979,13 @@ void RasterizerD3D12::QueryFallback(GPUVAddr address, VideoCommon::QueryType typ
             memory->Write<u64>(address, payload);
         } else {
             memory->Write<u32>(address, payload);
+        }
+        if (Tegra::g_nx2_ampere) {
+            static std::atomic<u32> traced{};
+            if (traced.fetch_add(1) < 60) {
+                LOG_INFO(Render, "NX2 query fence done: addr {:#x} payload {:#x} (readback {:#x})",
+                         address, payload, memory->Read<u32>(address));
+            }
         }
     };
     if (True(flags & VideoCommon::QueryPropertiesFlags::IsAFence)) {
