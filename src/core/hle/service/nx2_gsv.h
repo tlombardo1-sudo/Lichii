@@ -20,6 +20,8 @@
 #include "core/core_timing.h"
 #include "video_core/host1x/host1x.h"
 #include "core/hle/kernel/k_event.h"
+#include "core/hle/kernel/k_hardware_timer.h"
+#include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/kernel/k_transfer_memory.h"
