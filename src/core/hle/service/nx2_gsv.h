@@ -739,9 +739,9 @@ private:
         if (now < pacing.deadline) {
             const auto wait =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(pacing.deadline - now);
-            auto& kernel = system.Kernel();
-            static_cast<void>(Kernel::GetCurrentThread(kernel).Sleep(
-                kernel, kernel.HardwareTimer().GetTick() + wait.count() + 2));
+            auto& kern = system.Kernel();
+            static_cast<void>(Kernel::GetCurrentThread(kern).Sleep(
+                kern, kern.HardwareTimer().GetTick() + wait.count() + 2));
         }
     }
 
