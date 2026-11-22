@@ -539,6 +539,7 @@ public:
             {105, &INx2Vi2Session::QueryDisplayHdrPaperWhite, "QueryDisplayHdrPaperWhite"},
             {212, &INx2Vi2Session::GetLayerBufferBits, "GetLayerBufferBits"},
             {228, &INx2Vi2Session::CancelClientBuffer, "CancelClientBuffer"},
+            {229, &INx2Vi2Session::PresentClientBuffer, "PresentClientBuffer"},
         });
     }
 
@@ -650,6 +651,19 @@ private:
         constexpr u64 AvailableSlots = 0x7fff;
         TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots), static_cast<u32>(AvailableSlots >> 32)});
     }
+    // 229: result, u64 mask of buffer slots the client may acquire next, four zero words. An
+    // empty reply left the guest with no free buffers. Every slot is handed back at once.
+    void PresentClientBuffer(HLERequestContext& ctx) {
+        ++m_presents;
+        if (m_presents <= 4 || (m_presents % 600) == 0) {
+            LOG_INFO(Service, "nx2:vi2 229 present #{}", m_presents);
+        }
+        constexpr u64 AvailableSlots = 0x7fff;
+        TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots),
+                             static_cast<u32>(AvailableSlots >> 32), 0, 0, 0, 0});
+    }
+    u32 m_presents{};
+
     void CancelClientBuffer(HLERequestContext& ctx) {
         constexpr u64 AvailableSlots = 0x7fff;
         TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots),
