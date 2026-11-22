@@ -426,11 +426,25 @@ void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument
     // Methods after 0xE00 are special, they're actually triggers for some microcode that was
     // uploaded to the GPU during initialization.
     if (method >= MacroRegistersStart) {
+        if (g_nx2_ampere) {
+            static std::atomic<u32> traced{};
+            if (traced.fetch_add(1) < 60) {
+                LOG_INFO(HW_GPU, "NX2 3D macro trigger {:#x} arg {:#x} last {}", method, method_argument,
+                         is_last_call);
+            }
+        }
         ProcessMacro(system, method, &method_argument, 1, is_last_call);
         return;
     }
 
     ASSERT(method < Regs::NUM_REGS && "Invalid Maxwell3D register, increase the size of the Regs structure");
+    if (g_nx2_ampere && method >= 0x6c0 && method <= 0x6c4) {
+        static std::atomic<u32> traced{};
+        if (traced.fetch_add(1) < 60) {
+            LOG_INFO(HW_GPU, "NX2 3D report reg {:#x} <- {:#x} (macro {:#x})", method, method_argument,
+                     executing_macro);
+        }
+    }
     const u32 argument = ProcessShadowRam(method, method_argument);
     ProcessDirtyRegisters(method, argument);
     ProcessMethodCall(method, argument, method_argument, is_last_call);
