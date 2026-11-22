@@ -547,6 +547,33 @@ public:
             {212, &INx2Vi2Session::GetLayerBufferBits, "GetLayerBufferBits"},
             {228, &INx2Vi2Session::CancelClientBuffer, "CancelClientBuffer"},
             {229, &INx2Vi2Session::PresentClientBuffer, "PresentClientBuffer"},
+            {106, &INx2Vi2Session::GetBufferMaxResolution, "GetBufferMaxResolution"},
+            // Firmware commands without a known meaning: zeroed replies.
+            {13, &INx2Vi2Session::StubReplyZeroed, "Unknown13"},
+            {51, &INx2Vi2Session::StubReplyZeroed, "Unknown51"},
+            {101, &INx2Vi2Session::StubReplyZeroed, "Unknown101"},
+            {102, &INx2Vi2Session::StubReplyZeroed, "Unknown102"},
+            {107, &INx2Vi2Session::StubReplyZeroed, "Unknown107"},
+            {108, &INx2Vi2Session::StubReplyZeroed, "Unknown108"},
+            {111, &INx2Vi2Session::StubReplyZeroed, "Unknown111"},
+            {112, &INx2Vi2Session::StubReplyZeroed, "Unknown112"},
+            {113, &INx2Vi2Session::StubReplyZeroed, "Unknown113"},
+            {202, &INx2Vi2Session::StubReplyZeroed, "Unknown202"},
+            {230, &INx2Vi2Session::StubReplyZeroed, "Unknown230"},
+            {231, &INx2Vi2Session::StubReplyZeroed, "Unknown231"},
+            {232, &INx2Vi2Session::StubReplyZeroed, "Unknown232"},
+            {251, &INx2Vi2Session::StubReplyZeroed, "Unknown251"},
+            {252, &INx2Vi2Session::StubReplyZeroed, "Unknown252"},
+            {301, &INx2Vi2Session::StubReplyZeroed, "Unknown301"},
+            {302, &INx2Vi2Session::StubReplyZeroed, "Unknown302"},
+            {351, &INx2Vi2Session::StubReplyZeroed, "Unknown351"},
+            {352, &INx2Vi2Session::StubReplyZeroed, "Unknown352"},
+            {353, &INx2Vi2Session::StubReplyZeroed, "Unknown353"},
+            {354, &INx2Vi2Session::StubReplyZeroed, "Unknown354"},
+            {355, &INx2Vi2Session::StubReplyZeroed, "Unknown355"},
+            {356, &INx2Vi2Session::StubReplyZeroed, "Unknown356"},
+            {358, &INx2Vi2Session::StubReplyZeroed, "Unknown358"},
+            {359, &INx2Vi2Session::StubReplyZeroed, "Unknown359"},
         });
     }
 
@@ -762,6 +789,26 @@ private:
                         syncpoints.GetGuestSyncpointValue(fence_id));
         }
         return syncpoints.IsReadyGuest(fence_id, fence_value);
+    }
+
+    // 106(u64 display name): result, u64 max resolution mode.
+    void GetBufferMaxResolution(HLERequestContext& ctx) {
+        const auto* packet = ctx.CommandBuffer();
+        const u64 name = u64{packet[2]} | (u64{packet[3]} << 32);
+        constexpr u64 DefaultDisplay = 0x00746c7561666564ULL; // "default"
+        Result result = Kernel::ResultInvalidCombination;
+        u64 mode{};
+        if (packet[0] == 0x7a && packet[1] == 2) {
+            result = Result{ErrorModule::VI, 7};
+            if (name == DefaultDisplay) {
+                static const char* forced = std::getenv("EDEN_VI2_MAX_RESOLUTION_MODE");
+                mode = forced ? std::strtoull(forced, nullptr, 0) : Settings::IsDockedMode() ? 4 : 2;
+                result = ResultSuccess;
+            }
+        }
+        IPC::ResponseBuilder rb{ctx, 4};
+        rb.Push(result.raw);
+        rb.Push(mode);
     }
 
     void CancelClientBuffer(HLERequestContext& ctx) {
