@@ -584,7 +584,7 @@ HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
     const auto reason = TranslateHaltReason(m_jit->Run());
     // Every 5 s the svc counter bumps the epoch: log where each thread that is preempted while
     // running guest code (not blocked in an svc) is, to find user-mode spin loops.
-    static thread_local std::map<u32, u32> last_epoch;
+    static thread_local std::map<u64, u32> last_epoch;
     const u32 epoch = g_nx2_thread_dump_epoch.load(std::memory_order_relaxed);
     auto& seen = last_epoch[thread->GetThreadId()];
     if (epoch != 0 && epoch != seen && epoch <= 4 && thread->GetOwnerProcess() != nullptr &&
