@@ -1085,7 +1085,7 @@ private:
         for (u32 w = 0; w < words; ++w) {
             armed[w] = m_syncpt_memory->Read64(m_syncpt_rw + SyncptRwBitsOffset + w * 8);
         }
-        UpdateSyncptValues();
+        const bool values_changed = UpdateSyncptValues();
         bool acked = false;
         for (u32 w = 0; w < words; ++w) {
             const u64 ro_address = m_syncpt_ro + SyncptRoBitsOffset + w * 8;
@@ -1096,7 +1096,13 @@ private:
         }
         m_syncpt_memory->Write64(m_syncpt_ro + SyncptRoSummaryOffset,
                                  m_syncpt_memory->Read64(m_syncpt_rw + SyncptRwSummaryOffset));
-        if (acked) {
+        // A syncpoint advancing after the client armed its wait must wake the client too, or
+        // the wait is lost: it only rechecks the value page when notified.
+        bool any_armed_now = false;
+        for (u32 w = 0; w < words; ++w) {
+            any_armed_now |= armed[w] != 0;
+        }
+        if (acked || (values_changed && any_armed_now)) {
             m_syncpt_events[1]->Signal(system.Kernel());
         }
         // Diagnostics: which syncpoints are armed and what the host values are (first 40 acks,
