@@ -311,7 +311,7 @@ u32 DmaPusher::CallConstBufferRun(std::span<const CommandHeader> pending, size_t
     VideoCore::Perf::AddDetailed(VideoCore::Perf::Counter::DmaMaxwellCalls, 1);
     VideoCore::Perf::AddDetailed(VideoCore::Perf::Counter::ConstBufferRuns, 1);
     VideoCore::Perf::AddDetailed(VideoCore::Perf::Counter::ConstBufferRunWords, words);
-    dma_state.dma_word_offset = u32((index + word_offset) * sizeof(u32));
+    dma_state.dma_word_offset = u32(index * sizeof(u32));
     maxwell->ConsumeSink(system);
     maxwell->current_dma_segment = dma_state.dma_get + dma_state.dma_word_offset;
     maxwell->StoreConstBufferRun(dma_state.method, &pending[0].argument, words,
