@@ -244,6 +244,15 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
     g_gpu_trace_engine = 0xffff;
     g_gpu_trace_method = method_call.method;
     const auto method = static_cast<BufferMethods>(method_call.method);
+    if (g_nx2_ampere) {
+        static std::atomic<u32> traced{};
+        if (traced.fetch_add(1) < 400) {
+            LOG_INFO(HW_GPU, "NX2 puller ch{} method {:#x} arg {:#x} sub {} (sem addr {:#x}:{:#x} payload {:#x})",
+                     dma_pusher.channel_state.bind_id, method_call.method, method_call.argument,
+                     method_call.subchannel, regs.reg_array[0x18], regs.reg_array[0x17],
+                     regs.reg_array[0x19]);
+        }
+    }
 
     switch (method) {
     case BufferMethods::BindObject: {

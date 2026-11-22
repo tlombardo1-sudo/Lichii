@@ -4,14 +4,18 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <optional>
 
+#include "common/logging.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/engines/const_buffer_run.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/control/channel_state.h"
 #include "video_core/gpu.h"
+#include "video_core/nx2.h"
 #include "video_core/gpu_written_pages.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
@@ -89,6 +93,14 @@ bool DmaPusher::Step() {
     }
 
     size_t processed = 0;
+    if (g_nx2_ampere && command_resume_offset == 0) {
+        static std::atomic<u32> traced{};
+        if (traced.fetch_add(1) < 120) {
+            LOG_INFO(HW_GPU, "NX2 pusher ch{} entry {:#x} size {} raw {:#x} (method {:#x} count {} pending)",
+                     channel_state.bind_id, u64{header.addr}, u64{header.size}, header.raw,
+                     dma_state.method, dma_state.method_count);
+        }
+    }
     if (header.size > 0) {
         // dma_flush_filter=1: memory no cache ever held GPU writes for has nothing to flush, so
         // the safe read and the dirty check can skip the cache locks for it.
