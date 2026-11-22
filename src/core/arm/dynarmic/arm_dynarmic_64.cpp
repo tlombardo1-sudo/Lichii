@@ -260,6 +260,23 @@ void DynarmicCallbacks64::LogWaitStack(u32 svc) {
         }
     };
     dump_code(gpr[30] - 0x40, 24);
+    if (svc == 0x0b) {
+        // The functions the spin loop calls: follow the BL instructions just around the return address.
+        u32 followed = 0;
+        for (u64 pc = gpr[30] - 0x40; pc < gpr[30] + 0x10 && followed < 4; pc += 4) {
+            if (m_memory.GetPointerSilent(pc) == nullptr) {
+                break;
+            }
+            const u32 insn = m_memory.Read32(pc);
+            if ((insn & 0xfc000000) == 0x94000000) {
+                const s64 imm = (static_cast<s64>(insn & 0x03ffffff) << 38) >> 36;
+                const u64 target = pc + imm;
+                LOG_INFO(Core_ARM, "CODE callee of {:#x}", pc);
+                dump_code(target, 40);
+                ++followed;
+            }
+        }
+    }
     u64 fp = gpr[29];
     for (int frame = 0; frame < 10 && fp >= 0x10000 && m_memory.GetPointerSilent(fp) != nullptr; ++frame) {
         const u64 ret = m_memory.Read64(fp + 8);
