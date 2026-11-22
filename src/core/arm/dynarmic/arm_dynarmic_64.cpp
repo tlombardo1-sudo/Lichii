@@ -7,6 +7,7 @@
 #include <mutex>
 #include <set>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 
 #include "common/host_memory.h"
@@ -216,16 +217,34 @@ void DynarmicCallbacks64::LogWaitStack(u32 svc) {
     static std::mutex dump_mutex;
     static std::set<std::pair<u32, u64>> seen_wait;
     if ((svc != 0x1c && svc != 0x18 && svc != 0x43 && svc != 0x44 && svc != 0x0b && svc != 0x1f) ||
-        !m_process->IsSwitch2() || dumps.load() >= 40) {
+        !m_process->IsSwitch2() || dumps.load() >= 120) {
         return;
     }
     const auto& jit = *m_parent.m_jit;
     std::scoped_lock lk{dump_mutex};
-    if (!seen_wait.insert({svc, jit.GetRegisters()[30]}).second) {
+    // A spin-yield loop (svc 0xb) is dumped again every ~8 s, to see which words change.
+    static const auto start_time = std::chrono::steady_clock::now();
+    const u64 bucket = svc == 0x0b ? static_cast<u64>((std::chrono::steady_clock::now() - start_time) /
+                                                      std::chrono::seconds{8}) << 40
+                                   : 0;
+    if (!seen_wait.insert({svc, jit.GetRegisters()[30] ^ bucket ^
+                                    (u64{Kernel::GetCurrentThread(m_parent.m_system.Kernel()).GetThreadId()} << 48)}).second) {
         return;
     }
     ++dumps;
     const auto gpr = jit.GetRegisters();
+    if (svc == 0x0b) {
+        for (u32 r = 19; r <= 28; ++r) {
+            const u64 value = gpr[r];
+            std::string words;
+            if (value >= 0x10000 && m_memory.GetPointerSilent(value) != nullptr) {
+                for (u32 w = 0; w < 12; ++w) {
+                    words += fmt::format(" {:08x}", m_memory.Read32(value + w * 4));
+                }
+            }
+            LOG_INFO(Core_ARM, "SPIN x{}={:#x} mem:{}", r, value, words);
+        }
+    }
     LOG_INFO(Core_ARM, "WAITSTACK svc {:#x} thread {} x0={:#x} x1={:#x} x2={:#x} x3={:#x} lr={:#x} sp={:#x} fp={:#x}",
              svc, Kernel::GetCurrentThread(m_parent.m_system.Kernel()).GetThreadId(), gpr[0], gpr[1], gpr[2], gpr[3], gpr[30], jit.GetSP(), gpr[29]);
     const auto dump_code = [&](u64 start, u32 words) {
