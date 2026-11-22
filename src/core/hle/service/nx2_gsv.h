@@ -31,6 +31,11 @@
 #include "core/hle/service/nvdrv/nvdrv.h"
 #include "core/hle/service/nvdrv/nvdrv_interface.h"
 #include "core/hle/service/nx2_image_layout.h"
+#include "core/hle/service/nx2_present_pacer.h"
+#include "common/settings.h"
+#include "video_core/gpu.h"
+#include <condition_variable>
+#include <cstdlib>
 #include "core/hle/service/nx2_stub_interface.h"
 #include "core/hle/service/service.h"
 #include "core/hle/service/sm/sm.h"
@@ -651,18 +656,111 @@ private:
         constexpr u64 AvailableSlots = 0x7fff;
         TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots), static_cast<u32>(AvailableSlots >> 32)});
     }
-    // 229: result, u64 mask of buffer slots the client may acquire next, four zero words. An
-    // empty reply left the guest with no free buffers. Every slot is handed back at once.
+    // 229(u64 token, u32 slot, u32 image, ...): result, u64 mask of buffer slots the client may
+    // acquire next, four zero words. Every slot is handed back at once, so pace the game here:
+    // wait for the frame's GPU fence (bounded) and hold to the vblank. Words 22/24 are the
+    // fence (~syncpoint, value), word 12 the (swap interval << 16) | refresh rate.
     void PresentClientBuffer(HLERequestContext& ctx) {
+        const auto* w = ctx.CommandBuffer();
         ++m_presents;
         if (m_presents <= 4 || (m_presents % 600) == 0) {
-            LOG_INFO(Service, "nx2:vi2 229 present #{}", m_presents);
+            LOG_INFO(Service, "nx2:vi2 229 present #{} slot={} image={}", m_presents, w[4], w[5]);
         }
+        // A channel suspended on a semaphore this thread releases later must not be waited on:
+        // wait for the previous frame's fence then.
+        if (!WaitForFrame(~w[22], w[24], true)) {
+            WaitForFrame(m_previous_fence_id, m_previous_fence_value);
+        }
+        m_previous_fence_id = ~w[22];
+        m_previous_fence_value = w[24];
+        PaceToVblank(w[12]);
         constexpr u64 AvailableSlots = 0x7fff;
         TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots),
                              static_cast<u32>(AvailableSlots >> 32), 0, 0, 0, 0});
     }
     u32 m_presents{};
+    u32 m_wait_timeouts{};
+    u32 m_swap_word{};
+    u32 m_previous_fence_id{~0U};
+    u32 m_previous_fence_value{};
+    Nx2PresentPacer m_present_pacer;
+
+    void PaceToVblank(u32 timing) {
+        static const u32 forced_interval = [] {
+            const char* value = std::getenv("EDEN_NX2_SWAP_INTERVAL");
+            return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
+        }();
+        u32 swap_interval = std::clamp<u32>(timing >> 16, 1, 4);
+        if (forced_interval != 0) {
+            swap_interval = forced_interval;
+        }
+        const u32 refresh_rate =
+            (timing & 0xffff) >= 30 && (timing & 0xffff) <= 240 ? timing & 0xffff : 60;
+        if (!Settings::values.use_speed_limit.GetValue() || Settings::SpeedLimit() == 0) {
+            return;
+        }
+        if (timing != std::exchange(m_swap_word, timing)) {
+            LOG_INFO(Service, "nx2:vi2 present #{} swap interval {} at {} Hz (word 12 = {:#x})",
+                     m_presents, swap_interval, refresh_rate, timing);
+        }
+        const auto interval = std::chrono::nanoseconds{
+            100'000'000'000LL * swap_interval / refresh_rate / Settings::SpeedLimit()};
+        const auto now = std::chrono::steady_clock::now();
+        const auto pacing = m_present_pacer.Advance(now, interval);
+        if (now < pacing.deadline) {
+            const auto wait =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(pacing.deadline - now);
+            auto& kernel = system.Kernel();
+            static_cast<void>(Kernel::GetCurrentThread(kernel).Sleep(
+                kernel, kernel.HardwareTimer().GetTick() + wait.count() + 2));
+        }
+    }
+
+    bool WaitForFrame(u32 fence_id, u32 fence_value, bool unless_gpu_waits = false) {
+        if (fence_id >= 192) {
+            return true;
+        }
+        auto& syncpoints = system.Host1x().GetSyncpointManager();
+        const auto start = std::chrono::steady_clock::now();
+        const auto deadline = start + std::chrono::milliseconds{4000};
+        if (!syncpoints.IsReadyGuest(fence_id, fence_value)) {
+            struct Wake {
+                std::mutex mutex;
+                std::condition_variable cv;
+                bool done{};
+            };
+            auto wake = std::make_shared<Wake>();
+            syncpoints.RegisterGuestAction(fence_id, fence_value, [wake] {
+                {
+                    std::scoped_lock lk{wake->mutex};
+                    wake->done = true;
+                }
+                wake->cv.notify_all();
+            });
+            std::unique_lock lk{wake->mutex};
+            bool gpu_waited = false;
+            while (!wake->done && system.IsPoweredOn() &&
+                   std::chrono::steady_clock::now() < deadline) {
+                if (unless_gpu_waits) {
+                    gpu_waited |= system.GPU().HasSuspendedChannels();
+                    if (gpu_waited &&
+                        std::chrono::steady_clock::now() - start > std::chrono::milliseconds{3}) {
+                        return false;
+                    }
+                }
+                wake->cv.wait_for(lk, std::chrono::milliseconds{unless_gpu_waits ? 1 : 50});
+            }
+        }
+        if (unless_gpu_waits && !syncpoints.IsReadyGuest(fence_id, fence_value)) {
+            return false;
+        }
+        if (!syncpoints.IsReadyGuest(fence_id, fence_value) && m_wait_timeouts++ < 64) {
+            LOG_WARNING(Service, "nx2:vi2 present #{} fence ({}, {}) not reached in 4 s (now {})",
+                        m_presents, fence_id, fence_value,
+                        syncpoints.GetGuestSyncpointValue(fence_id));
+        }
+        return syncpoints.IsReadyGuest(fence_id, fence_value);
+    }
 
     void CancelClientBuffer(HLERequestContext& ctx) {
         constexpr u64 AvailableSlots = 0x7fff;
