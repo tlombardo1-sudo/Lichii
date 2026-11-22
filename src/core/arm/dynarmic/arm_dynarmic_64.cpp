@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <mutex>
+#include <map>
 #include <set>
 #include <atomic>
 #include <chrono>
@@ -575,10 +576,41 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     m_jit.emplace(config);
 }
 
+std::atomic<u32> g_nx2_thread_dump_epoch{0};
+
 HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
     const CpuProfile::RunTimer timer{m_core_index};
     m_jit->ClearExclusiveState();
-    return TranslateHaltReason(m_jit->Run());
+    const auto reason = TranslateHaltReason(m_jit->Run());
+    // Every 5 s the svc counter bumps the epoch: log where each thread that is preempted while
+    // running guest code (not blocked in an svc) is, to find user-mode spin loops.
+    static thread_local std::map<u32, u32> last_epoch;
+    const u32 epoch = g_nx2_thread_dump_epoch.load(std::memory_order_relaxed);
+    auto& seen = last_epoch[thread->GetThreadId()];
+    if (epoch != 0 && epoch != seen && epoch <= 4 && thread->GetOwnerProcess() != nullptr &&
+        thread->GetOwnerProcess()->IsSwitch2()) {
+        seen = epoch;
+        const auto& jit = *m_jit;
+        const u64 pc = jit.GetPC();
+        auto& memory = thread->GetOwnerProcess()->GetMemory();
+        const auto regs = jit.GetRegisters();
+        LOG_INFO(Core_ARM,
+                 "RUNNING t{} core {} pc={:#x} lr={:#x} sp={:#x} x0={:#x} x1={:#x} x2={:#x} x3={:#x} "
+                 "x8={:#x} x19={:#x} x20={:#x} x21={:#x}",
+                 thread->GetThreadId(), m_core_index, pc, regs[30], jit.GetSP(), regs[0], regs[1],
+                 regs[2], regs[3], regs[8], regs[19], regs[20], regs[21]);
+        std::string code;
+        for (u64 a = pc - 32; a < pc + 32; a += 4) {
+            code += fmt::format(" {:08x}", memory.Read32(a));
+        }
+        LOG_INFO(Core_ARM, "RUNNING t{} code from {:#x}:{}", thread->GetThreadId(), pc - 32, code);
+        std::string stack;
+        for (u64 a = 0; a < 8; ++a) {
+            stack += fmt::format(" {:x}", memory.Read64(jit.GetSP() + a * 8));
+        }
+        LOG_INFO(Core_ARM, "RUNNING t{} stack:{}", thread->GetThreadId(), stack);
+    }
+    return reason;
 }
 
 HaltReason ArmDynarmic64::StepThread(Kernel::KThread* thread) {
