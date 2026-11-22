@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include "video_core/nx2.h"
 #include "common/algorithm.h"
 #include "common/assert.h"
 #include "common/logging.h"
@@ -350,6 +352,13 @@ void MaxwellDMA::ReleaseSemaphore() {
     const GPUVAddr address = regs.semaphore.address;
     const u32 payload = regs.semaphore.payload;
     VideoCommon::QueryPropertiesFlags flags{VideoCommon::QueryPropertiesFlags::IsAFence};
+    if (g_nx2_ampere && type != LaunchDMA::SemaphoreType::NONE) {
+        static std::atomic<u32> traced{};
+        if (traced.fetch_add(1) < 40) {
+            LOG_INFO(HW_GPU, "NX2 DMA semaphore type {} addr {:#x} payload {:#x}",
+                     static_cast<u32>(type.Value()), address, payload);
+        }
+    }
     switch (type) {
     case LaunchDMA::SemaphoreType::NONE:
         break;

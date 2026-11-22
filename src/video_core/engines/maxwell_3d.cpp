@@ -6,6 +6,9 @@
 
 #include <cstring>
 #include <optional>
+#include <atomic>
+#include "common/logging.h"
+#include "video_core/nx2.h"
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/scope_exit.h"
@@ -520,6 +523,14 @@ void Maxwell3D::ProcessQueryGet() {
         static_cast<VideoCommon::QueryType>(regs.report_semaphore.query.report.Value());
     const u32 payload = regs.report_semaphore.payload;
     const u32 subreport = regs.report_semaphore.query.sub_report;
+    if (g_nx2_ampere) {
+        static std::atomic<u32> traced{};
+        if (traced.fetch_add(1) < 40) {
+            LOG_INFO(HW_GPU, "NX2 3D report semaphore op {} addr {:#x} payload {:#x} short {}",
+                     static_cast<u32>(regs.report_semaphore.query.operation.Value()), sequence_address,
+                     payload, static_cast<u32>(regs.report_semaphore.query.short_query.Value()));
+        }
+    }
     switch (regs.report_semaphore.query.operation) {
     case Regs::ReportSemaphore::Operation::Release:
         if (regs.report_semaphore.query.short_query != 0) {
