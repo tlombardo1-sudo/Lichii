@@ -17,13 +17,13 @@ using Progress = std::function<void(std::size_t, std::size_t)>;
 // One stopped JIT per owner, never concurrent access to one instance. UI callbacks
 // run only on the coordinator. RAII joins also protect callback/state lifetimes
 // when progress throws. Zero-sized owners do not need a worker.
-inline void RunOwners(const std::array<std::size_t, 4>& sizes,
+inline void RunOwners(const std::array<std::size_t, 6>& sizes,
                       const std::function<void(std::size_t, const Progress&)>& work,
                       const Progress& progress) {
-    std::array<std::atomic<std::size_t>, 4> completed{};
-    std::array<std::atomic_bool, 4> finished{};
-    std::array<std::exception_ptr, 4> errors{};
-    std::array<std::jthread, 4> workers;
+    std::array<std::atomic<std::size_t>, 6> completed{};
+    std::array<std::atomic_bool, 6> finished{};
+    std::array<std::exception_ptr, 6> errors{};
+    std::array<std::jthread, 6> workers;
     std::size_t total{};
     for (std::size_t core = 0; core < sizes.size(); ++core) {
         total += sizes[core];
