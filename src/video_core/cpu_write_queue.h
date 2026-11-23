@@ -28,7 +28,7 @@ namespace VideoCommon::CpuWriteQueue {
 
 using Mode = VideoCore::FramePipeline::Mode;
 
-inline constexpr size_t QUEUES = 4; // Core::Hardware::NUM_CPU_CORES: the last one is guarded
+inline constexpr size_t QUEUES = 6; // Core::Hardware::NUM_CPU_CORES: the last one is guarded
 inline constexpr u64 CAPACITY = 4096;
 static_assert((CAPACITY & (CAPACITY - 1)) == 0);
 

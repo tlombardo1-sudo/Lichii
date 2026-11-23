@@ -46,6 +46,8 @@ void GlobalSchedulerContext::PreemptThreads(KernelCore& kernel) noexcept {
         59,
         59,
         63,
+        59,
+        59,
     };
     ASSERT(KScheduler::IsSchedulerLockedByCurrentThread(kernel));
     for (u32 core_id = 0; core_id < per_core.size(); core_id++)
