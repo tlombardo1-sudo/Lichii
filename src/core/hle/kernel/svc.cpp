@@ -12,6 +12,7 @@
 #include "core/arm/arm_interface.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/physical_core.h"
 #include "core/hle/kernel/k_thread.h"
 #include "common/alignment.h"
 #include "core/hle/kernel/k_page_table.h"
@@ -2551,7 +2552,12 @@ void Call(Core::System& system, u32 imm) {
             }
             counts.fill(0);
             LOG_INFO(Kernel_SVC, "Switch 2 svc counts, last 5 s:{}", text);
-            Core::g_nx2_thread_dump_epoch.fetch_add(1, std::memory_order_relaxed);
+            if (Core::g_nx2_thread_dump_epoch.fetch_add(1, std::memory_order_relaxed) < 4) {
+                // Interrupt every core so threads running guest code report where they are.
+                for (size_t core = 0; core < 4; ++core) {
+                    kernel.PhysicalCore(core).Interrupt();
+                }
+            }
             static int thread_dumps = 0;
             if (thread_dumps < 3 && now - std::chrono::steady_clock::time_point{} > std::chrono::seconds{1}) {
                 ++thread_dumps;
