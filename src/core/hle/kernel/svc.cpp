@@ -28,6 +28,9 @@
 namespace Core {
 extern std::atomic<u32> g_nx2_thread_dump_epoch;
 }
+namespace Kernel::Svc {
+void DumpCvRing();
+}
 
 namespace Kernel::Svc {
 
@@ -2553,6 +2556,7 @@ void Call(Core::System& system, u32 imm) {
             counts.fill(0);
             LOG_INFO(Kernel_SVC, "Switch 2 svc counts, last 5 s:{}", text);
             if (Core::g_nx2_thread_dump_epoch.fetch_add(1, std::memory_order_relaxed) < 4) {
+                Kernel::Svc::DumpCvRing();
                 // Interrupt every core so threads running guest code report where they are.
                 for (size_t core = 0; core < 4; ++core) {
                     kernel.PhysicalCore(core).Interrupt();

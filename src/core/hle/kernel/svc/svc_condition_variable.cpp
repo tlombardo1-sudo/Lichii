@@ -4,7 +4,12 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <atomic>
+
+#include "common/logging.h"
 #include "core/core.h"
+#include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/k_hardware_timer.h"
 #include "core/hle/kernel/k_memory_layout.h"
 #include "core/hle/kernel/k_process.h"
@@ -13,6 +18,37 @@
 #include "core/hle/kernel/svc_results.h"
 
 namespace Kernel::Svc {
+
+namespace {
+struct CvEvent {
+    u64 thread;
+    u64 key;
+    u64 address;
+    u32 tag_or_count;
+    s64 timeout;
+    bool signal;
+};
+constexpr size_t CvRingSize = 64;
+std::array<CvEvent, CvRingSize> cv_ring{};
+std::atomic<u64> cv_ring_next{0};
+
+void RecordCv(Core::System& system, const CvEvent& event) {
+    if (GetCurrentProcess(system.Kernel()).IsSwitch2()) {
+        cv_ring[cv_ring_next.fetch_add(1, std::memory_order_relaxed) % CvRingSize] = event;
+    }
+}
+} // namespace
+
+/// The last condition variable waits and signals, oldest first (Switch 2 hang diagnosis).
+void DumpCvRing() {
+    const u64 next = cv_ring_next.load();
+    for (u64 i = next > CvRingSize ? next - CvRingSize : 0; i < next; ++i) {
+        const auto& e = cv_ring[i % CvRingSize];
+        LOG_INFO(Kernel_SVC, "CVRING #{} t{} {} key={:#x} addr={:#x} {}={:#x} timeout={}", i,
+                 e.thread, e.signal ? "signal" : "wait", e.key, e.address,
+                 e.signal ? "count" : "tag", e.tag_or_count, e.timeout);
+    }
+}
 
 /// Wait process wide key atomic
 Result WaitProcessWideKeyAtomic(Core::System& system, u64 address, u64 cv_key, u32 tag,
@@ -40,6 +76,9 @@ Result WaitProcessWideKeyAtomic(Core::System& system, u64 address, u64 cv_key, u
         timeout = timeout_ns;
     }
 
+    RecordCv(system, {GetCurrentThread(system.Kernel()).GetThreadId(), cv_key, address, tag,
+                      timeout_ns, false});
+
     // Wait on the condition variable.
     R_RETURN(
         GetCurrentProcess(system.Kernel())
@@ -49,6 +88,9 @@ Result WaitProcessWideKeyAtomic(Core::System& system, u64 address, u64 cv_key, u
 /// Signal process wide key
 void SignalProcessWideKey(Core::System& system, u64 cv_key, s32 count) {
     LOG_TRACE(Kernel_SVC, "called, cv_key={:#x}, count={:#08x}", cv_key, count);
+
+    RecordCv(system, {GetCurrentThread(system.Kernel()).GetThreadId(), cv_key, 0,
+                      static_cast<u32>(count), 0, true});
 
     // Signal the condition variable.
     return GetCurrentProcess(system.Kernel())
